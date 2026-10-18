@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: sh
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
+      - name: Set up coverage
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Check sources
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Test and measure coverage
+        run: ./scripts/test.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.os }}
+          path: target/lcov.info
+          if-no-files-found: error
+
+  msrv:
+    name: Check minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        run: |
+          msrv=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          readonly msrv
+          rustup toolchain install "$msrv" --profile minimal
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$msrv" >>"$GITHUB_ENV"
+      - name: Check all targets
+        run: cargo check --locked --all-targets
+      - name: Verify package
+        run: cargo package --locked

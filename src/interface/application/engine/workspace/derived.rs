@@ -1,0 +1,1300 @@
+use super::{Document, Workspace};
+use crate::interface::application::engine::{
+  self, Analysis, DependencyState, DocumentId, Error, Location, Occurrence,
+  OccurrenceId, Revision, Snapshot, Symbol, SymbolId, Value, check_cancelled,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OriginMapping {
+  Linear(usize),
+  Whole(Vec<Range<usize>>),
+  Generated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OriginPart {
+  pub bytes: Range<usize>,
+  pub source: OriginMapping,
+}
+
+impl OriginPart {
+  pub(in crate::interface::application::engine) fn new(
+    bytes: Range<usize>,
+    source: Option<Range<usize>>,
+  ) -> Self {
+    let source = match source {
+      Some(source) if source.len() == bytes.len() => {
+        OriginMapping::Linear(source.start)
+      }
+      Some(source) => OriginMapping::Whole(vec![source]),
+      None => OriginMapping::Generated,
+    };
+    Self { bytes, source }
+  }
+
+  pub(in crate::interface::application::engine) fn merge(
+    &mut self,
+    other: &Self,
+  ) -> bool {
+    if self.bytes.end != other.bytes.start {
+      return false;
+    }
+    let contiguous = match (&self.source, &other.source) {
+      (OriginMapping::Linear(start), OriginMapping::Linear(next)) => {
+        *start + self.bytes.len() == *next
+      }
+      (OriginMapping::Generated, OriginMapping::Generated) => true,
+      _ => false,
+    };
+    if contiguous {
+      self.bytes.end = other.bytes.end;
+    }
+    contiguous
+  }
+
+  pub(in crate::interface::application::engine) fn project(
+    &self,
+    bytes: Range<usize>,
+  ) -> Option<Vec<Range<usize>>> {
+    match &self.source {
+      OriginMapping::Linear(start) => {
+        let range = start + bytes.start - self.bytes.start
+          ..start + bytes.end - self.bytes.start;
+        Some(vec![range])
+      }
+      OriginMapping::Whole(ranges) if bytes == self.bytes => {
+        Some(ranges.clone())
+      }
+      _ => None,
+    }
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivedOrigin {
+  pub registration: OccurrenceId,
+  pub argument: Location,
+  pub parts: Vec<OriginPart>,
+}
+
+impl DerivedOrigin {
+  pub(in crate::interface::application::engine) fn project(
+    &self,
+    bytes: Range<usize>,
+  ) -> Option<Vec<Location>> {
+    if bytes.is_empty() {
+      return self
+        .project_point(bytes.start)
+        .map(|location| vec![location]);
+    }
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut covered = bytes.start;
+    for part in &self.parts {
+      let start = part.bytes.start.max(bytes.start);
+      let end = part.bytes.end.min(bytes.end);
+      if start >= end {
+        continue;
+      }
+      if start != covered {
+        return None;
+      }
+      for range in part.project(start..end)? {
+        if let Some(last) = ranges.last_mut()
+          && last.end == range.start
+        {
+          last.end = range.end;
+        } else {
+          ranges.push(range);
+        }
+      }
+      covered = end;
+    }
+    (covered == bytes.end && !ranges.is_empty()).then(|| {
+      ranges
+        .into_iter()
+        .map(|bytes| Location {
+          snapshot: self.argument.snapshot,
+          bytes,
+        })
+        .collect()
+    })
+  }
+
+  fn project_point(&self, point: usize) -> Option<Location> {
+    let mut position = None;
+    for part in self
+      .parts
+      .iter()
+      .filter(|part| part.bytes.start <= point && point <= part.bytes.end)
+    {
+      let next = match &part.source {
+        OriginMapping::Linear(start) => start + point - part.bytes.start,
+        OriginMapping::Whole(ranges) if point == part.bytes.start => {
+          ranges.first()?.start
+        }
+        OriginMapping::Whole(ranges) if point == part.bytes.end => {
+          ranges.last()?.end
+        }
+        _ => return None,
+      };
+      if position.is_some_and(|old| old != next) {
+        return None;
+      }
+      position = Some(next);
+    }
+    position.map(|point| Location {
+      snapshot: self.argument.snapshot,
+      bytes: point..point,
+    })
+  }
+
+  fn compose(&self, parts: &[OriginPart]) -> Vec<OriginPart> {
+    let mut output: Vec<OriginPart> = Vec::new();
+    for part in parts {
+      let next = match &part.source {
+        OriginMapping::Linear(start) => {
+          for outer in &self.parts {
+            let first = (*start).max(outer.bytes.start);
+            let end = (start + part.bytes.len()).min(outer.bytes.end);
+            if first >= end {
+              continue;
+            }
+            let bytes =
+              part.bytes.start + first - start..part.bytes.start + end - start;
+            let source = match &outer.source {
+              OriginMapping::Linear(offset) => {
+                OriginMapping::Linear(offset + first - outer.bytes.start)
+              }
+              _ => outer
+                .project(first..end)
+                .map_or(OriginMapping::Generated, OriginMapping::Whole),
+            };
+            let next = OriginPart { bytes, source };
+            if output.last_mut().is_none_or(|last| !last.merge(&next)) {
+              output.push(next);
+            }
+          }
+          continue;
+        }
+        OriginMapping::Whole(ranges) => {
+          let projected: Option<Vec<_>> = ranges
+            .iter()
+            .map(|range| self.project(range.clone()))
+            .collect();
+          let source = projected.map_or(OriginMapping::Generated, |ranges| {
+            OriginMapping::Whole(
+              ranges
+                .into_iter()
+                .flatten()
+                .map(|location| location.bytes)
+                .collect(),
+            )
+          });
+          OriginPart {
+            bytes: part.bytes.clone(),
+            source,
+          }
+        }
+        OriginMapping::Generated => part.clone(),
+      };
+      if output.last_mut().is_none_or(|last| !last.merge(&next)) {
+        output.push(next);
+      }
+    }
+    output
+  }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum MappingKey {
+  Linear(usize),
+  Whole(Vec<(usize, usize)>),
+  Generated,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OriginKey {
+  start: usize,
+  end: usize,
+  source: MappingKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(in crate::interface::application::engine) struct DerivedSite {
+  root: OccurrenceId,
+  program: Option<Arc<[u8]>>,
+  occurrence: usize,
+  argument: (usize, usize),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(in crate::interface::application::engine) struct DerivedKey {
+  pub site: DerivedSite,
+  pub body: Arc<[u8]>,
+  parts: Arc<[OriginKey]>,
+}
+
+impl DerivedKey {
+  pub fn new(
+    mut origin: DerivedOrigin,
+    body: &[u8],
+    units: &std::collections::BTreeMap<DocumentId, DerivedUnit>,
+  ) -> (Self, DerivedOrigin) {
+    let parent = units.get(&origin.registration.snapshot.document);
+    let occurrence = origin.registration.index;
+    if let Some(unit) = parent {
+      let argument = unit.origin.project(origin.argument.bytes.clone());
+      origin.parts = unit.origin.compose(&origin.parts);
+      origin.argument = argument
+        .and_then(|ranges| {
+          Some(Location {
+            snapshot: unit.origin.argument.snapshot,
+            bytes: ranges.first()?.bytes.start..ranges.last()?.bytes.end,
+          })
+        })
+        .unwrap_or_else(|| unit.origin.argument.clone());
+      origin.registration = unit.key.site.root;
+    }
+    let key = Self {
+      site: DerivedSite {
+        root: origin.registration,
+        program: parent.map(|unit| unit.key.body.clone()),
+        occurrence,
+        argument: (origin.argument.bytes.start, origin.argument.bytes.end),
+      },
+      body: body.into(),
+      parts: origin
+        .parts
+        .iter()
+        .map(|part| OriginKey {
+          start: part.bytes.start,
+          end: part.bytes.end,
+          source: match &part.source {
+            OriginMapping::Linear(start) => MappingKey::Linear(*start),
+            OriginMapping::Whole(ranges) => MappingKey::Whole(
+              ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect(),
+            ),
+            OriginMapping::Generated => MappingKey::Generated,
+          },
+        })
+        .collect(),
+    };
+    (key, origin)
+  }
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::interface::application::engine) struct DerivedCandidate {
+  pub key: DerivedKey,
+  pub origin: DerivedOrigin,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::interface::application::engine) struct DerivedUnit {
+  pub key: DerivedKey,
+  pub origin: DerivedOrigin,
+  pub document: Arc<Document>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(in crate::interface::application::engine) struct DerivedDocuments {
+  pub candidates: BTreeMap<DerivedKey, DerivedCandidate>,
+  pub bodies: BTreeMap<OccurrenceId, DeferredBody>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(in crate::interface::application::engine) struct DeferredBody {
+  pub documents: BTreeMap<Snapshot, Location>,
+  pub incomplete: bool,
+  pub conditional: bool,
+}
+
+impl DerivedDocuments {
+  pub fn incomplete_bodies(
+    &self,
+    analysis: Option<&Analysis>,
+  ) -> BTreeSet<Snapshot> {
+    let mut incomplete: BTreeSet<_> = self
+      .bodies
+      .values()
+      .flat_map(|body| {
+        body.documents.iter().filter_map(|(snapshot, argument)| {
+          (body.incomplete
+            || body.conditional
+            || analysis
+              .and_then(|analysis| {
+                analysis.argument_summary(engine::UseSite::argument(argument))
+              })
+              .is_some_and(|role| {
+                role.kind != Some(engine::ArgumentKind::ShellBody)
+              }))
+          .then_some(*snapshot)
+        })
+      })
+      .collect();
+    let mut descendants: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut pending: Vec<_> = incomplete.iter().copied().collect();
+    for (site, body) in &self.bodies {
+      descendants
+        .entry(site.snapshot)
+        .or_default()
+        .extend(body.documents.keys().copied());
+      if body.documents.len() > 1 {
+        pending.extend(body.documents.keys().copied());
+      }
+    }
+    while let Some(snapshot) = pending.pop() {
+      if let Some(children) = descendants.remove(&snapshot) {
+        for child in children {
+          if incomplete.insert(child) {
+            pending.push(child);
+          }
+        }
+      }
+    }
+    incomplete
+  }
+
+  pub fn materialize(
+    &mut self,
+    workspace: &mut Workspace,
+    candidate: DerivedCandidate,
+    cancelled: &AtomicBool,
+  ) -> Result<Snapshot, Error> {
+    let key = candidate.key.clone();
+    if !workspace.derived_keys.contains_key(&key) {
+      workspace.add_derived(candidate.clone(), cancelled)?;
+    }
+    let (key, snapshot) = workspace
+      .derived_keys
+      .get_key_value(&key)
+      .expect("derived document");
+    self.candidates.entry(key.clone()).or_insert(candidate);
+    Ok(*snapshot)
+  }
+
+  pub fn body(
+    &mut self,
+    workspace: &mut Workspace,
+    registration: OccurrenceId,
+    action: Result<Option<(DerivedOrigin, Value)>, ()>,
+    limit: usize,
+    cancelled: &AtomicBool,
+  ) -> Result<Option<Snapshot>, Error> {
+    let body = self.bodies.entry(registration).or_default();
+    let (origin, value) = match action {
+      Ok(Some(action)) => action,
+      Ok(None) => return Ok(None),
+      Err(()) => {
+        body.incomplete = true;
+        return Ok(None);
+      }
+    };
+    let Value::Literal(value) = value else {
+      body.incomplete = true;
+      return Ok(None);
+    };
+    if value.len() > limit
+      || value.contains(&0)
+      || std::str::from_utf8(&value).is_err()
+    {
+      body.incomplete = true;
+      return Ok(None);
+    }
+    let argument = origin.argument.clone();
+    let (key, origin) = DerivedKey::new(origin, &value, &workspace.derived);
+    let snapshot = self.materialize(
+      workspace,
+      DerivedCandidate { key, origin },
+      cancelled,
+    )?;
+    self
+      .bodies
+      .get_mut(&registration)
+      .expect("body registration")
+      .documents
+      .insert(snapshot, argument);
+    Ok(Some(snapshot))
+  }
+
+  pub fn collect(
+    &mut self,
+    workspace: &mut Workspace,
+    mut pending: BTreeSet<Snapshot>,
+    analysis: Option<&Analysis>,
+    limit: usize,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    let mut visited = BTreeSet::new();
+    while let Some(snapshot) = pending.pop_first() {
+      if !visited.insert(snapshot) {
+        continue;
+      }
+      check_cancelled(cancelled)?;
+      let document = workspace
+        .documents
+        .get(&snapshot.document)
+        .ok_or(Error::UnknownDocument(snapshot.document))?
+        .clone();
+      document.prepare_deferred(cancelled)?;
+      if !document.has_body_candidates() {
+        continue;
+      }
+      for (site, command) in document.body_candidates() {
+        check_cancelled(cancelled)?;
+        let registration = &site.id;
+        if self.bodies.contains_key(registration)
+          || analysis.is_some_and(|analysis| {
+            analysis
+              .resolutions(engine::UseSite::Syntax(*registration))
+              .next()
+              .is_some()
+          })
+          || (!command.incomplete_body && command.bodies.is_empty())
+        {
+          continue;
+        }
+        self.bodies.insert(
+          *registration,
+          DeferredBody {
+            incomplete: command.incomplete_body,
+            conditional: site.name != Value::Literal(b"trap".to_vec()),
+            ..DeferredBody::default()
+          },
+        );
+        for ((start, end), (value, parts)) in &command.bodies {
+          let origin = DerivedOrigin {
+            registration: *registration,
+            argument: Location {
+              snapshot,
+              bytes: *start..*end,
+            },
+            parts: parts.clone(),
+          };
+          pending.extend(self.body(
+            workspace,
+            *registration,
+            Ok(Some((origin, value.clone()))),
+            limit,
+            cancelled,
+          )?);
+        }
+      }
+    }
+    Ok(())
+  }
+}
+
+pub(in crate::interface::application::engine) const fn reserved(
+  id: DocumentId,
+) -> bool {
+  id.0 & (1 << 63) != 0
+}
+
+pub(in crate::interface::application::engine) fn owner(
+  units: &std::collections::BTreeMap<DocumentId, DerivedUnit>,
+  snapshot: Snapshot,
+) -> Snapshot {
+  units
+    .get(&snapshot.document)
+    .map_or(snapshot, |unit| unit.origin.argument.snapshot)
+}
+
+impl Workspace {
+  pub fn semantic_spans(
+    &self,
+    id: DocumentId,
+  ) -> Result<Vec<engine::SemanticSpan>, Error> {
+    let document = self.document(id).ok_or(Error::UnknownDocument(id))?;
+    document.prepare_deferred(&AtomicBool::new(false))?;
+    let mut spans = document.semantic_spans(self.analysis());
+    for group in self.projections(document.snapshot(), self.analysis()) {
+      if !group.complete {
+        continue;
+      }
+      let mut projected: BTreeMap<
+        _,
+        engine::analysis::semantic::ProjectedSpan,
+      > = BTreeMap::new();
+      for unit in &group.documents {
+        for mut span in unit.document.semantic_spans(self.analysis()) {
+          let Some(locations) = self.project_locations(&span.location) else {
+            continue;
+          };
+          for location in locations
+            .into_iter()
+            .filter(|location| location.snapshot == document.snapshot())
+          {
+            span.location = location;
+            span.semantic = true;
+            projected
+              .entry((span.location.bytes.start, span.location.bytes.end))
+              .and_modify(|old| {
+                old.join(&span, unit.document.snapshot().document);
+              })
+              .or_insert_with(|| {
+                engine::analysis::semantic::ProjectedSpan::new(
+                  span.clone(),
+                  unit.document.snapshot().document,
+                )
+              });
+          }
+        }
+      }
+      for projected in projected.into_values() {
+        if projected.compatible
+          && projected.documents.len() == group.documents.len()
+        {
+          spans.push(projected.span);
+        }
+      }
+    }
+    spans.sort_by_key(|span| {
+      (
+        span.location.bytes.start,
+        span.location.bytes.end,
+        span.kind,
+      )
+    });
+    spans.dedup();
+    Ok(spans)
+  }
+
+  /// Collects embedded syntax without assuming an execution environment.
+  pub fn index_document(
+    &mut self,
+    id: DocumentId,
+    limits: engine::AnalysisLimits,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    check_cancelled(cancelled)?;
+    if self
+      .indexed
+      .get(&id)
+      .is_some_and(|(limit, _)| *limit == limits.value_bytes)
+    {
+      return Ok(());
+    }
+    let document = self.document(id).ok_or(Error::UnknownDocument(id))?;
+    let snapshot = document.snapshot();
+    if limits.value_bytes == 0 {
+      return Err(Error::InvalidAnalysis("Value size must be positive".into()));
+    }
+    document.prepare_deferred(cancelled)?;
+    if !document.has_body_candidates() {
+      self.indexed.insert(
+        id,
+        (limits.value_bytes, Arc::new(DerivedDocuments::default())),
+      );
+      return Ok(());
+    }
+    let mut staged = self.clone();
+    let mut derived = DerivedDocuments::default();
+    derived.collect(
+      &mut staged,
+      [snapshot].into(),
+      None,
+      limits.value_bytes,
+      cancelled,
+    )?;
+    staged
+      .indexed
+      .insert(id, (limits.value_bytes, Arc::new(derived)));
+    staged.prune_unused_derived();
+    check_cancelled(cancelled)?;
+    *self = staged;
+    Ok(())
+  }
+
+  pub(in crate::interface::application::engine) fn add_derived(
+    &mut self,
+    mut candidate: DerivedCandidate,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    if self.next_derived >= 1 << 63 {
+      return Err(Error::InvalidAnalysis(
+        "Derived document IDs exhausted".into(),
+      ));
+    }
+    let id = DocumentId(u64::MAX - self.next_derived);
+    self.next_derived += 1;
+    let snapshot = Snapshot {
+      document: id,
+      revision: Revision(1),
+    };
+    let document = if let Some((body, program)) =
+      self.programs.get_key_value(&candidate.key.body)
+    {
+      candidate.key.body = body.clone();
+      program.instantiate(snapshot, cancelled)?
+    } else {
+      Document::parse(snapshot, &candidate.key.body, cancelled)?
+    };
+    self.insert_document(document)?;
+    let document = self.documents[&id].clone();
+    self
+      .programs
+      .entry(candidate.key.body.clone())
+      .or_insert_with(|| document.clone());
+    self.derived_keys.insert(candidate.key.clone(), snapshot);
+    self.derived.insert(
+      id,
+      DerivedUnit {
+        key: candidate.key,
+        origin: candidate.origin,
+        document,
+      },
+    );
+    Ok(())
+  }
+
+  pub(super) fn prune_derived(
+    &mut self,
+    entry: DocumentId,
+    candidates: &BTreeMap<DerivedKey, DerivedCandidate>,
+  ) -> bool {
+    self.derived_entries.insert(
+      entry,
+      candidates
+        .keys()
+        .filter_map(|key| {
+          self.derived_keys.get(key).map(|snapshot| snapshot.document)
+        })
+        .collect(),
+    );
+    self.prune_unused_derived()
+  }
+
+  pub(super) fn prune_unused_derived(&mut self) -> bool {
+    let retained: BTreeSet<_> = self
+      .derived_entries
+      .values()
+      .flatten()
+      .copied()
+      .chain(
+        self
+          .indexed
+          .values()
+          .flat_map(|(_, derived)| derived.candidates.keys())
+          .filter_map(|key| {
+            self.derived_keys.get(key).map(|snapshot| snapshot.document)
+          }),
+      )
+      .collect();
+    let removed: Vec<_> = self
+      .derived
+      .keys()
+      .filter(|id| !retained.contains(id))
+      .copied()
+      .collect();
+    for id in &removed {
+      self.discard(*id);
+    }
+    if !removed.is_empty() {
+      self.changed();
+    }
+    !removed.is_empty()
+  }
+
+  #[must_use]
+  pub fn derived_origin(
+    &self,
+    id: DocumentId,
+  ) -> Option<&crate::interface::application::engine::DerivedOrigin> {
+    self.derived.get(&id).map(|unit| &unit.origin)
+  }
+
+  #[must_use]
+  pub fn source_snapshot(&self, snapshot: Snapshot) -> Snapshot {
+    owner(&self.derived, snapshot)
+  }
+
+  #[must_use]
+  pub fn project_locations(
+    &self,
+    location: &crate::interface::application::engine::Location,
+  ) -> Option<Vec<crate::interface::application::engine::Location>> {
+    self.document(location.snapshot.document)?.text(location)?;
+    let locations = match self.derived_origin(location.snapshot.document) {
+      Some(origin) => origin.project(location.bytes.clone())?,
+      None => vec![location.clone()],
+    };
+    for projected in &locations {
+      self
+        .document(projected.snapshot.document)?
+        .text(projected)?;
+    }
+    Some(locations)
+  }
+
+  #[must_use]
+  pub fn navigation_location(
+    &self,
+    location: &crate::interface::application::engine::Location,
+  ) -> Option<crate::interface::application::engine::Location> {
+    let locations = self.project_locations(location)?;
+    let first = locations.first()?;
+    let last = locations.last()?;
+    Some(crate::interface::application::engine::Location {
+      snapshot: first.snapshot,
+      bytes: first.bytes.start..last.bytes.end,
+    })
+  }
+
+  pub fn projected_symbols(
+    &self,
+    id: DocumentId,
+  ) -> impl Iterator<Item = (&Symbol, crate::interface::application::engine::Location)>
+  {
+    self
+      .search_symbol_locations(&[])
+      .filter(move |(_, location)| location.snapshot.document == id)
+  }
+
+  pub fn search_symbol_locations<'a>(
+    &'a self,
+    query: &'a [u8],
+  ) -> impl Iterator<
+    Item = (&'a Symbol, crate::interface::application::engine::Location),
+  > {
+    let mut seen = BTreeSet::new();
+    self
+      .symbol_locations(query)
+      .filter(move |(symbol, location)| {
+        seen.insert((
+          symbol.kind,
+          symbol.name.as_slice(),
+          location.snapshot,
+          location.bytes.start,
+          location.bytes.end,
+        ))
+      })
+  }
+
+  pub(super) fn symbol_locations<'a>(
+    &'a self,
+    query: &'a [u8],
+  ) -> impl Iterator<Item = (&'a Symbol, Location)> {
+    let mut visible = BTreeSet::new();
+    let roots: BTreeSet<_> = self
+      .search_symbols(query)
+      .filter(|symbol| self.derived.contains_key(&symbol.id.snapshot.document))
+      .map(|symbol| self.source_snapshot(symbol.id.snapshot))
+      .collect();
+    for root in roots {
+      for group in self.projections(root, None).filter(|group| group.complete) {
+        let mut matches: BTreeMap<
+          _,
+          (BTreeSet<SymbolId>, BTreeSet<DocumentId>),
+        > = BTreeMap::new();
+        for unit in &group.documents {
+          for symbol in unit.document.symbols() {
+            let Some(location) = self
+              .occurrence(symbol.definition)
+              .and_then(|site| self.navigation_location(&site.location))
+            else {
+              continue;
+            };
+            let key = (
+              symbol.kind,
+              symbol.name.as_slice(),
+              location.snapshot,
+              location.bytes.start,
+              location.bytes.end,
+            );
+            let (symbols, documents) = matches.entry(key).or_default();
+            symbols.insert(symbol.id);
+            documents.insert(symbol.id.snapshot.document);
+          }
+        }
+        visible.extend(
+          matches
+            .into_values()
+            .filter(|(_, documents)| documents.len() == group.documents.len())
+            .flat_map(|(ids, _)| ids),
+        );
+      }
+    }
+    self.search_symbols(query).filter_map(move |symbol| {
+      if self.derived.contains_key(&symbol.id.snapshot.document)
+        && !visible.contains(&symbol.id)
+      {
+        return None;
+      }
+      let site = self.occurrence(symbol.definition)?;
+      let location = self.navigation_location(&site.location)?;
+      Some((symbol, location))
+    })
+  }
+}
+
+impl Workspace {
+  /// Resolved operands from the current analysis, projected to the requested document.
+  #[must_use]
+  pub fn source_links(
+    &self,
+    id: DocumentId,
+  ) -> Vec<(crate::interface::application::engine::Location, Snapshot)> {
+    let Some(analysis) = self.analysis() else {
+      return Vec::new();
+    };
+    let mut inputs: BTreeMap<
+      _,
+      crate::interface::application::engine::SourceInput,
+    > = BTreeMap::new();
+    for (reference, _, input) in analysis.source_inputs() {
+      inputs
+        .entry(reference)
+        .and_modify(|old| old.join(input))
+        .or_insert_with(|| input.clone());
+    }
+    let mut variants: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for key in analysis.derived.candidates.keys() {
+      if let Some(snapshot) = self.derived_keys.get(key) {
+        variants
+          .entry(key.site.clone())
+          .or_default()
+          .insert(snapshot.document);
+      }
+    }
+    let mut projected: BTreeMap<_, (Option<Snapshot>, BTreeSet<_>)> =
+      BTreeMap::new();
+    for (reference, input) in inputs {
+      let Some(operand) = analysis.source_operand(reference) else {
+        continue;
+      };
+      let Some(location) = self.navigation_location(operand) else {
+        continue;
+      };
+      if location.snapshot.document != id {
+        continue;
+      }
+      let target = match analysis.source_bindings().get(&reference) {
+        Some(DependencyState::Resolved(target))
+          if (matches!(input.operand, Value::Literal(_))
+            || input.annotation.is_some())
+            && analysis.request().source_inputs.get(&reference)
+              == Some(&input)
+            && self
+              .document(target.document)
+              .is_some_and(|doc| doc.snapshot() == *target) =>
+        {
+          Some(*target)
+        }
+        _ => None,
+      };
+      let site = self
+        .derived
+        .get(&reference.snapshot.document)
+        .map(|unit| unit.key.site.clone());
+      let entry = projected
+        .entry((
+          site,
+          location.snapshot,
+          location.bytes.start,
+          location.bytes.end,
+        ))
+        .or_insert_with(|| (target, BTreeSet::new()));
+      if entry.0 != target {
+        entry.0 = None;
+      }
+      entry.1.insert(reference.snapshot.document);
+    }
+    let mut links: BTreeMap<_, Option<Snapshot>> = BTreeMap::new();
+    for ((site, snapshot, start, end), (mut target, documents)) in projected {
+      if site.is_some_and(|site| variants.get(&site) != Some(&documents)) {
+        target = None;
+      }
+      links
+        .entry((snapshot, start, end))
+        .and_modify(|old| {
+          if *old != target {
+            *old = None;
+          }
+        })
+        .or_insert(target);
+    }
+    links
+      .into_iter()
+      .filter_map(|((snapshot, start, end), target)| {
+        target.map(|target| {
+          (
+            crate::interface::application::engine::Location {
+              snapshot,
+              bytes: start..end,
+            },
+            target,
+          )
+        })
+      })
+      .collect()
+  }
+  pub fn resolution_at(
+    &self,
+    snapshot: Snapshot,
+    offset: usize,
+  ) -> Result<Option<engine::Resolution>, Error> {
+    let document = self
+      .document(snapshot.document)
+      .ok_or(Error::UnknownDocument(snapshot.document))?;
+    if document.snapshot() != snapshot {
+      return Err(Error::StaleSnapshot(snapshot));
+    }
+    if offset > document.source().len()
+      || !document.source().is_char_boundary(offset)
+    {
+      return Err(Error::InvalidPosition);
+    }
+    if let Some(resolution) = self.projected_resolution_at(snapshot, offset) {
+      return Ok(resolution.resolution);
+    }
+    let analysis = self.analysis();
+    let mut selected: Option<((usize, u8), Option<engine::Resolution>)> = None;
+    let mut consider =
+      |width: usize, priority: u8, resolution: Option<engine::Resolution>| {
+        let key = (width, priority);
+        match &mut selected {
+          Some((previous, _)) if *previous < key => {}
+          Some((previous, result)) if *previous == key => {
+            join_resolution(result, resolution.as_ref());
+          }
+          _ => selected = Some((key, resolution)),
+        }
+      };
+    for site in document.occurrences() {
+      if self
+        .project_locations_at(&site.location, snapshot, offset)
+        .is_empty()
+      {
+        continue;
+      }
+      let width = syntax_spelling(document, site)
+        .iter()
+        .flat_map(|location| {
+          self.project_locations_at(location, snapshot, offset)
+        })
+        .map(|location| location.bytes.len())
+        .min();
+      if let Some(width) = width {
+        consider(width, 0, syntax_resolution(document, site, analysis));
+      }
+    }
+    if let Some(analysis) = analysis {
+      for role in analysis.argument_summaries(snapshot).into_values() {
+        let width = role
+          .spelling
+          .iter()
+          .flat_map(|location| {
+            self.project_locations_at(location, snapshot, offset)
+          })
+          .map(|location| location.bytes.len())
+          .min();
+        if let Some(width) = width {
+          consider(width, 1, argument_resolution(analysis, &role));
+        }
+      }
+    }
+    Ok(selected.and_then(|(_, resolution)| resolution))
+  }
+
+  fn project_locations_at(
+    &self,
+    location: &Location,
+    snapshot: Snapshot,
+    offset: usize,
+  ) -> Vec<Location> {
+    let mut locations = self.project_locations(location).unwrap_or_default();
+    locations.retain(|location| {
+      location.snapshot == snapshot && location.bytes.contains(&offset)
+    });
+    locations
+  }
+
+  fn projections(
+    &self,
+    snapshot: Snapshot,
+    analysis: Option<&Analysis>,
+  ) -> impl Iterator<Item = ProjectedDocuments<'_>> {
+    let mut groups: BTreeMap<_, ProjectedDocuments<'_>> = BTreeMap::new();
+    if self.derived.is_empty() {
+      return groups.into_values();
+    }
+    let analysis = analysis.filter(|analysis| {
+      analysis.contexts().iter().any(|context| {
+        self.source_snapshot(context.location.snapshot) == snapshot
+      }) || analysis
+        .derived
+        .candidates
+        .values()
+        .any(|candidate| candidate.origin.argument.snapshot == snapshot)
+    });
+    let derived = analysis.map(|analysis| &analysis.derived).or_else(|| {
+      self
+        .indexed
+        .get(&snapshot.document)
+        .map(|(_, derived)| derived.as_ref())
+    });
+    let Some(derived) = derived else {
+      return groups.into_values();
+    };
+    let arguments: BTreeSet<_> = analysis
+      .into_iter()
+      .flat_map(Analysis::argument_definition_documents)
+      .collect();
+    let incomplete = derived.incomplete_bodies(analysis);
+    let gaps: BTreeSet<_> = analysis
+      .into_iter()
+      .flat_map(Analysis::gaps)
+      .map(|gap| {
+        (
+          gap.location.snapshot,
+          gap.location.bytes.start,
+          gap.location.bytes.end,
+        )
+      })
+      .collect();
+    for unit in derived
+      .candidates
+      .keys()
+      .filter_map(|key| self.derived_keys.get(key))
+      .filter_map(|snapshot| self.derived.get(&snapshot.document))
+      .filter(|unit| {
+        self.source_snapshot(unit.document.snapshot()) == snapshot
+          && !arguments.contains(&unit.document.snapshot())
+      })
+    {
+      let origin = &unit.origin.argument;
+      let group = groups.entry(unit.key.site.clone()).or_insert_with(|| {
+        ProjectedDocuments {
+          documents: Vec::new(),
+          complete: true,
+        }
+      });
+      group.documents.push(unit);
+      group.complete &= !incomplete.contains(&unit.document.snapshot())
+        && !gaps.contains(&(
+          origin.snapshot,
+          origin.bytes.start,
+          origin.bytes.end,
+        ));
+    }
+    groups.into_values()
+  }
+
+  fn projected_resolution_at(
+    &self,
+    snapshot: Snapshot,
+    offset: usize,
+  ) -> Option<ProjectedResolution> {
+    let mut selected: Option<(usize, ProjectedResolution)> = None;
+    for ((start, end), projected) in
+      self.projected_resolutions(snapshot, Some(offset))
+    {
+      if !(start..end).contains(&offset) {
+        continue;
+      }
+      let width = end - start;
+      match &mut selected {
+        Some((previous, _)) if *previous < width => {}
+        Some((previous, resolution)) if *previous == width => {
+          resolution.join(&projected);
+        }
+        _ => selected = Some((width, projected)),
+      }
+    }
+    selected.map(|(_, resolution)| resolution)
+  }
+
+  pub(super) fn projected_resolutions(
+    &self,
+    snapshot: Snapshot,
+    offset: Option<usize>,
+  ) -> BTreeMap<(usize, usize), ProjectedResolution> {
+    let analysis = self.analysis();
+    let mut result: BTreeMap<_, ProjectedResolution> = BTreeMap::new();
+    for group in self.projections(snapshot, analysis) {
+      let mut projected: BTreeMap<_, ProjectedResolution> = BTreeMap::new();
+      for unit in &group.documents {
+        for site in unit.document.occurrences() {
+          for location in self
+            .project_locations(&site.location)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|location| {
+              location.snapshot == snapshot
+                && offset.is_none_or(|offset| location.bytes.contains(&offset))
+            })
+          {
+            let resolution = ProjectedResolution::new(
+              site,
+              syntax_resolution(&unit.document, site, analysis),
+            );
+            projected
+              .entry((location.bytes.start, location.bytes.end))
+              .and_modify(|old| old.join(&resolution))
+              .or_insert(resolution);
+          }
+        }
+      }
+      for (range, mut projected) in projected {
+        if !group.complete || projected.documents.len() != group.documents.len()
+        {
+          projected.resolution = None;
+        }
+        result
+          .entry(range)
+          .and_modify(|old| old.join(&projected))
+          .or_insert(projected);
+      }
+    }
+    result
+  }
+}
+
+struct ProjectedDocuments<'a> {
+  documents: Vec<&'a DerivedUnit>,
+  complete: bool,
+}
+
+pub(super) struct ProjectedResolution {
+  kind: engine::OccurrenceKind,
+  access: engine::Access,
+  name: Value,
+  documents: BTreeSet<DocumentId>,
+  pub(super) resolution: Option<engine::Resolution>,
+}
+
+impl ProjectedResolution {
+  fn new(site: &Occurrence, resolution: Option<engine::Resolution>) -> Self {
+    Self {
+      kind: site.kind,
+      access: site.access,
+      name: site.name.clone(),
+      documents: [site.id.snapshot.document].into(),
+      resolution,
+    }
+  }
+
+  fn join(&mut self, other: &Self) {
+    self.documents.extend(other.documents.iter().copied());
+    if self.kind != other.kind
+      || self.access != other.access
+      || self.name != other.name
+    {
+      self.resolution = None;
+    } else {
+      join_resolution(&mut self.resolution, other.resolution.as_ref());
+    }
+  }
+}
+
+fn join_resolution(
+  left: &mut Option<engine::Resolution>,
+  right: Option<&engine::Resolution>,
+) {
+  match (left.as_mut(), right) {
+    (Some(left), Some(right)) => left.join(right),
+    _ => *left = None,
+  }
+}
+
+pub(super) fn syntax_spelling(
+  document: &super::Document,
+  site: &Occurrence,
+) -> Vec<Location> {
+  if site.kind != engine::OccurrenceKind::Command {
+    return vec![site.location.clone()];
+  }
+  if !matches!(site.name, Value::Literal(_)) {
+    return Vec::new();
+  }
+  let Some(node) = document.tree.root_node().named_descendant_for_byte_range(
+    site.location.bytes.start,
+    site.location.bytes.end,
+  ) else {
+    return Vec::new();
+  };
+  engine::word::literal(node, document.source().as_bytes())
+    .fragments
+    .into_iter()
+    .filter_map(|fragment| fragment.source)
+    .map(|bytes| Location {
+      snapshot: site.location.snapshot,
+      bytes,
+    })
+    .collect()
+}
+
+fn argument_resolution(
+  analysis: &Analysis,
+  role: &engine::ArgumentRole,
+) -> Option<engine::Resolution> {
+  let site = engine::UseSite::argument(&role.location);
+  match &role.kind {
+    Some(engine::ArgumentKind::Variable {
+      access: engine::Access::Write,
+      ..
+    }) => {
+      let candidates =
+        analysis.written_definitions(site).collect::<BTreeSet<_>>();
+      (!candidates.is_empty()).then_some(engine::Resolution {
+        candidates,
+        ..Default::default()
+      })
+    }
+    Some(
+      engine::ArgumentKind::Variable {
+        access: engine::Access::Unknown,
+        ..
+      }
+      | engine::ArgumentKind::Number,
+    )
+    | None => None,
+    _ => analysis.summarize(site).resolution,
+  }
+}
+
+pub(in crate::interface::application::engine) fn syntax_resolution(
+  document: &super::Document,
+  site: &Occurrence,
+  analysis: Option<&Analysis>,
+) -> Option<engine::Resolution> {
+  if matches!(
+    site.access,
+    engine::Access::Definition | engine::Access::Write
+  ) {
+    document
+      .symbols()
+      .iter()
+      .find(|symbol| symbol.definition == site.id)
+      .map(|symbol| engine::Resolution {
+        candidates: [symbol.id].into(),
+        ..Default::default()
+      })
+  } else {
+    (site.kind == engine::OccurrenceKind::Command)
+      .then(|| engine::analysis::invariant_command(&site.name))
+      .flatten()
+      .or_else(|| {
+        let use_site = engine::UseSite::Syntax(site.id);
+        if let Some(analysis) = analysis
+          && analysis.resolutions(use_site).next().is_some()
+        {
+          analysis.summarize(use_site).resolution
+        } else {
+          document.deferred_resolution(use_site)
+        }
+      })
+  }
+}
+
+#[cfg(test)]
+#[path = "../../../../../tests/implementation/derived.rs"]
+mod tests;

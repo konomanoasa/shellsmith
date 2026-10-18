@@ -1,0 +1,50 @@
+[package]
+name = "konomanoasa-shellsmith"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Language server for shell scripts."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/konomanoasa/shellsmith"
+keywords = ["language-server", "lsp", "posix", "shell"]
+
+[lib]
+name = "shellsmith"
+
+[[bin]]
+name = "shellsmith"
+path = "src/main.rs"
+
+[dependencies]
+async-lsp = { version = "0.2", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+ignore = "0.4"
+imbl = "7.0.0"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "io-std", "io-util", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tower = { version = "0.5", default-features = false }
+typed-arena = "2"
+tree-sitter = "0.27.1"
+tree-sitter-sh = "0.21.0"
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "time"] }
+
+[[bench]]
+name = "engine"
+harness = false
+
+[[bench]]
+name = "lsp"
+harness = false
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+missing_errors_doc = "allow"

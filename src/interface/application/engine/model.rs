@@ -21,6 +21,17 @@ pub struct Location {
   pub bytes: Range<usize>,
 }
 
+impl Location {
+  pub(in crate::interface::application) fn contains(
+    &self,
+    inner: &Self,
+  ) -> bool {
+    self.snapshot == inner.snapshot
+      && self.bytes.start <= inner.bytes.start
+      && inner.bytes.end <= self.bytes.end
+  }
+}
+
 macro_rules! entity_id {
   ($($name:ident),+) => {$ (
     #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -122,7 +133,7 @@ pub struct Context {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Classification {
   pub location: Location,
-  pub capture: String,
+  pub capture: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,7 +217,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-pub(in crate::interface::application::engine) fn check_cancelled(
+pub(in crate::interface::application) fn check_cancelled(
   cancelled: &AtomicBool,
 ) -> Result<(), Error> {
   if cancelled.load(Ordering::Relaxed) {

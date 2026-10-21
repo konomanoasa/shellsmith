@@ -1,5 +1,5 @@
-use super::engine::{DocumentId, Location};
-use super::{Application, Error, check};
+use super::engine::{DocumentId, Location, check_cancelled};
+use super::{Application, Error};
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 
@@ -17,7 +17,7 @@ impl Application {
       .ok_or(super::engine::Error::UnknownDocument(id))?
       .snapshot();
     let resolution = self.workspace.resolution_at(snapshot, offset)?;
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let Some(resolution) = resolution else {
       return Ok(Vec::new());
     };
@@ -26,12 +26,11 @@ impl Application {
     }
     let mut locations = BTreeMap::new();
     for candidate in resolution.candidates {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       let Some(location) = self
         .workspace
         .symbol(candidate)
-        .and_then(|symbol| self.workspace.occurrence(symbol.definition))
-        .and_then(|site| self.workspace.navigation_location(&site.location))
+        .and_then(|symbol| self.workspace.definition_location(symbol))
       else {
         return Ok(Vec::new());
       };

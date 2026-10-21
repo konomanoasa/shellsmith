@@ -430,8 +430,14 @@ mod bindings {
     for source in [
       "PWD=old; cd somewhere; : \"$PWD\"",
       "x=0; local x=1; : \"$x\"",
+      "x=0; [[ -n x ]]; : \"$x\"",
+      "x=0; if select; then :; fi; : \"$x\"",
+      "x=0; label: operand; : \"$x\"",
+      "x=0; time() { :; }; time; : \"$x\"",
       "x=0; command \"$(unknown)\"; x=1; : \"$x\"",
       "x=0; fc -s; x=1; : \"$x\"",
+      "x=0; command -v -x g; : \"$x\"",
+      "x=0; f() { if c; then f; : \"$x\"; fi; command -v -x g; }; f",
     ] {
       let (workspace, analysis) = analyze(source);
       let name = if source.starts_with("PWD") {
@@ -490,6 +496,34 @@ mod bindings {
         [Alternative::Builtin].into(),
       ]
     );
+  }
+
+  #[test]
+  fn unordered_variable_writes_leave_special_and_positional_parameters_ordered()
+  {
+    let parameter = Resolution {
+      alternatives: [Alternative::SpecialParameter].into(),
+      ..Resolution::default()
+    };
+    let variable = Resolution {
+      alternatives: [Alternative::Unset].into(),
+      issues: [ResolutionIssue::EvaluationOrder].into(),
+      ..Resolution::default()
+    };
+    for (name, expected) in [
+      ("1", &parameter),
+      ("?", &parameter),
+      ("#", &parameter),
+      ("x", &variable),
+    ] {
+      let source = format!("set -- p; n=y; v=$(( $n = 1 )) : >\"${name}\"");
+      let (workspace, analysis) = analyze(&source);
+      let resolutions: Vec<_> = reads(&workspace, &analysis, name.as_bytes())
+        .iter()
+        .map(|site| &site.resolution)
+        .collect();
+      assert_eq!(resolutions, [expected], "{source}");
+    }
   }
 
   #[test]
@@ -611,6 +645,19 @@ mod bindings {
   }
 
   #[test]
+  fn later_case_clauses_follow_expanded_patterns_and_pure_alternatives_stay_ordered()
+   {
+    let (workspace, analysis) =
+      analyze("case a in ${x=1}) ;; *|b) : \"$x\";; esac");
+    let x = workspace.symbols_named(b"x").next().unwrap().id;
+    assert_eq!(
+      reads(&workspace, &analysis, b"x")[1].resolution.status(),
+      ResolutionStatus::Resolved(x)
+    );
+    assert_eq!(analysis.gaps(), []);
+  }
+
+  #[test]
   fn substitutions_are_isolated_and_pipelines_keep_environment_uncertainty() {
     let (workspace, analysis) =
       analyze("x=1; : $(x=2; : \"$x\"); : \"$x\"; { x=3; } | cat; : \"$x\"");
@@ -725,7 +772,11 @@ mod bindings {
 
   #[test]
   fn unspecified_evaluation_order_never_claims_a_single_reaching_write() {
-    for source in ["x=0; x=1 y=$x external", "x=0; : $(( (x=1) + x ))"] {
+    for source in [
+      "x=0; x=1 y=$x external",
+      "x=0; : $(( (x=1) + x ))",
+      "case a in a|${x=1}) : \"$x\";; esac",
+    ] {
       let (workspace, analysis) = analyze(source);
       let uses = reads(&workspace, &analysis, b"x");
       assert_ne!(uses, [] as [&ResolvedUse; 0]);
@@ -766,26 +817,19 @@ mod bindings {
 
   #[test]
   fn repeated_source_reads_use_separate_contexts_and_return_their_writes() {
-    let root = support::parse(1, 1, "x=1; . lib; x=2; . lib; : \"$x\"");
+    let root = support::parse(1, 1, "x=1; . /lib; x=2; . /lib; : \"$x\"");
     let library = support::parse(2, 1, ": \"$x\"; x=3");
     let root_definitions: Vec<_> =
       root.symbols().iter().map(|symbol| symbol.id).collect();
     let library_definition = library.symbols()[0].id;
-    let target = library.snapshot();
-    let references: Vec<_> =
-      root.references().iter().map(|site| site.id).collect();
     let mut request = AnalysisRequest::new(root.snapshot());
     request.initial = InitialEnvironment::empty();
     let mut workspace = Workspace::default();
     workspace.insert(root).unwrap();
-    workspace.insert(library).unwrap();
-    for reference in references {
-      workspace
-        .set_reference(reference, DependencyState::Resolved(target))
-        .unwrap();
-    }
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let mut inputs = support::Inputs::sources([("/lib", library)]);
+    let analysis = workspace
+      .analyze(request, &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     let uses = reads(&workspace, &analysis, b"x");
     assert_eq!(
       uses
@@ -807,21 +851,17 @@ mod bindings {
     let root = support::parse(
       1,
       1,
-      "load() { . lib; }; x=1; load; x=2; load; f; : \"$x\"",
+      "load() { . /lib; }; x=1; load; x=2; load; f; : \"$x\"",
     );
     let library = support::parse(2, 1, ": \"$x\"; f() { x=3; }; return; x=4");
     let mut request = AnalysisRequest::new(root.snapshot());
     request.initial = InitialEnvironment::empty();
-    let reference = root.references()[0].id;
-    let target = library.snapshot();
     let mut workspace = Workspace::default();
     workspace.insert(root).unwrap();
-    workspace.insert(library).unwrap();
-    workspace
-      .set_reference(reference, DependencyState::Resolved(target))
+    let mut inputs = support::Inputs::sources([("/lib", library)]);
+    let analysis = workspace
+      .analyze(request, &mut inputs, &AtomicBool::new(false))
       .unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
     let ids: Vec<_> = workspace
       .symbols_named(b"x")
       .map(|symbol| symbol.id)
@@ -852,39 +892,67 @@ mod bindings {
   }
 
   #[test]
-  fn source_cycles_and_failed_or_invalidated_bindings_preserve_unknown_effects()
-  {
-    let root = support::parse(1, 1, "x=1; . lib; x=2; : \"$x\"");
-    let library = support::parse(2, 1, "again() { . root; }; again");
+  fn sourced_files_start_with_the_loading_status_and_empty_files_complete_with_zero()
+   {
+    for (entry, body, expected) in [
+      ("(exit 3); . /lib; out=$?; : \"$out\"", "# comment\n", "0"),
+      ("(exit 3); . /lib", "out=$?; : \"$out\"", "3"),
+      (". /lib; out=$?; : \"$out\"", "(exit 3)", "3"),
+    ] {
+      let root = support::parse(1, 1, entry);
+      let library = support::parse(2, 1, body);
+      let mut request = AnalysisRequest::new(root.snapshot());
+      request.initial = InitialEnvironment::empty();
+      let mut workspace = Workspace::default();
+      workspace.insert(root).unwrap();
+      let mut inputs = support::Inputs::sources([("/lib", library)]);
+      let analysis = workspace
+        .analyze(request, &mut inputs, &AtomicBool::new(false))
+        .unwrap();
+      let read = reads(&workspace, &analysis, b"out")[0];
+      assert_eq!(
+        analysis.value(read.site.syntax().unwrap(), read.context),
+        Some(&Value::Literal(expected.as_bytes().to_vec())),
+        "{entry} with {body:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn source_cycles_failures_and_stale_snapshots_preserve_unknown_effects() {
+    use shellsmith::interface::application::engine::SourceDocument;
+
+    let root = support::parse(1, 1, "x=1; . /lib; x=2; : \"$x\"");
+    let library = support::parse(2, 1, "again() { . /root; }; again");
     let entry = root.snapshot();
     let target = library.snapshot();
-    let root_reference = root.references()[0].id;
-    let library_reference = library.references()[0].id;
     let mut request = AnalysisRequest::new(entry);
     request.initial = InitialEnvironment::empty();
     let mut workspace = Workspace::default();
     workspace.insert(root).unwrap();
-    workspace.insert(library).unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    workspace
-      .set_reference(root_reference, DependencyState::Resolved(target))
+    let mut inputs = support::Inputs::sources([
+      ("/lib", library),
+      ("/root", support::parse(1, 1, "x=1; . /lib; x=2; : \"$x\"")),
+    ]);
+    let cyclic = workspace
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
       .unwrap();
-    workspace
-      .set_reference(library_reference, DependencyState::Resolved(entry))
-      .unwrap();
-    let cyclic = workspace.analyze(&AtomicBool::new(false)).unwrap();
     assert!(
       reads(&workspace, &cyclic, b"x")[0]
         .resolution
         .issues
         .contains(&ResolutionIssue::Recursion)
     );
+    let input = inputs.source_queries[0].clone();
+    let library = inputs.sources.remove(&input).unwrap();
     for state in [
-      DependencyState::Unresolved("dynamic target".into()),
-      DependencyState::Failed("read failed".into()),
+      SourceDocument::Unresolved("dynamic target".into()),
+      SourceDocument::Failed("read failed".into()),
     ] {
-      workspace.set_reference(root_reference, state).unwrap();
-      let failed = workspace.analyze(&AtomicBool::new(false)).unwrap();
+      inputs.sources.insert(input.clone(), state);
+      let failed = workspace
+        .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+        .unwrap();
       assert!(
         reads(&workspace, &failed, b"x")[0]
           .resolution
@@ -892,17 +960,12 @@ mod bindings {
           .contains(&ResolutionIssue::UnresolvedSource)
       );
     }
-    workspace
-      .set_reference(root_reference, DependencyState::Resolved(target))
-      .unwrap();
+    inputs.sources.insert(input, library);
     workspace.insert(support::parse(2, 2, "x=3")).unwrap();
-    let invalidated = workspace.analyze(&AtomicBool::new(false)).unwrap();
-    assert!(
-      reads(&workspace, &invalidated, b"x")[0]
-        .resolution
-        .issues
-        .contains(&ResolutionIssue::UnresolvedSource)
-    );
+    assert!(matches!(
+      workspace.analyze(request, &mut inputs, &AtomicBool::new(false)),
+      Err(Error::StaleSnapshot(snapshot)) if snapshot == target
+    ));
   }
 
   #[test]
@@ -910,21 +973,17 @@ mod bindings {
     let root = support::parse(
       1,
       1,
-      "x=0; while condition; do . lib; x=1; done; : \"$x\"",
+      "x=0; while condition; do . /lib; x=1; done; : \"$x\"",
     );
     let library = support::parse(2, 1, "break");
     let mut request = AnalysisRequest::new(root.snapshot());
     request.initial = InitialEnvironment::empty();
-    let reference = root.references()[0].id;
-    let target = library.snapshot();
     let mut workspace = Workspace::default();
     workspace.insert(root).unwrap();
-    workspace.insert(library).unwrap();
-    workspace
-      .set_reference(reference, DependencyState::Resolved(target))
+    let mut inputs = support::Inputs::sources([("/lib", library)]);
+    let analysis = workspace
+      .analyze(request, &mut inputs, &AtomicBool::new(false))
       .unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
     assert!(
       reads(&workspace, &analysis, b"x")[0]
         .resolution
@@ -1008,8 +1067,14 @@ mod bindings {
 
   #[test]
   fn input_changes_invalidate_published_results_and_reject_stale_publication() {
-    let (mut workspace, analysis) = analyze("x=1; : \"$x\"");
-    let old = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let (mut workspace, old) = analyze("x=1; : \"$x\"");
+    let analysis = workspace
+      .analyze(
+        old.request().clone(),
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     workspace.publish_analysis(analysis).unwrap();
     assert!(workspace.analysis().is_some());
     workspace
@@ -1020,13 +1085,24 @@ mod bindings {
     let entry = workspace.document(DocumentId(1)).unwrap().snapshot();
     let mut request = AnalysisRequest::new(entry);
     request.initial = InitialEnvironment::empty();
-    workspace.set_analysis_request(request.clone()).unwrap();
-    let old = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let old = workspace
+      .analyze(
+        request.clone(),
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     request
       .initial
       .variables
       .insert(b"external".to_vec(), InitialBinding::External);
-    workspace.set_analysis_request(request).unwrap();
+    workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     assert_eq!(workspace.publish_analysis(old), Err(Error::StaleAnalysis));
   }
 
@@ -1072,8 +1148,13 @@ mod bindings {
       .initial
       .variables
       .insert(b"x".to_vec(), InitialBinding::External);
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let analysis = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     let uses = reads(&workspace, &analysis, b"x");
     assert_eq!(
       uses[0].resolution.alternatives,
@@ -1092,8 +1173,13 @@ mod bindings {
     }
     let mut request = AnalysisRequest::new(analysis.request().entry);
     request.initial = InitialEnvironment::default();
-    workspace.set_analysis_request(request).unwrap();
-    let unknown = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let unknown = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     let uses = reads(&workspace, &unknown, b"x");
     assert_eq!(
       uses[0].resolution.issues,
@@ -1186,45 +1272,106 @@ mod bindings {
     );
   }
   #[test]
-  fn dynamic_source_bindings_require_matching_values_from_the_current_analysis()
-  {
-    let document = support::parse(1, 1, ". \"$HOME/lib.sh\"; : \"$loaded\"\n");
-    let reference = document.references()[0].id;
-    let mut request = AnalysisRequest::new(document.snapshot());
-    request.initial = InitialEnvironment::empty();
-    request
-      .initial
-      .environment
-      .insert(b"HOME".to_vec(), b"/initial".to_vec());
-    let library = support::parse(2, 1, "loaded=1\n");
-    let definition = library.symbols()[0].id;
-    let target = library.snapshot();
-    let mut workspace = Workspace::default();
-    workspace.insert(document).unwrap();
-    workspace.insert(library).unwrap();
-    workspace
-      .set_reference(reference, DependencyState::Resolved(target))
-      .unwrap();
-    for (value, resolves) in [
-      (None, false),
-      (Some(b"/initial/lib.sh".to_vec()), true),
-      (Some(b"/other/lib.sh".to_vec()), false),
+  fn source_inputs_use_the_provider_conditions_instead_of_registered_dependencies()
+   {
+    use shellsmith::interface::application::engine::{
+      SourceDocument, SourceInput,
+    };
+    use std::sync::Arc;
+
+    for (operand, path, cwd, search_path) in [
+      ("\"$HOME/lib.sh\"", "/actual/lib.sh", None, None),
+      ("./lib.sh", "./lib.sh", Some("/actual"), None),
+      ("lib.sh", "lib.sh", None, Some("/actual")),
     ] {
-      request.source_inputs.clear();
-      if let Some(value) = value {
-        request.source_inputs.insert(
-          reference,
-          shellsmith::interface::application::engine::SourceInput {
-            operand: Value::Literal(value),
-            annotation: None,
-            cwd: None,
-            search_path: None,
-          },
+      let input = SourceInput {
+        operand: Value::Literal(path.as_bytes().to_vec()),
+        cwd: cwd.map(|path| Value::Literal(path.as_bytes().to_vec())),
+        search_path: search_path
+          .map(|path| Value::Literal(path.as_bytes().to_vec())),
+        annotation: None,
+      };
+      for supplied in ["missing", "mismatched", "matching"] {
+        let root = support::parse(1, 1, &format!(". {operand}; : \"$loaded\""));
+        let reference = root.references()[0].id;
+        let library = support::parse(2, 1, "loaded=registered");
+        let registered = library.symbols()[0].id;
+        let target = library.snapshot();
+        let current = Arc::new(support::parse(3, 1, "loaded=current"));
+        let definition = current.symbols()[0].id;
+        let mut request = AnalysisRequest::new(root.snapshot());
+        request.initial = InitialEnvironment::empty();
+        request.initial.cwd = Some(b"/actual".to_vec());
+        request
+          .initial
+          .values
+          .insert(b"PATH".to_vec(), b"/actual".to_vec());
+        request
+          .initial
+          .values
+          .insert(b"HOME".to_vec(), b"/actual".to_vec());
+        let mut workspace = Workspace::default();
+        workspace.insert(root).unwrap();
+        workspace.insert(library).unwrap();
+        workspace
+          .set_reference(reference, DependencyState::Resolved(target))
+          .unwrap();
+        let mut inputs = support::Inputs::default();
+        if supplied != "missing" {
+          let mut key = input.clone();
+          if supplied == "mismatched" {
+            if key.cwd.is_some() {
+              key.cwd = Some(Value::Literal(b"/other".to_vec()));
+            } else if key.search_path.is_some() {
+              key.search_path = Some(Value::Literal(b"/other".to_vec()));
+            } else {
+              key.operand = Value::Literal(b"/other/lib.sh".to_vec());
+            }
+          }
+          inputs
+            .sources
+            .insert(key, SourceDocument::Resolved(current.clone()));
+        }
+        let result = workspace
+          .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+          .unwrap();
+        assert_eq!(
+          inputs.source_queries.as_slice(),
+          std::slice::from_ref(&input),
+          "{operand}: {supplied}"
         );
+        assert_eq!(
+          result.references(registered).count(),
+          0,
+          "{operand}: {supplied}"
+        );
+        assert_eq!(
+          result.references(definition).count(),
+          usize::from(supplied == "matching"),
+          "{operand}: {supplied}"
+        );
+        workspace.publish_analysis(result).unwrap();
+        let targets: Vec<_> = workspace
+          .source_links(DocumentId(1))
+          .into_iter()
+          .map(|(_, target)| target)
+          .collect();
+        assert_eq!(
+          targets,
+          if supplied == "matching" {
+            vec![current.snapshot()]
+          } else {
+            Vec::new()
+          }
+        );
+        inputs.sources.clear();
+        let again = workspace
+          .analyze(request, &mut inputs, &AtomicBool::new(false))
+          .unwrap();
+        assert_eq!(again.references(definition).count(), 0);
+        workspace.publish_analysis(again).unwrap();
+        assert_eq!(workspace.source_links(DocumentId(1)), []);
       }
-      workspace.set_analysis_request(request.clone()).unwrap();
-      let result = workspace.analyze(&AtomicBool::new(false)).unwrap();
-      assert_eq!(result.references(definition).count(), usize::from(resolves));
     }
   }
 }
@@ -1235,31 +1382,48 @@ mod updates {
   use shellsmith::interface::application::engine::{
     Analysis, AnalysisRequest, DependencyState, DocumentId, Error,
     InitialEnvironment, OccurrenceKind, ResolutionIssue, ResolutionStatus,
-    Value, Workspace,
+    SourceDocument, SourceInput, Value, Workspace,
   };
+  use std::sync::Arc;
   use std::sync::atomic::AtomicBool;
 
-  fn workspace(target: u64, reverse: bool) -> Workspace {
-    let root = support::parse(1, 1, ". lib; : \"$x\"; dormant() { : \"$y\"; }");
+  fn workspace(
+    target: u64,
+    reverse: bool,
+  ) -> (Workspace, AnalysisRequest, support::Inputs) {
+    let root =
+      support::parse(1, 1, ". /lib; : \"$x\"; dormant() { : \"$y\"; }");
     let first = support::parse(2, 1, "x=1");
     let second = support::parse(3, 1, "x=2");
     let reference = root.references()[0].id;
     let mut request = AnalysisRequest::new(root.snapshot());
     request.initial = InitialEnvironment::empty();
-    let mut documents = vec![root, first, second];
+    let mut documents: Vec<_> =
+      [root, first, second].into_iter().map(Arc::new).collect();
+    let mut inputs = support::Inputs::default();
+    inputs.sources.insert(
+      SourceInput {
+        operand: Value::Literal(b"/lib".to_vec()),
+        cwd: None,
+        search_path: None,
+        annotation: None,
+      },
+      SourceDocument::Resolved(
+        documents[usize::try_from(target - 1).unwrap()].clone(),
+      ),
+    );
     if reverse {
       documents.reverse();
     }
     let mut workspace = Workspace::default();
     for document in documents {
-      workspace.insert(document).unwrap();
+      workspace.insert_shared(document).unwrap();
     }
     let target = workspace.document(DocumentId(target)).unwrap().snapshot();
     workspace
       .set_reference(reference, DependencyState::Resolved(target))
       .unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    workspace
+    (workspace, request, inputs)
   }
 
   fn equivalent(left: &Analysis, right: &Analysis) {
@@ -1277,9 +1441,13 @@ mod updates {
   #[test]
   fn rebinding_without_text_changes_rejects_old_results_and_matches_fresh_analysis()
    {
-    let mut updated = workspace(2, false);
-    let old = updated.analyze(&AtomicBool::new(false)).unwrap();
-    let published = updated.analyze(&AtomicBool::new(false)).unwrap();
+    let (mut updated, request, mut inputs) = workspace(2, false);
+    let old = updated
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
+    let published = updated
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     updated.publish_analysis(published).unwrap();
     let root = updated.document(DocumentId(1)).unwrap();
     let reference = root.references()[0].id;
@@ -1289,9 +1457,15 @@ mod updates {
       .unwrap();
     assert!(updated.analysis().is_none());
     assert_eq!(updated.publish_analysis(old), Err(Error::StaleAnalysis));
-    let new = updated.analyze(&AtomicBool::new(false)).unwrap();
-    let mut fresh = workspace(3, true);
-    let fresh_analysis = fresh.analyze(&AtomicBool::new(false)).unwrap();
+    *inputs.sources.values_mut().next().unwrap() =
+      SourceDocument::Resolved(Arc::new(support::parse(3, 1, "x=2")));
+    let new = updated
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
+    let (mut fresh, fresh_request, mut fresh_inputs) = workspace(3, true);
+    let fresh_analysis = fresh
+      .analyze(fresh_request, &mut fresh_inputs, &AtomicBool::new(false))
+      .unwrap();
     equivalent(&new, &fresh_analysis);
     let previous = updated.symbols_named(b"x").next().unwrap().id;
     let current = updated.document(DocumentId(3)).unwrap().symbols()[0].id;
@@ -1306,13 +1480,19 @@ mod updates {
   #[test]
   fn removal_and_reinsertion_require_current_bindings_and_keep_snapshot_provenance()
    {
-    let mut workspace = workspace(2, false);
-    let old = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let (mut workspace, request, mut inputs) = workspace(2, false);
+    let old = workspace
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     let target = workspace.document(DocumentId(2)).unwrap().snapshot();
     let reference =
       workspace.document(DocumentId(1)).unwrap().references()[0].id;
     workspace.remove(target).unwrap();
-    let missing = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let input = inputs.sources.keys().next().unwrap().clone();
+    inputs.sources.clear();
+    let missing = workspace
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     assert!(
       missing
         .gaps()
@@ -1331,7 +1511,13 @@ mod updates {
     workspace
       .set_reference(reference, DependencyState::Resolved(current))
       .unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    inputs.sources.insert(
+      input,
+      SourceDocument::Resolved(Arc::new(support::parse(2, 2, "x=3"))),
+    );
+    let analysis = workspace
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     assert_eq!(
       analysis.source_bindings()[&reference],
       DependencyState::Resolved(current)
@@ -1375,8 +1561,13 @@ mod updates {
     request.initial = InitialEnvironment::empty();
     let mut workspace = Workspace::default();
     workspace.insert(document).unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let analysis = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     let summary = analysis.summarize(
       shellsmith::interface::application::engine::UseSite::Syntax(x),
     );
@@ -1415,30 +1606,40 @@ mod updates {
 
   #[test]
   fn cancellation_and_rejected_requests_leave_the_published_result_intact() {
-    let mut workspace = workspace(2, false);
-    let report = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let (mut workspace, request, mut inputs) = workspace(2, false);
+    let report = workspace
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     let mut invalid = report.request().clone();
     invalid.limits.value_bytes = 0;
     workspace.publish_analysis(report).unwrap();
     assert!(matches!(
-      workspace.set_analysis_request(invalid),
+      workspace.analyze(invalid, &mut inputs, &AtomicBool::new(false)),
       Err(Error::InvalidAnalysis(_))
     ));
     assert!(matches!(
-      workspace.analyze(&AtomicBool::new(true)),
+      workspace.analyze(request.clone(), &mut inputs, &AtomicBool::new(true)),
       Err(Error::Cancelled)
     ));
     assert!(workspace.analysis().is_some());
-    let old = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let old = workspace
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     let mut changed = old.request().clone();
     changed.limits.value_bytes += 1;
-    workspace.set_analysis_request(changed).unwrap();
+    workspace
+      .analyze(changed, &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     assert!(workspace.analysis().is_none());
     assert_eq!(workspace.publish_analysis(old), Err(Error::StaleAnalysis));
-    let old = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let old = workspace
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     let mut changed = old.request().clone();
     changed.entry = workspace.document(DocumentId(3)).unwrap().snapshot();
-    workspace.set_analysis_request(changed).unwrap();
+    workspace
+      .analyze(changed, &mut inputs, &AtomicBool::new(false))
+      .unwrap();
     assert_eq!(workspace.publish_analysis(old), Err(Error::StaleAnalysis));
   }
 
@@ -1455,8 +1656,13 @@ mod updates {
       request.initial = InitialEnvironment::empty();
       let mut workspace = Workspace::default();
       workspace.insert(document).unwrap();
-      workspace.set_analysis_request(request.clone()).unwrap();
-      let damaged = workspace.analyze(&AtomicBool::new(false)).unwrap();
+      let damaged = workspace
+        .analyze(
+          request.clone(),
+          &mut support::Inputs::default(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
       assert!(
         damaged
           .gaps()
@@ -1473,8 +1679,13 @@ mod updates {
         Err(Error::StaleAnalysis)
       );
       request.entry = workspace.document(DocumentId(1)).unwrap().snapshot();
-      workspace.set_analysis_request(request).unwrap();
-      let repaired = workspace.analyze(&AtomicBool::new(false)).unwrap();
+      let repaired = workspace
+        .analyze(
+          request,
+          &mut support::Inputs::default(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
       assert_eq!(repaired.gaps(), []);
       let definition = workspace.symbols_named(b"x").next().unwrap().id;
       assert_eq!(
@@ -1499,7 +1710,6 @@ mod updates {
     request.initial = InitialEnvironment::empty();
     let mut workspace = Workspace::default();
     workspace.insert(document).unwrap();
-    workspace.set_analysis_request(request).unwrap();
     let cancelled = AtomicBool::new(false);
     std::thread::scope(|scope| {
       scope.spawn(|| {
@@ -1507,7 +1717,7 @@ mod updates {
         cancelled.store(true, Ordering::Relaxed);
       });
       assert!(matches!(
-        workspace.analyze(&cancelled),
+        workspace.analyze(request, &mut support::Inputs::default(), &cancelled),
         Err(Error::Cancelled)
       ));
     });
@@ -1519,8 +1729,8 @@ mod stack {
   use crate::support;
 
   use shellsmith::interface::application::engine::{
-    Analysis, AnalysisLimits, AnalysisRequest, DependencyState, DocumentId,
-    InitialEnvironment, OccurrenceKind, ResolutionStatus, Value, Workspace,
+    Analysis, AnalysisLimits, AnalysisRequest, DocumentId, InitialEnvironment,
+    OccurrenceKind, ResolutionStatus, Value, Workspace,
   };
   use std::fmt::Write;
   use std::sync::atomic::AtomicBool;
@@ -1528,16 +1738,18 @@ mod stack {
   fn analyze_on_small_stack(
     mut workspace: Workspace,
     limits: AnalysisLimits,
+    mut inputs: support::Inputs,
   ) -> (Workspace, Analysis) {
     let entry = workspace.document(DocumentId(1)).unwrap().snapshot();
     let mut request = AnalysisRequest::new(entry);
     request.initial = InitialEnvironment::empty();
     request.limits = limits;
-    workspace.set_analysis_request(request).unwrap();
     std::thread::Builder::new()
       .stack_size(256 * 1024)
       .spawn(move || {
-        let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+        let analysis = workspace
+          .analyze(request, &mut inputs, &AtomicBool::new(false))
+          .unwrap();
         (workspace, analysis)
       })
       .unwrap()
@@ -1580,8 +1792,11 @@ mod stack {
         opening.repeat(depth),
         closing.repeat(depth),
       );
-      let (workspace, analysis) =
-        analyze_on_small_stack(workspace(&source), AnalysisLimits::default());
+      let (workspace, analysis) = analyze_on_small_stack(
+        workspace(&source),
+        AnalysisLimits::default(),
+        support::Inputs::default(),
+      );
       let definitions: Vec<_> = workspace
         .symbols_named(b"x")
         .map(|symbol| symbol.id)
@@ -1603,8 +1818,11 @@ mod stack {
       format!("$(({}x{}))", "(".repeat(depth), ")".repeat(depth)),
     ] {
       let source = format!("x=0; x={expression}; : \"$x\"");
-      let (workspace, analysis) =
-        analyze_on_small_stack(workspace(&source), AnalysisLimits::default());
+      let (workspace, analysis) = analyze_on_small_stack(
+        workspace(&source),
+        AnalysisLimits::default(),
+        support::Inputs::default(),
+      );
       let definitions: Vec<_> = workspace
         .symbols_named(b"x")
         .map(|symbol| symbol.id)
@@ -1629,8 +1847,11 @@ mod stack {
         .unwrap();
     }
     writeln!(source, "f{}; : \"$x\"", calls - 1).unwrap();
-    let (workspace, analysis) =
-      analyze_on_small_stack(workspace(&source), AnalysisLimits::default());
+    let (workspace, analysis) = analyze_on_small_stack(
+      workspace(&source),
+      AnalysisLimits::default(),
+      support::Inputs::default(),
+    );
     let assignment = workspace.symbols_named(b"x").nth(1).unwrap().id;
     assert_eq!(
       resolved_reads(&workspace, &analysis, b"x"),
@@ -1645,33 +1866,26 @@ mod stack {
     let documents = 256;
     let mut workspace = Workspace::default();
     workspace
-      .insert(support::parse(1, 1, ". lib2; : \"$x\"; . lib2; : \"$x\"\n"))
+      .insert(support::parse(
+        1,
+        1,
+        ". /lib2; : \"$x\"; . /lib2; : \"$x\"\n",
+      ))
       .unwrap();
+    let mut libraries = Vec::new();
     for id in 2..=documents {
       let source = if id == documents {
         "x=1; return; x=2\n".to_owned()
       } else {
-        format!(". lib{}; return; x=3\n", id + 1)
+        format!(". /lib{}; return; x=3\n", id + 1)
       };
-      workspace.insert(support::parse(id, 1, &source)).unwrap();
+      libraries.push((format!("/lib{id}"), support::parse(id, 1, &source)));
     }
-    for id in 1..documents {
-      let references: Vec<_> = workspace
-        .document(DocumentId(id))
-        .unwrap()
-        .references()
-        .iter()
-        .map(|reference| reference.id)
-        .collect();
-      let target = workspace.document(DocumentId(id + 1)).unwrap().snapshot();
-      for reference in references {
-        workspace
-          .set_reference(reference, DependencyState::Resolved(target))
-          .unwrap();
-      }
-    }
+    let (paths, bodies): (Vec<_>, Vec<_>) = libraries.into_iter().unzip();
+    let inputs =
+      support::Inputs::sources(paths.iter().map(String::as_str).zip(bodies));
     let (workspace, analysis) =
-      analyze_on_small_stack(workspace, AnalysisLimits::default());
+      analyze_on_small_stack(workspace, AnalysisLimits::default(), inputs);
     let assignment =
       workspace.document(DocumentId(documents)).unwrap().symbols()[0].id;
     assert_eq!(
@@ -1684,8 +1898,11 @@ mod stack {
   #[test]
   fn nested_command_forwarding_reaches_the_utility() {
     let source = format!("{}readonly x=1; : \"$x\"", "command ".repeat(1024));
-    let (workspace, analysis) =
-      analyze_on_small_stack(workspace(&source), AnalysisLimits::default());
+    let (workspace, analysis) = analyze_on_small_stack(
+      workspace(&source),
+      AnalysisLimits::default(),
+      support::Inputs::default(),
+    );
     let assignment = workspace.symbols_named(b"x").next().unwrap().id;
     assert_eq!(
       resolved_reads(&workspace, &analysis, b"x"),
@@ -1701,8 +1918,11 @@ mod stack {
       writeln!(source, "if condition; then x={value}; fi").unwrap();
     }
     source.push_str(": \"$x\"\n");
-    let (workspace, analysis) =
-      analyze_on_small_stack(workspace(&source), AnalysisLimits::default());
+    let (workspace, analysis) = analyze_on_small_stack(
+      workspace(&source),
+      AnalysisLimits::default(),
+      support::Inputs::default(),
+    );
     let read = analysis
       .uses()
       .find(|site| {
@@ -1900,11 +2120,137 @@ mod inputs {
   use crate::support;
   use shellsmith::interface::application::engine::{
     AnalysisInputs, AnalysisRequest, Document, Error, InitialEnvironment,
-    InputQuery, InputResult, SourceDocument, SourceInput, Value, Workspace,
+    InputQuery, InputResult, Occurrence, OccurrenceKind, SourceDocument,
+    SourceInput, UseSite, Value, Workspace,
   };
   use std::collections::BTreeMap;
   use std::sync::Arc;
   use std::sync::atomic::{AtomicBool, Ordering};
+
+  #[test]
+  fn changed_provider_results_reject_old_analysis_without_document_changes() {
+    let root = support::parse(1, 1, "value=~example; : \"$value\"");
+    let read = root
+      .occurrences()
+      .iter()
+      .find(|site| site.kind == OccurrenceKind::VariableExpansion)
+      .unwrap()
+      .id;
+    let mut request = AnalysisRequest::new(root.snapshot());
+    request.initial = InitialEnvironment::empty();
+    let mut workspace = Workspace::default();
+    workspace.insert(root).unwrap();
+    let mut inputs = support::Inputs::default();
+    let query = InputQuery::Home(b"example".to_vec());
+    inputs
+      .evaluated
+      .insert(query.clone(), InputResult::Path(b"/first".to_vec()));
+    let old = workspace
+      .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+      .unwrap();
+    inputs
+      .evaluated
+      .insert(query, InputResult::Path(b"/second".to_vec()));
+    let current = workspace
+      .analyze(request, &mut inputs, &AtomicBool::new(false))
+      .unwrap();
+    assert_eq!(
+      old.values(read).next().unwrap().1,
+      &Value::Literal(b"/first".to_vec())
+    );
+    assert_eq!(
+      current.values(read).next().unwrap().1,
+      &Value::Literal(b"/second".to_vec())
+    );
+    assert_eq!(old.snapshots(), current.snapshots());
+    workspace.publish_analysis(current).unwrap();
+    let published = std::ptr::from_ref(workspace.analysis().unwrap());
+    assert_eq!(workspace.publish_analysis(old), Err(Error::StaleAnalysis));
+    assert_eq!(std::ptr::from_ref(workspace.analysis().unwrap()), published);
+  }
+
+  #[test]
+  fn source_contexts_use_current_search_conditions_and_require_agreement_for_links()
+   {
+    use shellsmith::interface::application::engine::{
+      DependencyState, DocumentId,
+    };
+
+    for (operand, changes) in [
+      ("./lib", ["cd /a", "cd /b"]),
+      ("lib", ["PATH=/a", "PATH=/b"]),
+    ] {
+      let root = support::parse(
+        1,
+        1,
+        &format!(
+          "load() {{ . {operand}; : \"$value\"; }}; {}; load; {}; load",
+          changes[0], changes[1]
+        ),
+      );
+      let reference = root.references()[0].id;
+      let mut request = AnalysisRequest::new(root.snapshot());
+      request.initial = InitialEnvironment::empty();
+      let mut workspace = Workspace::default();
+      workspace.insert(root).unwrap();
+      let first = Arc::new(support::parse(2, 1, "value=first"));
+      let second = Arc::new(support::parse(3, 1, "value=second"));
+      let mut inputs = support::Inputs::default();
+      let mut expected = Vec::new();
+      for (path, document) in [
+        (b"/a".to_vec(), first.clone()),
+        (b"/b".to_vec(), second.clone()),
+      ] {
+        inputs.evaluated.insert(
+          InputQuery::Directory {
+            cwd: Vec::new(),
+            path: path.clone(),
+            physical: false,
+          },
+          InputResult::Path(path.clone()),
+        );
+        let input = SourceInput {
+          operand: Value::Literal(operand.as_bytes().to_vec()),
+          cwd: (operand == "./lib").then(|| Value::Literal(path.clone())),
+          search_path: (operand == "lib").then_some(Value::Literal(path)),
+          annotation: None,
+        };
+        expected.push(input.clone());
+        inputs
+          .sources
+          .insert(input, SourceDocument::Resolved(document));
+      }
+      let analysis = workspace
+        .analyze(request.clone(), &mut inputs, &AtomicBool::new(false))
+        .unwrap();
+      assert_eq!(inputs.source_queries, expected);
+      for document in [&first, &second] {
+        assert_eq!(analysis.references(document.symbols()[0].id).count(), 1);
+      }
+      assert!(matches!(
+        analysis.source_bindings()[&reference],
+        DependencyState::Unresolved(_)
+      ));
+      workspace.publish_analysis(analysis).unwrap();
+      assert_eq!(workspace.source_links(DocumentId(1)), []);
+      inputs
+        .sources
+        .insert(expected[1].clone(), SourceDocument::Resolved(first.clone()));
+      let analysis = workspace
+        .analyze(request, &mut inputs, &AtomicBool::new(false))
+        .unwrap();
+      assert_eq!(analysis.references(first.symbols()[0].id).count(), 2);
+      assert_eq!(analysis.references(second.symbols()[0].id).count(), 0);
+      assert_eq!(
+        analysis.source_bindings()[&reference],
+        DependencyState::Resolved(first.snapshot())
+      );
+      workspace.publish_analysis(analysis).unwrap();
+      let links = workspace.source_links(DocumentId(1));
+      assert_eq!(links.len(), 1);
+      assert_eq!(links[0].1, first.snapshot());
+    }
+  }
 
   struct Inputs<'a> {
     documents: BTreeMap<Vec<u8>, Arc<Document>>,
@@ -1941,6 +2287,12 @@ mod inputs {
           physical: false
         }
       );
+      if self.fail {
+        return Err(Error::Input("Input provider failed".into()));
+      }
+      if let Some(flag) = self.stop {
+        flag.store(true, Ordering::Relaxed);
+      }
       Ok(InputResult::Path(b"/next".to_vec()))
     }
   }
@@ -1980,7 +2332,7 @@ mod inputs {
     let mut workspace = Workspace::default();
     workspace.insert(root).unwrap();
     let result = workspace
-      .analyze_with(request, &mut inputs, &AtomicBool::new(false))
+      .analyze(request, &mut inputs, &AtomicBool::new(false))
       .unwrap();
     assert_eq!(
       inputs.sources,
@@ -2004,40 +2356,104 @@ mod inputs {
   #[test]
   fn cancellation_and_provider_failure_discard_documents_loaded_during_analysis()
    {
-    for cancel in [false, true] {
-      let flag = AtomicBool::new(false);
-      let root = support::parse(1, 1, ". /a; . /b");
+    for source in [". /a; . /b", ". /a; cd /next"] {
+      for cancel in [false, true] {
+        let flag = AtomicBool::new(false);
+        let root = support::parse(1, 1, source);
+        let mut request = AnalysisRequest::new(root.snapshot());
+        request.initial = InitialEnvironment::empty();
+        let mut workspace = Workspace::default();
+        workspace.insert(root).unwrap();
+        let previous = workspace
+          .analyze(request.clone(), &mut support::Inputs::default(), &flag)
+          .unwrap();
+        workspace.publish_analysis(previous).unwrap();
+        let published = std::ptr::from_ref(workspace.analysis().unwrap());
+        let mut inputs = Inputs {
+          documents: BTreeMap::from([
+            (b"/a".to_vec(), Arc::new(support::parse(2, 1, "a=1"))),
+            (b"/b".to_vec(), Arc::new(support::parse(3, 1, "b=1"))),
+          ]),
+          sources: Vec::new(),
+          queries: Vec::new(),
+          stop: cancel.then_some(&flag),
+          fail: !cancel,
+        };
+        let error = workspace.analyze(request, &mut inputs, &flag).unwrap_err();
+        assert_eq!(
+          error,
+          if cancel {
+            Error::Cancelled
+          } else {
+            Error::Input("Input provider failed".into())
+          }
+        );
+        assert_eq!(workspace.documents().count(), 1);
+        assert_eq!(
+          std::ptr::from_ref(workspace.analysis().unwrap()),
+          published
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn sources_indexed_during_analysis_keep_the_analysis_derived_documents() {
+    for (entry, name, reader, definitions) in [
+      (
+        "read x\n. /lib\n: \"$x\"\n",
+        b"x".as_slice(),
+        "read x\n. /lib\n: \"$x\"\n",
+        vec!["x="],
+      ),
+      (
+        "cmd=': \"$y\"'\ntrap \"$cmd\" EXIT\n. /lib\ny=set\n",
+        b"y",
+        ": \"$y\"",
+        Vec::new(),
+      ),
+    ] {
+      let root = support::parse(1, 1, entry);
       let mut request = AnalysisRequest::new(root.snapshot());
       request.initial = InitialEnvironment::empty();
-      let mut workspace = Workspace::default();
-      workspace.insert(root).unwrap();
-      workspace.set_analysis_request(request.clone()).unwrap();
-      let previous = workspace.analyze(&flag).unwrap();
-      workspace.publish_analysis(previous).unwrap();
-      let published = std::ptr::from_ref(workspace.analysis().unwrap());
       let mut inputs = Inputs {
-        documents: BTreeMap::from([
-          (b"/a".to_vec(), Arc::new(support::parse(2, 1, "a=1"))),
-          (b"/b".to_vec(), Arc::new(support::parse(3, 1, "b=1"))),
-        ]),
+        documents: BTreeMap::from([(
+          b"/lib".to_vec(),
+          Arc::new(support::parse(2, 1, "command -v true\n")),
+        )]),
         sources: Vec::new(),
         queries: Vec::new(),
-        stop: cancel.then_some(&flag),
-        fail: !cancel,
+        stop: None,
+        fail: false,
       };
-      let error = workspace
-        .analyze_with(request, &mut inputs, &flag)
-        .unwrap_err();
-      assert_eq!(
-        error,
-        if cancel {
-          Error::Cancelled
-        } else {
-          Error::Input("Input provider failed".into())
-        }
-      );
-      assert_eq!(workspace.documents().count(), 1);
-      assert_eq!(std::ptr::from_ref(workspace.analysis().unwrap()), published);
+      let mut workspace = Workspace::default();
+      workspace.insert(root).unwrap();
+      let result = workspace
+        .analyze(request, &mut inputs, &AtomicBool::new(false))
+        .unwrap();
+      let text = |site: &Occurrence| {
+        let document = workspace.document(site.location.snapshot.document);
+        document.unwrap().source().to_owned()
+      };
+      let read = workspace
+        .documents()
+        .flat_map(|document| document.occurrences().iter())
+        .find(|site| {
+          site.kind == OccurrenceKind::VariableExpansion
+            && site.name == Value::Literal(name.to_vec())
+        })
+        .unwrap();
+      assert_eq!(text(read), reader, "{entry}");
+      let actual: Vec<_> = result
+        .resolutions(UseSite::Syntax(read.id))
+        .flat_map(|use_site| use_site.resolution.candidates.iter())
+        .map(|id| {
+          let symbol = workspace.symbol(*id).expect("defined symbol");
+          text(workspace.occurrence(symbol.definition).unwrap())
+        })
+        .collect();
+      assert_eq!(actual, definitions, "{entry}");
+      workspace.publish_analysis(result).unwrap();
     }
   }
 }
@@ -2101,7 +2517,14 @@ mod names {
       );
     }
     assert_eq!(workspace.analysis().unwrap().contexts(), contexts);
-    let again = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let request = workspace.analysis().unwrap().request().clone();
+    let again = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     assert_eq!(workspace.documents().count(), 3);
     assert_eq!(again.contexts(), contexts);
     assert!(workspace.document(snapshot.document).is_some());
@@ -2347,6 +2770,27 @@ mod names {
           |site| site.context.is_some() && site.spelling.editable().is_some()
         )
     );
+  }
+
+  #[test]
+  fn prefixes_are_temporary_names_only_when_no_special_builtin_may_run() {
+    for (source, temporary) in [
+      ("y=$(external); x=1 ex\"$y\"t", 0),
+      ("y=$(external); x=1 tr\"$y\"e", 1),
+    ] {
+      let (mut workspace, analysis) = support::analyze(source);
+      workspace.publish_analysis(analysis).unwrap();
+      let names = workspace.name_relations(&AtomicBool::new(false)).unwrap();
+      assert_eq!(
+        names
+          .names
+          .iter()
+          .filter(|name| name.text == b"x" && name.temporary.is_some())
+          .count(),
+        temporary,
+        "{source}"
+      );
+    }
   }
 
   #[test]

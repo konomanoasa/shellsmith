@@ -1,8 +1,6 @@
 use crate::interface::application::engine::{
-  DocumentId, Modifier, SemanticKind, SemanticSpan, SymbolDetails, SymbolKind,
-};
-use async_lsp::lsp_types::{
-  SemanticToken, SemanticTokenModifier, SemanticTokenType,
+  self, DocumentId, Modifier, SemanticKind, SemanticSpan, SymbolDetails,
+  SymbolKind,
 };
 
 use crate::interface::application::{
@@ -44,13 +42,10 @@ fn fault(error: Error) -> ResponseError {
   let code = match error {
     Error::RenameRefused(_) => ErrorCode::REQUEST_FAILED,
     Error::Superseded => ErrorCode::CONTENT_MODIFIED,
-    Error::InvalidName(_)
-    | Error::Engine(
-      crate::interface::application::engine::Error::InvalidPosition,
-    ) => ErrorCode::INVALID_PARAMS,
-    Error::Engine(crate::interface::application::engine::Error::Cancelled) => {
-      ErrorCode::REQUEST_CANCELLED
+    Error::InvalidName(_) | Error::Engine(engine::Error::InvalidPosition) => {
+      ErrorCode::INVALID_PARAMS
     }
+    Error::Engine(engine::Error::Cancelled) => ErrorCode::REQUEST_CANCELLED,
     _ => ErrorCode::INTERNAL_ERROR,
   };
   ResponseError::new(code, error)
@@ -66,9 +61,49 @@ fn file_path(uri: &Url) -> Result<PathBuf, ResponseError> {
     .map_err(|()| invalid("Unsupported file URI"))
 }
 
-fn uri(path: &Path) -> Result<Url, Error> {
+fn uri(
+  application: &Application,
+  opened: &BTreeMap<PathBuf, OpenDocument>,
+  path: &Path,
+) -> Result<Url, Error> {
+  if let Some(document) = opened.get(path) {
+    if document
+      .uri
+      .to_file_path()
+      .ok()
+      .is_none_or(|client_path| application.absolute(&client_path) != path)
+    {
+      return Err(Error::Superseded);
+    }
+    return Ok(document.uri.clone());
+  }
   Url::from_file_path(path)
     .map_err(|()| Error::Message("Cannot encode file URI".into()))
+}
+
+fn document_source(
+  application: &Application,
+  id: DocumentId,
+) -> Result<&str, Error> {
+  Ok(
+    application
+      .workspace()
+      .document(id)
+      .ok_or(engine::Error::UnknownDocument(id))?
+      .source(),
+  )
+}
+
+fn document_offset(
+  application: &Application,
+  id: DocumentId,
+  position: lsp::Position,
+) -> Result<usize, Error> {
+  Ok(
+    Lines::new(document_source(application, id)?)
+      .offset(position)
+      .ok_or(engine::Error::InvalidPosition)?,
+  )
 }
 
 #[derive(Default)]
@@ -77,6 +112,9 @@ struct ClientSupport {
   watch: bool,
   document_changes: bool,
   symbols: SymbolFormat,
+  /// The semantic token legend, present only when the client accepts full
+  /// requests in the relative format.
+  semantic_tokens: Option<lsp::SemanticTokensLegend>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -86,15 +124,17 @@ enum SymbolFormat {
   Hierarchical,
 }
 
+#[derive(Clone)]
+struct OpenDocument {
+  uri: Url,
+  version: i32,
+}
+
 struct Server {
   session: Arc<Session>,
   client: ClientSocket,
-  versions: BTreeMap<PathBuf, i32>,
-  document_uris: BTreeMap<PathBuf, Url>,
+  opened: BTreeMap<PathBuf, OpenDocument>,
   support: ClientSupport,
-  types: Vec<lsp::SemanticTokenType>,
-  modifiers: Vec<lsp::SemanticTokenModifier>,
-  semantic_tokens: bool,
   shutdown: Arc<AtomicBool>,
 }
 
@@ -145,40 +185,41 @@ impl Server {
     } else {
       SymbolFormat::Flat
     };
-    if let Some(capability) = params
+    self.support.semantic_tokens = params
       .capabilities
       .text_document
       .and_then(|text| text.semantic_tokens)
-    {
-      self.types = TYPES
-        .iter()
-        .filter(|name| {
-          capability
-            .token_types
-            .iter()
-            .any(|kind| kind.as_str() == **name)
-        })
-        .map(|name| lsp::SemanticTokenType::new(name))
-        .collect();
-      self.modifiers = MODIFIERS
-        .iter()
-        .filter(|name| {
-          capability
-            .token_modifiers
-            .iter()
-            .any(|kind| kind.as_str() == **name)
-        })
-        .map(|name| lsp::SemanticTokenModifier::new(name))
-        .collect();
-      self.semantic_tokens =
+      .filter(|capability| {
         matches!(
           capability.requests.full,
           Some(
             lsp::SemanticTokensFullOptions::Bool(true)
               | lsp::SemanticTokensFullOptions::Delta { .. }
           )
-        ) && capability.formats.contains(&lsp::TokenFormat::RELATIVE);
-    }
+        ) && capability.formats.contains(&lsp::TokenFormat::RELATIVE)
+      })
+      .map(|capability| lsp::SemanticTokensLegend {
+        token_types: TYPES
+          .iter()
+          .filter(|name| {
+            capability
+              .token_types
+              .iter()
+              .any(|kind| kind.as_str() == **name)
+          })
+          .map(|name| lsp::SemanticTokenType::new(name))
+          .collect(),
+        token_modifiers: MODIFIERS
+          .iter()
+          .filter(|name| {
+            capability
+              .token_modifiers
+              .iter()
+              .any(|kind| kind.as_str() == **name)
+          })
+          .map(|name| lsp::SemanticTokenModifier::new(name))
+          .collect(),
+      });
     Ok(lsp::InitializeResult {
       capabilities: self.capabilities(),
       server_info: Some(lsp::ServerInfo {
@@ -217,17 +258,16 @@ impl Server {
         }),
         ..Default::default()
       }),
-      semantic_tokens_provider: self.semantic_tokens.then(|| {
-        lsp::SemanticTokensOptions {
-          legend: lsp::SemanticTokensLegend {
-            token_types: self.types.clone(),
-            token_modifiers: self.modifiers.clone(),
-          },
-          full: Some(lsp::SemanticTokensFullOptions::Bool(true)),
-          ..Default::default()
-        }
-        .into()
-      }),
+      semantic_tokens_provider: self.support.semantic_tokens.clone().map(
+        |legend| {
+          lsp::SemanticTokensOptions {
+            legend,
+            full: Some(lsp::SemanticTokensFullOptions::Bool(true)),
+            ..Default::default()
+          }
+          .into()
+        },
+      ),
       ..Default::default()
     }
   }
@@ -286,7 +326,7 @@ impl Server {
     if let Err(error) = self.session.start_index() {
       self.log(error);
     }
-    if self.support.refresh && self.semantic_tokens {
+    if self.support.refresh && self.support.semantic_tokens.is_some() {
       let client = self.client.clone();
       tokio::spawn(async move {
         if let Err(error) =
@@ -305,10 +345,10 @@ impl Server {
     let document = params.text_document;
     let path = self
       .session
-      .absolute(&file_path(&document.uri)?)
+      .document_path(&file_path(&document.uri)?)
       .map_err(fault)?;
-    if self.versions.contains_key(&path)
-      || self.document_uris.values().any(|uri| *uri == document.uri)
+    if self.opened.contains_key(&path)
+      || self.opened_path(&document.uri).is_some()
     {
       return Err(invalid("Document is already open"));
     }
@@ -316,8 +356,13 @@ impl Server {
       .session
       .set_overlay(&path, Some(document.text))
       .map_err(fault)?;
-    self.document_uris.insert(path.clone(), document.uri);
-    self.versions.insert(path, document.version);
+    self.opened.insert(
+      path,
+      OpenDocument {
+        uri: document.uri,
+        version: document.version,
+      },
+    );
     Ok(())
   }
 
@@ -326,17 +371,14 @@ impl Server {
     params: lsp::DidChangeTextDocumentParams,
   ) -> Result<(), ResponseError> {
     file_path(&params.text_document.uri)?;
-    let path = self
-      .document_uris
-      .iter()
-      .find(|(_, uri)| **uri == params.text_document.uri)
-      .map(|(path, _)| path.clone())
-      .ok_or_else(|| invalid("Document is not open"))?;
-    let previous = self
-      .versions
-      .get(&path)
-      .ok_or_else(|| invalid("Document is not open"))?;
-    if params.text_document.version <= *previous {
+    let Some((path, document)) = self
+      .opened
+      .iter_mut()
+      .find(|(_, document)| document.uri == params.text_document.uri)
+    else {
+      return Err(invalid("Document is not open"));
+    };
+    if params.text_document.version <= document.version {
       return Err(invalid("Outdated document version"));
     }
     if params
@@ -352,8 +394,8 @@ impl Server {
       .last()
       .ok_or_else(|| invalid("Missing content changes"))?
       .text;
-    self.session.set_overlay(&path, Some(text)).map_err(fault)?;
-    self.versions.insert(path, params.text_document.version);
+    self.session.set_overlay(path, Some(text)).map_err(fault)?;
+    document.version = params.text_document.version;
     Ok(())
   }
 
@@ -363,14 +405,11 @@ impl Server {
   ) -> Result<(), ResponseError> {
     file_path(&params.text_document.uri)?;
     let path = self
-      .document_uris
-      .iter()
-      .find(|(_, uri)| **uri == params.text_document.uri)
-      .map(|(path, _)| path.clone())
+      .opened_path(&params.text_document.uri)
+      .cloned()
       .ok_or_else(|| invalid("Document is not open"))?;
     self.session.set_overlay(&path, None).map_err(fault)?;
-    self.versions.remove(&path);
-    self.document_uris.remove(&path);
+    self.opened.remove(&path);
     Ok(())
   }
 
@@ -378,18 +417,10 @@ impl Server {
     &mut self,
     params: &lsp::DidChangeWorkspaceFoldersParams,
   ) -> Result<(), ResponseError> {
-    let removed: Vec<_> = params
-      .event
-      .removed
-      .iter()
-      .map(|folder| file_path(&folder.uri))
-      .collect::<Result<_, _>>()?;
-    let added: Vec<_> = params
-      .event
-      .added
-      .iter()
-      .map(|folder| file_path(&folder.uri))
-      .collect::<Result<_, _>>()?;
+    let event = &params.event;
+    let removed =
+      self.file_paths(event.removed.iter().map(|folder| &folder.uri));
+    let added = self.file_paths(event.added.iter().map(|folder| &folder.uri));
     for path in removed {
       self.session.remove_input(&path).map_err(fault)?;
     }
@@ -399,36 +430,69 @@ impl Server {
     Ok(())
   }
 
-  fn query<T: Send + 'static>(
-    &mut self,
-    path: Option<&Url>,
+  /// The paths of the file URIs among `uris`. Logs the other URIs, which a
+  /// notification cannot reject one by one.
+  fn file_paths<'a>(
+    &self,
+    uris: impl Iterator<Item = &'a Url>,
+  ) -> Vec<PathBuf> {
+    uris
+      .filter_map(|uri| file_path(uri).map_err(|error| self.log(error)).ok())
+      .collect()
+  }
+
+  fn opened_path(&self, uri: &Url) -> Option<&PathBuf> {
+    self
+      .opened
+      .iter()
+      .find_map(|(path, document)| (document.uri == *uri).then_some(path))
+  }
+
+  /// The path of `uri`, which must still resolve to the document opened
+  /// through it.
+  fn document_path(&self, uri: &Url) -> Result<PathBuf, ResponseError> {
+    let requested = file_path(uri)?;
+    if let Some(path) = self.opened_path(uri)
+      && self.session.absolute(&requested).map_err(fault)? != *path
+    {
+      return Err(fault(Error::Superseded));
+    }
+    Ok(requested)
+  }
+
+  fn document_query<T: Send + 'static>(
+    &self,
+    uri: &Url,
     scope: fn(PathBuf) -> RequestScope,
     operation: impl FnOnce(
       &mut Application,
-      Option<DocumentId>,
+      DocumentId,
       &AtomicBool,
     ) -> Result<T, Error>
     + Send
     + 'static,
   ) -> Reply<T> {
-    let path = match path.map(file_path).transpose() {
+    let path = match self.document_path(uri) {
       Ok(path) => path,
       Err(error) => return Box::pin(std::future::ready(Err(error))),
     };
-    let scope = match path.clone() {
-      Some(path) => scope(path),
-      None => RequestScope::Workspace,
-    };
+    self.query(scope(path.clone()), move |application, cancelled| {
+      let id = application.document_id(&path).ok_or_else(|| {
+        Error::Message(format!("Cannot load {}", path.display()))
+      })?;
+      operation(application, id, cancelled)
+    })
+  }
+
+  fn query<T: Send + 'static>(
+    &self,
+    scope: RequestScope,
+    operation: impl FnOnce(&mut Application, &AtomicBool) -> Result<T, Error>
+    + Send
+    + 'static,
+  ) -> Reply<T> {
     let job = self.session.request(scope, move |application, cancelled| {
-      let id = path
-        .as_ref()
-        .map(|path| {
-          application.document_id(path).ok_or_else(|| {
-            Error::Message(format!("Cannot load {}", path.display()))
-          })
-        })
-        .transpose()?;
-      let result = operation(application, id, cancelled)?;
+      let result = operation(application, cancelled)?;
       Ok((result, application.failures().to_vec()))
     });
     let client = self.client.clone();
@@ -445,85 +509,57 @@ impl Server {
   }
 
   fn semantic(
-    &mut self,
+    &self,
     params: &lsp::SemanticTokensParams,
   ) -> Reply<Option<lsp::SemanticTokensResult>> {
-    if !self.semantic_tokens {
+    let Some(legend) = self.support.semantic_tokens.clone() else {
       return Box::pin(std::future::ready(Err(ResponseError::new(
         ErrorCode::METHOD_NOT_FOUND,
         "Semantic tokens were not negotiated",
       ))));
-    }
-    let types = self.types.clone();
-    let modifiers = self.modifiers.clone();
-    self.query(
-      Some(&params.text_document.uri),
+    };
+    self.document_query(
+      &params.text_document.uri,
       RequestScope::Analysis,
       move |application, id, cancelled| {
-        let id = id.expect("document request");
         let spans = application.classify(id, cancelled)?;
-        let source = application
-          .workspace()
-          .document(id)
-          .ok_or(
-            crate::interface::application::engine::Error::UnknownDocument(id),
-          )?
-          .source();
         Ok(Some(lsp::SemanticTokensResult::Tokens(
           lsp::SemanticTokens {
             result_id: None,
-            data: encode(source, &spans, &types, &modifiers),
+            data: encode(document_source(application, id)?, &spans, &legend),
           },
         )))
       },
     )
   }
   fn definitions(
-    &mut self,
+    &self,
     params: &lsp::GotoDefinitionParams,
   ) -> Reply<Option<lsp::GotoDefinitionResponse>> {
     let position = params.text_document_position_params.position;
-    self.query(
-      Some(&params.text_document_position_params.text_document.uri),
+    let opened = self.opened.clone();
+    self.document_query(
+      &params.text_document_position_params.text_document.uri,
       RequestScope::Analysis,
       move |application, id, cancelled| {
-        let id = id.expect("document request");
-        let source = application
-          .workspace()
-          .document(id)
-          .ok_or(
-            crate::interface::application::engine::Error::UnknownDocument(id),
-          )?
-          .source();
-        let offset = Lines::new(source).offset(position).ok_or(
-          crate::interface::application::engine::Error::InvalidPosition,
-        )?;
+        let offset = document_offset(application, id, position)?;
         let definitions = application.definitions(id, offset, cancelled)?;
         if definitions.is_empty() {
           return Ok(None);
         }
+        let mut positions = Positions::new(application);
         let locations = definitions
           .into_iter()
           .map(|location| {
-            let source = application
-              .workspace()
-              .document(location.snapshot.document)
-              .ok_or(
-                crate::interface::application::engine::Error::UnknownDocument(
-                  location.snapshot.document,
-                ),
-              )?
-              .source();
-            let path =
-              application.path(location.snapshot.document).ok_or_else(
-                || Error::Message("Unknown definition path".into()),
-              )?;
-            let range =
-              Lines::new(source).range(&location.bytes).ok_or_else(|| {
-                Error::Message("Invalid definition range".into())
-              })?;
+            let range = positions.range(&location)?.ok_or_else(|| {
+              Error::Message("Invalid definition range".into())
+            })?;
             Ok(lsp::Location {
-              uri: uri(path)?,
+              uri: uri(
+                application,
+                &opened,
+                positions.path(location.snapshot.document)?,
+              )?,
               range,
             })
           })
@@ -533,36 +569,16 @@ impl Server {
     )
   }
 
-  fn rename_uri(&self, uri: &Url) -> Result<(), ResponseError> {
-    let requested = file_path(uri)?;
-    if let Some((path, _)) =
-      self.document_uris.iter().find(|(_, opened)| *opened == uri)
-      && self.session.absolute(&requested).map_err(fault)? != *path
-    {
-      return Err(fault(Error::Superseded));
-    }
-    Ok(())
-  }
-
   fn prepare_rename(
-    &mut self,
+    &self,
     params: &lsp::TextDocumentPositionParams,
   ) -> Reply<Option<lsp::PrepareRenameResponse>> {
-    if let Err(error) = self.rename_uri(&params.text_document.uri) {
-      return Box::pin(std::future::ready(Err(error)));
-    }
     let position = params.position;
-    self.query(
-      Some(&params.text_document.uri),
+    self.document_query(
+      &params.text_document.uri,
       RequestScope::Names,
       move |application, id, cancelled| {
-        let id = id.expect("document request");
-        let document = application.workspace().document(id).ok_or(
-          crate::interface::application::engine::Error::UnknownDocument(id),
-        )?;
-        let offset = Lines::new(document.source()).offset(position).ok_or(
-          crate::interface::application::engine::Error::InvalidPosition,
-        )?;
+        let offset = document_offset(application, id, position)?;
         let path = application
           .path(id)
           .ok_or_else(|| Error::Message("Unknown document path".into()))?
@@ -572,18 +588,12 @@ impl Server {
         else {
           return Ok(None);
         };
-        let source = application
-          .workspace()
-          .document(target.location.snapshot.document)
-          .ok_or(
-            crate::interface::application::engine::Error::UnknownDocument(
-              target.location.snapshot.document,
-            ),
-          )?
-          .source();
-        let range = Lines::new(source).range(&target.location.bytes).ok_or(
-          crate::interface::application::engine::Error::InvalidPosition,
-        )?;
+        let range = Lines::new(document_source(
+          application,
+          target.location.snapshot.document,
+        )?)
+        .range(&target.location.bytes)
+        .ok_or(engine::Error::InvalidPosition)?;
         Ok(Some(lsp::PrepareRenameResponse::RangeWithPlaceholder {
           range,
           placeholder: target.placeholder,
@@ -593,60 +603,42 @@ impl Server {
   }
 
   fn rename(
-    &mut self,
+    &self,
     params: lsp::RenameParams,
   ) -> Reply<Option<lsp::WorkspaceEdit>> {
-    let versions = self.versions.clone();
-    let uris = self.document_uris.clone();
+    let opened = self.opened.clone();
     let document_changes = self.support.document_changes;
-    if let Err(error) =
-      self.rename_uri(&params.text_document_position.text_document.uri)
-    {
-      return Box::pin(std::future::ready(Err(error)));
-    }
-    self.query(
-      Some(&params.text_document_position.text_document.uri),
+    self.document_query(
+      &params.text_document_position.text_document.uri,
       RequestScope::Names,
       move |application, id, cancelled| {
-        let id = id.expect("document request");
-        let document = application.workspace().document(id).ok_or(
-          crate::interface::application::engine::Error::UnknownDocument(id),
+        let offset = document_offset(
+          application,
+          id,
+          params.text_document_position.position,
         )?;
-        let offset = Lines::new(document.source())
-          .offset(params.text_document_position.position)
-          .ok_or(
-            crate::interface::application::engine::Error::InvalidPosition,
-          )?;
         let path = application
           .path(id)
           .ok_or_else(|| Error::Message("Unknown document path".into()))?
           .to_path_buf();
         let edits =
           application.rename(&path, offset, &params.new_name, cancelled)?;
-        workspace_edit(application, edits, &uris, &versions, document_changes)
-          .map(Some)
+        workspace_edit(application, edits, &opened, document_changes).map(Some)
       },
     )
   }
 
   fn document_links(
-    &mut self,
+    &self,
     params: &lsp::DocumentLinkParams,
   ) -> Reply<Option<Vec<lsp::DocumentLink>>> {
-    self.query(
-      Some(&params.text_document.uri),
+    let opened = self.opened.clone();
+    self.document_query(
+      &params.text_document.uri,
       RequestScope::Analysis,
-      |application, id, cancelled| {
-        let id = id.expect("document request");
+      move |application, id, cancelled| {
         let links = application.document_links(id, cancelled)?;
-        let source = application
-          .workspace()
-          .document(id)
-          .ok_or(
-            crate::interface::application::engine::Error::UnknownDocument(id),
-          )?
-          .source();
-        let positions = Lines::new(source);
+        let positions = Lines::new(document_source(application, id)?);
         links
           .into_iter()
           .map(|(location, path)| {
@@ -655,7 +647,7 @@ impl Server {
             })?;
             Ok(lsp::DocumentLink {
               range,
-              target: Some(uri(&path)?),
+              target: Some(uri(application, &opened, &path)?),
               tooltip: None,
               data: None,
             })
@@ -670,30 +662,16 @@ impl Server {
 fn workspace_edit(
   application: &Application,
   edits: Vec<crate::interface::application::RenameEdit>,
-  uris: &BTreeMap<PathBuf, Url>,
-  versions: &BTreeMap<PathBuf, i32>,
+  opened: &BTreeMap<PathBuf, OpenDocument>,
   document_changes: bool,
 ) -> Result<lsp::WorkspaceEdit, Error> {
   let mut documents: BTreeMap<PathBuf, Vec<lsp::TextEdit>> = BTreeMap::new();
+  let mut positions = Positions::new(application);
   for edit in edits {
-    let id = edit.location.snapshot.document;
-    let document = application.workspace().document(id).ok_or(
-      crate::interface::application::engine::Error::UnknownDocument(id),
-    )?;
-    let range = Lines::new(document.source())
-      .range(&edit.location.bytes)
-      .ok_or(crate::interface::application::engine::Error::InvalidPosition)?;
-    let path = application
-      .path(id)
-      .ok_or_else(|| Error::Message("Unknown edited document path".into()))?;
-    if let Some(uri) = uris.get(path)
-      && uri
-        .to_file_path()
-        .ok()
-        .is_none_or(|client_path| application.absolute(&client_path) != path)
-    {
-      return Err(Error::Superseded);
-    }
+    let range = positions
+      .range(&edit.location)?
+      .ok_or(engine::Error::InvalidPosition)?;
+    let path = positions.path(edit.location.snapshot.document)?;
     documents
       .entry(path.to_path_buf())
       .or_default()
@@ -708,10 +686,11 @@ fn workspace_edit(
       documents
         .into_iter()
         .map(|(path, edits)| {
+          let document = opened.get(&path);
           Ok(lsp::TextDocumentEdit {
             text_document: lsp::OptionalVersionedTextDocumentIdentifier {
-              uri: uris.get(&path).cloned().map_or_else(|| uri(&path), Ok)?,
-              version: versions.get(&path).copied(),
+              uri: uri(application, opened, &path)?,
+              version: document.map(|document| document.version),
             },
             edits: edits.into_iter().map(lsp::OneOf::Left).collect(),
           })
@@ -722,12 +701,7 @@ fn workspace_edit(
     output.changes = Some(
       documents
         .into_iter()
-        .map(|(path, edits)| {
-          Ok((
-            uris.get(&path).cloned().map_or_else(|| uri(&path), Ok)?,
-            edits,
-          ))
-        })
+        .map(|(path, edits)| Ok((uri(application, opened, &path)?, edits)))
         .collect::<Result<_, Error>>()?,
     );
   }
@@ -747,29 +721,23 @@ fn log(client: &ClientSocket, message: impl std::fmt::Display) {
 )]
 fn symbols<'a>(
   application: &Application,
+  opened: &BTreeMap<PathBuf, OpenDocument>,
   locations: impl Iterator<Item = SymbolDetails<'a>>,
 ) -> Result<Vec<lsp::SymbolInformation>, Error> {
   let mut symbols = Vec::new();
+  let mut positions = Positions::new(application);
   for entry in locations {
     let symbol = entry.symbol;
     let location = entry.location;
-    let Some(doc) =
-      application.workspace().document(location.snapshot.document)
-    else {
+    let Ok(Some(range)) = positions.range(&location) else {
       continue;
     };
-    let lines = Lines::new(doc.source());
-    let Some(range) = lines.range(&location.bytes) else {
-      continue;
-    };
-    let path = application
-      .path(location.snapshot.document)
-      .ok_or_else(|| Error::Message("Unknown document path".into()))?;
+    let path = positions.path(location.snapshot.document)?;
     symbols.push(lsp::SymbolInformation {
       name: String::from_utf8_lossy(&symbol.name).into_owned(),
       kind: symbol_kind(symbol.kind),
       location: lsp::Location {
-        uri: uri(path)?,
+        uri: uri(application, opened, path)?,
         range,
       },
       tags: None,
@@ -795,18 +763,16 @@ fn symbol_kind(kind: SymbolKind) -> lsp::SymbolKind {
 )]
 fn document_symbols(
   application: &Application,
+  opened: &BTreeMap<PathBuf, OpenDocument>,
   id: DocumentId,
   format: SymbolFormat,
 ) -> Result<lsp::DocumentSymbolResponse, Error> {
   let entries = application.document_symbols(id)?;
   if matches!(format, SymbolFormat::Flat) {
-    return symbols(application, entries.map(|entry| entry.details))
+    return symbols(application, opened, entries.map(|entry| entry.details))
       .map(lsp::DocumentSymbolResponse::Flat);
   }
-  let document = application.workspace().document(id).ok_or(Error::Engine(
-    crate::interface::application::engine::Error::UnknownDocument(id),
-  ))?;
-  let lines = Lines::new(document.source());
+  let lines = Lines::new(document_source(application, id)?);
   let entries: Vec<_> = entries.collect();
   let mut children: BTreeMap<Option<usize>, Vec<lsp::DocumentSymbol>> =
     BTreeMap::new();
@@ -860,25 +826,30 @@ fn router(server: Server) -> Router<Server> {
     .request::<req::PrepareRenameRequest, _>(|server, params| {
       server.prepare_rename(&params)
     })
-    .request::<req::Rename, _>(Server::rename)
+    .request::<req::Rename, _>(|server, params| server.rename(params))
     .request::<req::DocumentLinkRequest, _>(|server, params| {
       server.document_links(&params)
     })
     .request::<req::DocumentSymbolRequest, _>(|server, params| {
       let format = server.support.symbols;
-      server.query(
-        Some(&params.text_document.uri),
+      let opened = server.opened.clone();
+      server.document_query(
+        &params.text_document.uri,
         RequestScope::Document,
         move |application, id, _| {
-          document_symbols(application, id.expect("document request"), format)
-            .map(Some)
+          document_symbols(application, &opened, id, format).map(Some)
         },
       )
     })
     .request::<req::WorkspaceSymbolRequest, _>(|server, params| {
-      server.query(None, RequestScope::Document, move |application, _, _| {
-        symbols(application, application.workspace_symbols(&params.query))
-          .map(|symbols| Some(lsp::WorkspaceSymbolResponse::Flat(symbols)))
+      let opened = server.opened.clone();
+      server.query(RequestScope::Workspace, move |application, _| {
+        symbols(
+          application,
+          &opened,
+          application.workspace_symbols(&params.query),
+        )
+        .map(|symbols| Some(lsp::WorkspaceSymbolResponse::Flat(symbols)))
       })
     })
     .notification::<notif::Initialized>(|server, _| {
@@ -906,12 +877,9 @@ fn router(server: Server) -> Router<Server> {
       ControlFlow::Continue(())
     })
     .notification::<notif::DidChangeWatchedFiles>(|server, params| {
-      let result = params
-        .changes
-        .iter()
-        .map(|event| file_path(&event.uri))
-        .collect::<Result<Vec<_>, _>>()
-        .and_then(|paths| server.session.files_changed(&paths).map_err(fault));
+      let paths =
+        server.file_paths(params.changes.iter().map(|event| &event.uri));
+      let result = server.session.files_changed(&paths).map_err(fault);
       server.updated(result);
       ControlFlow::Continue(())
     })
@@ -939,12 +907,8 @@ pub async fn run(
       .service(Requests::new(router(Server {
         session,
         client,
-        versions: BTreeMap::new(),
-        document_uris: BTreeMap::new(),
+        opened: BTreeMap::new(),
         support: ClientSupport::default(),
-        types: Vec::new(),
-        modifiers: Vec::new(),
-        semantic_tokens: false,
         shutdown,
       })))
   });
@@ -1078,6 +1042,51 @@ const MODIFIERS: &[&str] = &[
   "environment",
 ];
 
+/// Converts the locations of one response, preparing the line table and
+/// path of each document once.
+struct Positions<'a> {
+  application: &'a Application,
+  lines: BTreeMap<DocumentId, Lines<'a>>,
+  paths: BTreeMap<DocumentId, &'a Path>,
+}
+
+impl<'a> Positions<'a> {
+  const fn new(application: &'a Application) -> Self {
+    Self {
+      application,
+      lines: BTreeMap::new(),
+      paths: BTreeMap::new(),
+    }
+  }
+
+  /// The range of `location`, or `None` when its bytes do not delimit one.
+  fn range(
+    &mut self,
+    location: &engine::Location,
+  ) -> Result<Option<lsp::Range>, Error> {
+    let id = location.snapshot.document;
+    let lines = match self.lines.entry(id) {
+      std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+      std::collections::btree_map::Entry::Vacant(entry) => {
+        entry.insert(Lines::new(document_source(self.application, id)?))
+      }
+    };
+    Ok(lines.range(&location.bytes))
+  }
+
+  fn path(&mut self, id: DocumentId) -> Result<&'a Path, Error> {
+    if let Some(path) = self.paths.get(&id) {
+      return Ok(path);
+    }
+    let path = self
+      .application
+      .path(id)
+      .ok_or_else(|| Error::Message("Unknown document path".into()))?;
+    self.paths.insert(id, path);
+    Ok(path)
+  }
+}
+
 struct Lines<'a> {
   source: &'a str,
   starts: Vec<usize>,
@@ -1140,23 +1149,50 @@ impl<'a> Lines<'a> {
     Some(end)
   }
 
-  fn range(
-    &self,
-    bytes: &std::ops::Range<usize>,
-  ) -> Option<async_lsp::lsp_types::Range> {
+  fn range(&self, bytes: &std::ops::Range<usize>) -> Option<lsp::Range> {
     let (sl, sc) = self.position(bytes.start)?;
     let (el, ec) = self.position(bytes.end)?;
-    Some(async_lsp::lsp_types::Range::new(
-      async_lsp::lsp_types::Position::new(sl, sc),
-      async_lsp::lsp_types::Position::new(el, ec),
+    Some(lsp::Range::new(
+      lsp::Position::new(sl, sc),
+      lsp::Position::new(el, ec),
     ))
   }
   fn excess_at(&self, offset: usize) -> usize {
     let index = self.excess.partition_point(|(end, _)| *end <= offset);
     index.checked_sub(1).map_or(0, |index| self.excess[index].1)
   }
+  /// The line, UTF-16 column and UTF-16 length of the part of `bytes` on
+  /// each line, omitting empty parts.
+  fn segments(
+    &self,
+    bytes: std::ops::Range<usize>,
+  ) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
+    let mut offset = bytes.start;
+    std::iter::from_fn(move || {
+      while offset < bytes.end {
+        let row = self.starts.partition_point(|start| *start <= offset) - 1;
+        let text =
+          &self.source[offset..bytes.end.min(self.ends[row]).max(offset)];
+        let position = self.position(offset);
+        offset = self
+          .starts
+          .get(row + 1)
+          .copied()
+          .unwrap_or(bytes.end)
+          .min(bytes.end);
+        if let Some((line, column)) = position
+          && let Ok(length) = u32::try_from(text.encode_utf16().count())
+          && length > 0
+        {
+          return Some((line, column, length));
+        }
+      }
+      None
+    })
+  }
+
   fn position(&self, offset: usize) -> Option<(u32, u32)> {
-    if offset > self.source.len() || !self.source.is_char_boundary(offset) {
+    if !self.source.is_char_boundary(offset) {
       return None;
     }
     let line = self
@@ -1179,17 +1215,16 @@ impl<'a> Lines<'a> {
 fn encode(
   source: &str,
   spans: &[SemanticSpan],
-  types: &[SemanticTokenType],
-  modifiers: &[SemanticTokenModifier],
-) -> Vec<SemanticToken> {
+  legend: &lsp::SemanticTokensLegend,
+) -> Vec<lsp::SemanticToken> {
   let mut events: BTreeMap<usize, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
   for (index, span) in spans.iter().enumerate() {
     let range = &span.location.bytes;
     if range.is_empty()
-      || range.end > source.len()
       || !source.is_char_boundary(range.start)
       || !source.is_char_boundary(range.end)
-      || !types
+      || !legend
+        .token_types
         .iter()
         .any(|name| name.as_str() == token_kind(span.kind))
     {
@@ -1229,7 +1264,8 @@ fn encode(
   let mut tokens: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
   for (start, end, index) in ranges {
     let span = &spans[index];
-    let Some(kind) = types
+    let Some(kind) = legend
+      .token_types
       .iter()
       .position(|name| name.as_str() == token_kind(span.kind))
       .and_then(|i| u32::try_from(i).ok())
@@ -1240,31 +1276,23 @@ fn encode(
       .modifiers
       .iter()
       .filter_map(|modifier| {
-        modifiers
+        legend
+          .token_modifiers
           .iter()
           .position(|name| name.as_str() == token_modifier(*modifier))
       })
       .fold(0, |bits, index| bits | (1 << index));
-    let mut offset = start;
-    while offset < end {
-      let row = lines.starts.partition_point(|start| *start <= offset) - 1;
-      let text = &source[offset..end.min(lines.ends[row]).max(offset)];
-      if let Some((line, column)) = lines.position(offset)
-        && let Ok(length) = u32::try_from(text.encode_utf16().count())
-        && length > 0
+    for (line, column, length) in lines.segments(start..end) {
+      if let Some(last) = tokens.last_mut()
+        && last.0 == line
+        && last.1 + last.2 == column
+        && last.3 == kind
+        && last.4 == bits
       {
-        if let Some(last) = tokens.last_mut()
-          && last.0 == line
-          && last.1 + last.2 == column
-          && last.3 == kind
-          && last.4 == bits
-        {
-          last.2 += length;
-        } else {
-          tokens.push((line, column, length, kind, bits));
-        }
+        last.2 += length;
+      } else {
+        tokens.push((line, column, length, kind, bits));
       }
-      offset = lines.starts.get(row + 1).copied().unwrap_or(end).min(end);
     }
   }
   encode_relative(tokens)
@@ -1272,11 +1300,11 @@ fn encode(
 
 fn encode_relative(
   tokens: Vec<(u32, u32, u32, u32, u32)>,
-) -> Vec<SemanticToken> {
+) -> Vec<lsp::SemanticToken> {
   let mut encoded = Vec::with_capacity(tokens.len());
   let (mut last_line, mut last_column) = (0, 0);
   for (line, column, length, kind, bits) in tokens {
-    encoded.push(SemanticToken {
+    encoded.push(lsp::SemanticToken {
       delta_line: line - last_line,
       delta_start: if line == last_line {
         column - last_column

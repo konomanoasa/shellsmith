@@ -8,7 +8,6 @@ mod session;
 #[path = "../../../tests/common/fixtures.rs"]
 mod fixtures;
 
-pub(crate) use host::check;
 pub use host::{Application, Error, Failure, Settings};
 pub(super) use names::{EntryNames, NameCollection};
 pub use session::{RequestScope, Session};

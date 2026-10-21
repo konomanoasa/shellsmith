@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use super::files;
-use super::{Application, Error, Settings, check};
+use super::{Application, Error, Settings};
+use crate::interface::application::engine::check_cancelled;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RequestScope {
@@ -15,17 +15,6 @@ pub enum RequestScope {
   Document(PathBuf),
   Names(PathBuf),
   Workspace,
-}
-
-impl RequestScope {
-  fn document(&self) -> Option<&Path> {
-    match self {
-      Self::Analysis(path) | Self::Document(path) | Self::Names(path) => {
-        Some(path)
-      }
-      Self::Workspace => None,
-    }
-  }
 }
 
 struct State {
@@ -93,9 +82,11 @@ fn lock(state: &Mutex<State>) -> Result<MutexGuard<'_, State>, Error> {
 
 impl Session {
   pub fn absolute(&self, path: &Path) -> Result<PathBuf, Error> {
-    let state = lock(&self.state)?;
-    files::ordinary(&state.application.settings.cwd.join(path), true)?;
-    Ok(state.application.absolute(path))
+    Ok(lock(&self.state)?.application.absolute(path))
+  }
+
+  pub fn document_path(&self, path: &Path) -> Result<PathBuf, Error> {
+    lock(&self.state)?.application.document_path(path)
   }
   pub fn new(settings: Settings) -> Result<Self, Error> {
     Ok(Self {
@@ -116,9 +107,7 @@ impl Session {
 
   pub fn add_input(&self, path: &Path) -> Result<(), Error> {
     let mut state = lock(&self.state)?;
-    let path = state.application.absolute(path);
-    if !state.application.inputs.contains(&path) {
-      state.application.add_input(&path);
+    if state.application.add_input(path) {
       state.invalidate();
     }
     Ok(())
@@ -126,9 +115,7 @@ impl Session {
 
   pub fn remove_input(&self, path: &Path) -> Result<(), Error> {
     let mut state = lock(&self.state)?;
-    let path = state.application.absolute(path);
-    if state.application.inputs.contains(&path) {
-      state.application.remove_input(&path);
+    if state.application.remove_input(path) {
       state.invalidate();
     }
     Ok(())
@@ -140,19 +127,12 @@ impl Session {
     source: Option<String>,
   ) -> Result<(), Error> {
     let mut state = lock(&self.state)?;
-    if source.is_some() {
-      files::ordinary(&state.application.settings.cwd.join(path), true)?;
-    }
-    let path = state.application.absolute(path);
-    if let Some(source) = source {
-      state.application.opened.insert(path, source.into());
+    let path = if source.is_some() {
+      state.application.document_path(path)?
     } else {
-      state.application.opened.remove(&path);
-      state
-        .application
-        .collection
-        .changed(std::slice::from_ref(&path));
-    }
+      state.application.absolute(path)
+    };
+    state.application.set_overlay(path, source.map(Arc::from));
     state.invalidate();
     Ok(())
   }
@@ -228,10 +208,10 @@ impl Session {
       let flag = guard.0.clone();
       let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        check(&flag)?;
+        check_cancelled(&flag)?;
         let mut application = application.as_ref().clone();
         let output = operation(&mut application, &flag)?;
-        check(&flag)?;
+        check_cancelled(&flag)?;
         Ok::<_, Error>(output)
       })
       .await
@@ -260,18 +240,15 @@ impl Session {
     scope: RequestScope,
   ) -> Result<(Subscription, Arc<()>, Cancellation), Error> {
     let mut state = lock(&self.state)?;
-    if let Some(path) = scope.document() {
-      files::ordinary(&state.application.settings.cwd.join(path), true)?;
-    }
     let scope = match scope {
       RequestScope::Analysis(path) => {
-        RequestScope::Analysis(state.application.absolute(&path))
+        RequestScope::Analysis(state.application.document_path(&path)?)
       }
       RequestScope::Document(path) => {
-        RequestScope::Document(state.application.absolute(&path))
+        RequestScope::Document(state.application.document_path(&path)?)
       }
       RequestScope::Names(path) => {
-        RequestScope::Names(state.application.absolute(&path))
+        RequestScope::Names(state.application.document_path(&path)?)
       }
       RequestScope::Workspace => RequestScope::Workspace,
     };
@@ -328,23 +305,26 @@ impl Preparation {
         .map_err(|error| Error::Message(error.to_string()))?;
       tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        check(&flag)?;
-        if let RequestScope::Names(path) = &scope {
-          application.prepare_names(path, &flag)?;
-        } else {
-          application.refresh_for(
-            scope.document(),
-            matches!(scope, RequestScope::Analysis(_)),
-            &flag,
-          )?;
+        check_cancelled(&flag)?;
+        match &scope {
+          RequestScope::Analysis(path) => {
+            application.refresh_for(Some(path), &flag)?;
+            let id = application.document_id(path).ok_or_else(|| {
+              Error::Message(format!("Cannot load {}", path.display()))
+            })?;
+            application.analyze_document(id, &flag)?;
+          }
+          RequestScope::Document(path) => {
+            application.refresh_for(Some(path), &flag)?;
+          }
+          RequestScope::Names(path) => {
+            application.prepare_names(path, &flag)?;
+          }
+          RequestScope::Workspace => {
+            application.refresh_for(None, &flag)?;
+          }
         }
-        if let RequestScope::Analysis(path) = scope {
-          let id = application.document_id(&path).ok_or_else(|| {
-            Error::Message(format!("Cannot load {}", path.display()))
-          })?;
-          application.analyze_document(id, &flag)?;
-        }
-        check(&flag)?;
+        check_cancelled(&flag)?;
         Ok(Arc::new(application))
       })
       .await
@@ -373,7 +353,7 @@ fn current(
   if !Arc::ptr_eq(generation, &state.generation) {
     return Err(Error::Superseded);
   }
-  check(flag)
+  Ok(check_cancelled(flag)?)
 }
 
 fn validate(

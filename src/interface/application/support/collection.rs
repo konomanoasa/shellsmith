@@ -1,4 +1,5 @@
-use super::{Error, Failure, check, files};
+use super::{Error, Failure, files};
+use crate::interface::application::engine::check_cancelled;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -67,9 +68,9 @@ impl Collection {
     verify: bool,
     cancelled: &AtomicBool,
   ) -> Result<(BTreeSet<PathBuf>, Vec<Failure>), Error> {
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let _scan = self.scan.lock().expect("collection worker");
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let (generation, roots) = {
       let state = self.state.lock().expect("collection state");
       let roots: Vec<_> = inputs
@@ -89,7 +90,7 @@ impl Collection {
     let mut selected = BTreeSet::new();
     let mut failures = Vec::new();
     for (path, cached) in roots {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       let data = match cached.data {
         Some(data) if cached.changes.is_empty() => data,
         Some(data) => {
@@ -117,7 +118,7 @@ impl Collection {
         },
       );
     }
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let mut state = self.state.lock().expect("collection state");
     if !Arc::ptr_eq(&generation, &state.generation) {
       return Err(Error::Superseded);
@@ -188,7 +189,7 @@ fn scan(
   previous: &Root,
   cancelled: &AtomicBool,
 ) -> Result<Root, Error> {
-  check(cancelled)?;
+  check_cancelled(cancelled)?;
   let affected =
     |path: &Path| scopes.iter().any(|scope| path.starts_with(scope));
   let mut result = previous.clone();
@@ -239,7 +240,7 @@ fn scan(
           && state.0.insert(path))
     });
   for entry in walker.build() {
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let entry = match entry {
       Ok(entry) => entry,
       Err(error) => {
@@ -283,7 +284,7 @@ fn scan(
     .failures
     .sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
   result.failures.dedup();
-  check(cancelled)?;
+  check_cancelled(cancelled)?;
   Ok(result)
 }
 

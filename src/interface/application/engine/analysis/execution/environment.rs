@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::interface::application::engine::{
-  Alternative, InitialBinding, InitialEnvironment, Resolution, ResolutionIssue,
-  SymbolId, Value, ValueIssue,
+  Alternative, AttributeState, EffectTarget, InitialBinding,
+  InitialEnvironment, Resolution, ResolutionIssue, SymbolId, SymbolKind, Value,
+  ValueIssue,
 };
 
 pub(super) fn merge_value(into: &mut Arc<Value>, other: &Arc<Value>) {
@@ -81,13 +82,18 @@ impl Binding {
     merge_value(&mut self.value, &other.value);
   }
 
-  pub fn taint(&mut self, issue: ResolutionIssue) {
+  pub fn taint(&mut self, issue: ResolutionIssue, value_issue: ValueIssue) {
     self
       .resolution
       .alternatives
       .extend([Alternative::External, Alternative::Unset]);
     self.resolution.issues.insert(issue);
-    self.value = Arc::new(Value::Unknown(ValueIssue::Dynamic));
+    self.value = Arc::new(Value::Unknown(
+      self
+        .value
+        .issue()
+        .map_or(value_issue, |previous| previous.combine(value_issue)),
+    ));
   }
 }
 
@@ -151,24 +157,124 @@ impl Names {
     self.fallback.join(&other.fallback);
   }
 
-  pub fn taint(&mut self, issue: ResolutionIssue) {
-    self.patterns.clear();
-    self.uncertain = None;
-    for (name, mut value) in self.values.clone() {
-      value.taint(issue);
-      self.values.insert(name, value);
+  /// Makes the bindings that `pattern`, or any name when it is absent, may
+  /// name unknown, except the explicit bindings of `kept` names.
+  fn invalidate(
+    &mut self,
+    pattern: Option<Value>,
+    kept: impl Fn(&[u8]) -> bool,
+    issue: ResolutionIssue,
+    value_issue: ValueIssue,
+  ) {
+    for (name, mut binding) in self.values.clone() {
+      if pattern
+        .as_ref()
+        .is_none_or(|pattern| pattern.can_equal(&name))
+        && !kept(&name)
+      {
+        binding.taint(issue, value_issue);
+        self.values.insert(name, binding);
+      }
     }
-    self.fallback.taint(issue);
+    if let Some(pattern) = pattern {
+      self.restrict(pattern, issue, value_issue);
+    } else {
+      self.patterns.clear();
+      self.uncertain = None;
+      self.fallback.taint(issue, value_issue);
+    }
   }
 
-  pub fn restrict(&mut self, pattern: Value, issue: ResolutionIssue) {
+  pub fn restrict(
+    &mut self,
+    pattern: Value,
+    issue: ResolutionIssue,
+    value_issue: ValueIssue,
+  ) {
     let mut fallback = self
       .uncertain
       .take()
       .unwrap_or_else(|| self.fallback.clone());
-    fallback.taint(issue);
+    fallback.taint(issue, value_issue);
     self.uncertain = Some(fallback);
     self.patterns.insert(pattern);
+  }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(in crate::interface::application::engine::analysis) enum Positionals {
+  Known(Vec<Value>),
+  Unknown {
+    count: ValueIssue,
+    value: ValueIssue,
+  },
+}
+
+impl Positionals {
+  pub fn unknown(issue: ValueIssue) -> Self {
+    Self::Unknown {
+      count: issue,
+      value: issue,
+    }
+  }
+
+  pub fn values(&self) -> Result<&Vec<Value>, ValueIssue> {
+    match self {
+      Self::Known(values) => Ok(values),
+      Self::Unknown { value, .. } => Err(*value),
+    }
+  }
+
+  pub fn count(&self) -> Value {
+    match self {
+      Self::Known(values) => {
+        Value::Literal(values.len().to_string().into_bytes())
+      }
+      Self::Unknown { count, .. } => Value::Unknown(*count),
+    }
+  }
+
+  pub fn issue(&self) -> Option<ValueIssue> {
+    match self {
+      Self::Known(values) => values
+        .iter()
+        .filter_map(Value::issue)
+        .reduce(ValueIssue::combine),
+      Self::Unknown { value, .. } => Some(*value),
+    }
+  }
+
+  fn join(&mut self, other: &Self) {
+    if let (Self::Known(left), Self::Known(right)) = (&mut *self, other)
+      && left.len() == right.len()
+    {
+      for (left, right) in left.iter_mut().zip(right) {
+        left.join(right);
+      }
+      return;
+    }
+    let count = self
+      .count()
+      .issue()
+      .into_iter()
+      .chain(other.count().issue())
+      .reduce(ValueIssue::combine)
+      .unwrap_or(ValueIssue::Dynamic);
+    let value = self
+      .issue()
+      .into_iter()
+      .chain(other.issue())
+      .fold(count, ValueIssue::combine);
+    *self = Self::Unknown { count, value };
+  }
+
+  pub fn invalidate(&mut self, issue: ValueIssue) {
+    let count = self
+      .count()
+      .issue()
+      .map_or(issue, |count| count.combine(issue));
+    let value = self.issue().map_or(count, |value| value.combine(count));
+    *self = Self::Unknown { count, value };
   }
 }
 
@@ -177,62 +283,241 @@ pub(in crate::interface::application::engine::analysis) struct Environment {
   pub alternatives: Alternatives,
   pub variables: Names,
   pub functions: Names,
-  pub order: BTreeSet<crate::interface::application::engine::EffectTarget>,
+  pub order: BTreeSet<EffectTarget>,
   pub readonly: OrdMap<Vec<u8>, bool>,
-  pub unknown_attributes: bool,
+  /// Names matching these values may have become readonly untracked.
+  pub unknown_attributes: BTreeSet<Value>,
   pub errexit: Option<bool>,
   pub nounset: Option<bool>,
   pub noglob: Option<bool>,
   pub cwd: Value,
-  pub positional: Option<Vec<Value>>,
+  pub positional: Positionals,
   pub special: BTreeMap<Vec<u8>, Value>,
   pub substitution_status: Option<Value>,
+  /// Errors in this command's expansions, assignments and redirections.
+  pub failure: CommandFailure,
   pub option_cursor: Option<(Vec<Value>, usize)>,
   pub options_reset: bool,
   pub io: Io,
   pub directory_variables_modified: bool,
 }
 
-impl Environment {
-  pub(in crate::interface::application::engine::analysis) fn invalidate_pattern(
-    &mut self,
-    pattern: Value,
-    functions: bool,
-    issue: ResolutionIssue,
-  ) {
-    if !functions && pattern.can_equal(b"OPTIND") {
-      self.variable_changed(b"OPTIND", None);
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::interface::application::engine::analysis) enum CommandFailure {
+  #[default]
+  None,
+  Definite,
+  Possible(ValueIssue),
+}
+
+impl CommandFailure {
+  pub fn uncertain(&mut self, issue: ValueIssue) {
+    *self = match *self {
+      Self::None => Self::Possible(issue),
+      Self::Possible(previous) => Self::Possible(previous.combine(issue)),
+      Self::Definite => Self::Definite,
+    };
+  }
+
+  pub fn then(&mut self, other: Self) {
+    match other {
+      Self::Definite => *self = Self::Definite,
+      Self::Possible(issue) => self.uncertain(issue),
+      Self::None => {}
     }
+  }
+
+  fn join(&mut self, other: Self) {
+    if *self == other {
+      return;
+    }
+    *self = Self::Possible(match (*self, other) {
+      (Self::Possible(left), Self::Possible(right)) => left.combine(right),
+      (Self::Possible(issue), _) | (_, Self::Possible(issue)) => issue,
+      _ => ValueIssue::Dynamic,
+    });
+  }
+}
+
+impl Environment {
+  /// Makes the state that `target` names unknown. Definite readonly variables
+  /// keep their bindings, and unchanged state keeps its branch choices.
+  pub(in crate::interface::application::engine::analysis) fn invalidate(
+    &mut self,
+    target: EffectTarget,
+    issue: ResolutionIssue,
+    value_issue: ValueIssue,
+  ) {
+    match target {
+      EffectTarget::Variable(name) => {
+        if self.taint_variable(&name, issue, value_issue) {
+          self.variable_changed(&name, None);
+        }
+      }
+      EffectTarget::VariablePattern(pattern) => {
+        self.invalidate_names(false, Some(pattern), issue, value_issue);
+      }
+      EffectTarget::Variables => {
+        self.invalidate_names(false, None, issue, value_issue);
+      }
+      EffectTarget::Function(name) => {
+        self.alternatives.forget_function(&name);
+        let mut binding = self.functions.get(&name).clone();
+        binding.taint(issue, value_issue);
+        self.functions.values.insert(name, binding);
+      }
+      EffectTarget::FunctionPattern(pattern) => {
+        self.invalidate_names(true, Some(pattern), issue, value_issue);
+      }
+      EffectTarget::Functions => {
+        self.invalidate_names(true, None, issue, value_issue);
+      }
+      EffectTarget::Attribute(name) => {
+        if !self.readonly.contains_key(&name) {
+          self.readonly.insert(name, false);
+        }
+      }
+      EffectTarget::AttributePattern(pattern) => {
+        self.unknown_attributes.insert(pattern);
+      }
+      EffectTarget::Attributes => {
+        self.unknown_attributes.insert(Value::Unknown(value_issue));
+      }
+      EffectTarget::Directory => {
+        self.cwd = Value::Unknown(value_issue);
+        for name in [b"PWD".as_slice(), b"OLDPWD"] {
+          self.taint_variable(name, issue, value_issue);
+        }
+      }
+      EffectTarget::Positionals => {
+        self.positional.invalidate(value_issue);
+        self.alternatives.forget_positionals();
+      }
+      EffectTarget::Options => {
+        self.errexit = None;
+        self.nounset = None;
+        self.noglob = None;
+        self
+          .special
+          .insert(b"-".to_vec(), Value::Unknown(value_issue));
+      }
+      EffectTarget::SpecialParameters => {
+        for name in [b"?".as_slice(), b"-", b"!"] {
+          self
+            .special
+            .insert(name.to_vec(), Value::Unknown(value_issue));
+        }
+      }
+    }
+  }
+
+  fn invalidate_names(
+    &mut self,
+    functions: bool,
+    pattern: Option<Value>,
+    issue: ResolutionIssue,
+    value_issue: ValueIssue,
+  ) {
+    let matches = |name: &[u8]| {
+      pattern
+        .as_ref()
+        .is_none_or(|pattern| pattern.can_equal(name))
+    };
+    if !functions {
+      self.variables_changed(pattern.as_ref());
+      for (name, definite) in &self.readonly {
+        if *definite
+          && matches(name)
+          && !self.variables.values.contains_key(name)
+        {
+          let binding = self.variables.get(name).clone();
+          self.variables.values.insert(name.clone(), binding);
+        }
+      }
+    }
+    let readonly = &self.readonly;
+    let kept = |name: &[u8]| !functions && readonly.get(name) == Some(&true);
+    self
+      .alternatives
+      .forget_names(functions, |name| matches(name) && !kept(name));
     let names = if functions {
       &mut self.functions
     } else {
       &mut self.variables
     };
-    for (name, mut binding) in names.values.clone() {
-      if pattern.can_equal(&name)
-        && (functions || self.readonly.get(&name) != Some(&true))
-      {
-        binding.taint(issue);
-        names.values.insert(name.clone(), binding);
-        if functions {
-          self.alternatives.forget_function(&name);
-        } else {
-          self.alternatives.forget(&name);
-        }
-      }
+    names.invalidate(pattern, kept, issue, value_issue);
+  }
+
+  /// Makes `name` unknown and forgets its branch choices unless it is
+  /// definitely readonly, returning whether its value may change.
+  fn taint_variable(
+    &mut self,
+    name: &[u8],
+    issue: ResolutionIssue,
+    value_issue: ValueIssue,
+  ) -> bool {
+    if self.readonly(name) == Some(true) {
+      return false;
     }
-    names.restrict(pattern, issue);
+    self.alternatives.forget(name);
+    let mut binding = self.variables.get(name).clone();
+    binding.taint(issue, value_issue);
+    self.variables.values.insert(name.to_vec(), binding);
+    true
+  }
+
+  /// Assigns `value` from `definition` to `name` unless it is definitely
+  /// readonly, keeping the previous binding while it may be readonly.
+  pub(in crate::interface::application::engine::analysis) fn assign(
+    &mut self,
+    name: &[u8],
+    definition: Resolution,
+    value: Value,
+  ) {
+    let readonly = self.readonly(name);
+    if readonly == Some(true) {
+      return;
+    }
+    self.variable_changed(name, readonly.is_none().then_some(&value));
+    self.alternatives.forget(name);
+    let mut binding = Binding {
+      resolution: definition,
+      value: Arc::new(value),
+    };
+    if readonly.is_some() {
+      binding.join(self.variables.get(name));
+    }
+    self.variables.values.insert(name.to_vec(), binding);
   }
 
   pub fn variable_changed(&mut self, name: &[u8], value: Option<&Value>) {
-    if name == b"OPTIND" {
-      self.option_cursor = None;
-      self.options_reset = value == Some(&Value::Literal(b"1".to_vec()));
+    match name {
+      b"OPTIND" => {
+        self.option_cursor = None;
+        self.options_reset = value == Some(&Value::Literal(b"1".to_vec()));
+      }
+      b"PWD" | b"OLDPWD" => self.directory_variables_modified = true,
+      _ => {}
+    }
+  }
+
+  /// Records unknown changes to the writable variables that `pattern`, or
+  /// any name when it is absent, may name.
+  fn variables_changed(&mut self, pattern: Option<&Value>) {
+    for name in [b"OPTIND".as_slice(), b"PWD", b"OLDPWD"] {
+      if pattern.is_none_or(|pattern| pattern.can_equal(name))
+        && self.readonly(name) != Some(true)
+      {
+        self.variable_changed(name, None);
+      }
     }
   }
 
   pub fn locale(&self, category: &[u8]) -> Option<&[u8]> {
     for name in [b"LC_ALL".as_slice(), category, b"LANG"] {
+      if self.uncertain_variable(name) {
+        return None;
+      }
       match self.variables.get(name).value.as_ref() {
         Value::Literal(bytes) if !bytes.is_empty() => return Some(bytes),
         Value::Literal(_) => {}
@@ -296,10 +581,12 @@ impl Environment {
           .collect(),
         fallback: Binding::new(initial(input.other_functions)),
       },
-      positional: input
-        .positional
-        .as_ref()
-        .map(|args| args.iter().cloned().map(Value::Literal).collect()),
+      positional: input.positional.as_ref().map_or_else(
+        || Positionals::unknown(ValueIssue::Dynamic),
+        |args| {
+          Positionals::Known(args.iter().cloned().map(Value::Literal).collect())
+        },
+      ),
       special: input
         .special
         .iter()
@@ -307,6 +594,7 @@ impl Environment {
         .collect(),
       directory_variables_modified: false,
       substitution_status: None,
+      failure: CommandFailure::None,
       option_cursor: None,
       options_reset: input
         .values
@@ -316,7 +604,7 @@ impl Environment {
       io: Io::default(),
       order: BTreeSet::new(),
       readonly: OrdMap::new(),
-      unknown_attributes: false,
+      unknown_attributes: BTreeSet::new(),
       errexit: input.errexit,
       nounset: input.nounset,
       noglob: input.noglob,
@@ -329,6 +617,7 @@ impl Environment {
 
   pub fn join(&mut self, other: &Self) {
     self.alternatives.clear();
+    self.failure.join(other.failure);
     if self.option_cursor != other.option_cursor {
       self.option_cursor = None;
     }
@@ -369,14 +658,7 @@ impl Environment {
     if self.noglob != other.noglob {
       self.noglob = None;
     }
-    match (&mut self.positional, &other.positional) {
-      (Some(left), Some(right)) if left.len() == right.len() => {
-        for (a, b) in left.iter_mut().zip(right) {
-          a.join(b);
-        }
-      }
-      _ => self.positional = None,
-    }
+    self.positional.join(&other.positional);
     for (name, value) in &mut self.special {
       value.join(
         other
@@ -390,7 +672,9 @@ impl Environment {
     self.variables.join(&other.variables);
     self.functions.join(&other.functions);
     self.order.extend(other.order.iter().cloned());
-    self.unknown_attributes |= other.unknown_attributes;
+    self
+      .unknown_attributes
+      .extend(other.unknown_attributes.iter().cloned());
     let names: BTreeSet<_> = self
       .readonly
       .keys()
@@ -404,23 +688,66 @@ impl Environment {
     }
   }
 
+  /// The exit status that `$?` expands to.
+  pub fn status(&self) -> Value {
+    self.parameter(b"?").0
+  }
+
+  pub fn set_status(&mut self, status: Value) {
+    self.special.insert(b"?".to_vec(), status);
+  }
+
+  pub fn complete_command(&mut self) {
+    match self.failure {
+      CommandFailure::None => {}
+      CommandFailure::Definite => {
+        self.set_status(Value::Literal(b"1".to_vec()));
+      }
+      CommandFailure::Possible(issue) => {
+        self.set_status(Value::Unknown(
+          self
+            .status()
+            .issue()
+            .map_or(issue, |status| status.combine(issue)),
+        ));
+      }
+    }
+  }
+
+  pub fn require_parameter(&mut self, name: &[u8]) {
+    if self.nounset == Some(false) || matches!(name, b"@" | b"*") {
+      return;
+    }
+    let (value, absent) = self.parameter(name);
+    match (self.nounset, absent) {
+      (Some(true), Some(true)) => self.failure = CommandFailure::Definite,
+      (_, Some(false)) => {}
+      _ => self
+        .failure
+        .uncertain(value.issue().unwrap_or(ValueIssue::Dynamic)),
+    }
+  }
+
   pub fn readonly(&self, name: &[u8]) -> Option<bool> {
     self
       .readonly
       .get(name)
       .copied()
-      .or_else(|| self.unknown_attributes.then_some(false))
+      .or_else(|| self.unknown_attribute(name).then_some(false))
   }
 
-  pub fn readonly_attribute(
-    &self,
-    name: &[u8],
-  ) -> crate::interface::application::engine::AttributeState {
-    use crate::interface::application::engine::AttributeState;
+  fn unknown_attribute(&self, name: &[u8]) -> bool {
+    self
+      .unknown_attributes
+      .iter()
+      .any(|pattern| pattern.can_equal(name))
+  }
+
+  pub fn readonly_attribute(&self, name: &[u8]) -> AttributeState {
     match self.readonly.get(name) {
       Some(true) => AttributeState::Known(true),
       Some(false) => AttributeState::Conditional,
-      None if self.unknown_attributes => AttributeState::Unknown,
+      None if self.unknown_attribute(name) => AttributeState::Unknown,
       None if self.variables.get(name).resolution.issues.is_empty() => {
         AttributeState::Known(false)
       }
@@ -437,13 +764,77 @@ impl Environment {
   pub fn uncertain_variable(&self, name: &[u8]) -> bool {
     self
       .order
-      .contains(&crate::interface::application::engine::EffectTarget::Variables)
-      || self.order.contains(
-        &crate::interface::application::engine::EffectTarget::Variable(
-          name.to_vec(),
-        ),
-      )
-      || self.order.iter().any(|target| matches!(target, crate::interface::application::engine::EffectTarget::VariablePattern(pattern) if pattern.can_equal(name)))
+      .iter()
+      .any(|target| target.covers(SymbolKind::Variable, name))
+  }
+
+  pub(in crate::interface::application::engine::analysis) fn parameter(
+    &self,
+    name: &[u8],
+  ) -> (Value, Option<bool>) {
+    if name == b"#" {
+      return (self.positional.count(), Some(false));
+    }
+    if name != b"0" && name.iter().all(u8::is_ascii_digit) && !name.is_empty() {
+      let index = std::str::from_utf8(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|n| n.checked_sub(1));
+      return self.positional.values().map_or_else(
+        |issue| (Value::Unknown(issue), None),
+        |args| {
+          index
+            .and_then(|i| args.get(i))
+            .map_or((Value::Literal(Vec::new()), Some(true)), |v| {
+              (v.clone(), Some(false))
+            })
+        },
+      );
+    }
+    if matches!(name, b"?" | b"-" | b"$" | b"!" | b"0") {
+      return (
+        self
+          .special
+          .get(name)
+          .cloned()
+          .unwrap_or(Value::Unknown(ValueIssue::Dynamic)),
+        if name == b"!" { None } else { Some(false) },
+      );
+    }
+    if matches!(name, b"@" | b"*") {
+      return (Value::Unknown(ValueIssue::Unspecified), None);
+    }
+    if self.uncertain_variable(name) {
+      return (Value::Unknown(ValueIssue::Dynamic), None);
+    }
+    let binding = self.variables.get(name);
+    let resolution = &binding.resolution;
+    let absent = if !resolution.issues.is_empty() {
+      None
+    } else if resolution.candidates.is_empty()
+      && resolution.alternatives == [Alternative::Unset].into()
+    {
+      Some(true)
+    } else if !resolution.alternatives.contains(&Alternative::Unset) {
+      Some(false)
+    } else {
+      None
+    };
+    (binding.value.as_ref().clone(), absent)
+  }
+
+  pub(in crate::interface::application::engine::analysis) fn ifs(
+    &self,
+  ) -> Value {
+    let default = Value::Literal(b" \t\n".to_vec());
+    match self.parameter(b"IFS") {
+      (_, Some(true)) => default,
+      (value, Some(false)) => value,
+      (mut value, None) => {
+        value.join(&default);
+        value
+      }
+    }
   }
 }
 
@@ -519,12 +910,53 @@ pub(in crate::interface::application::engine::analysis) enum Transfer {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(in crate::interface::application::engine::analysis) struct Flow(
-  pub BTreeMap<Transfer, Environment>,
+  BTreeMap<Transfer, Environment>,
 );
 
 impl Flow {
   pub fn next(environment: Environment) -> Self {
-    Self(BTreeMap::from([(Transfer::Next, environment)]))
+    Self::single(Transfer::Next, environment)
+  }
+
+  pub fn single(transfer: Transfer, environment: Environment) -> Self {
+    Self(BTreeMap::from([(transfer, environment)]))
+  }
+
+  pub fn take(&mut self, transfer: Transfer) -> Option<Environment> {
+    self.0.remove(&transfer)
+  }
+
+  pub fn get(&self, transfer: Transfer) -> Option<&Environment> {
+    self.0.get(&transfer)
+  }
+
+  pub fn get_mut(&mut self, transfer: Transfer) -> Option<&mut Environment> {
+    self.0.get_mut(&transfer)
+  }
+
+  pub fn environments(&self) -> impl Iterator<Item = &Environment> {
+    self.0.values()
+  }
+
+  pub fn environments_mut(&mut self) -> impl Iterator<Item = &mut Environment> {
+    self.0.values_mut()
+  }
+
+  /// Joins the environments of every transfer, as a boundary that every
+  /// transfer leaves sees them.
+  pub fn merged(self) -> Option<Environment> {
+    self.0.into_values().reduce(|mut left, right| {
+      left.join(&right);
+      left
+    })
+  }
+
+  /// Continues after a function or `.` boundary, where `return` ends.
+  pub fn returned(mut self) -> Self {
+    if let Some(environment) = self.take(Transfer::Return) {
+      self.add(Transfer::Next, environment);
+    }
+    self
   }
 
   pub fn add(&mut self, transfer: Transfer, environment: Environment) {
@@ -542,11 +974,20 @@ impl Flow {
   }
 }
 
+impl IntoIterator for Flow {
+  type Item = (Transfer, Environment);
+  type IntoIter = std::collections::btree_map::IntoIter<Transfer, Environment>;
+
+  fn into_iter(self) -> Self::IntoIter {
+    self.0.into_iter()
+  }
+}
+
 #[cfg(test)]
 #[path = "../../../../../../tests/implementation/state.rs"]
 mod tests;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::interface::application::engine::analysis) struct Io {
   pub input: Input,
   pub input_order_unknown: bool,
@@ -556,13 +997,37 @@ pub(in crate::interface::application::engine::analysis) struct Io {
   pub stderr_captured: bool,
 }
 
-type Input = Option<(Arc<Vec<u8>>, usize)>;
+type Input = Result<(Arc<Vec<u8>>, usize), ValueIssue>;
+
+impl Default for Io {
+  fn default() -> Self {
+    Self {
+      input: Err(ValueIssue::Dynamic),
+      input_order_unknown: false,
+      saved_inputs: imbl::Vector::new(),
+      output: None,
+      stdout_redirected: false,
+      stderr_captured: false,
+    }
+  }
+}
+
+fn input_issue(left: &Input, right: &Input) -> ValueIssue {
+  left
+    .as_ref()
+    .err()
+    .into_iter()
+    .chain(right.as_ref().err())
+    .copied()
+    .reduce(ValueIssue::combine)
+    .unwrap_or(ValueIssue::Dynamic)
+}
 
 impl Io {
   fn join_input(&mut self, other: &Self) {
     let same_stream = match (&self.input, &other.input) {
-      (Some((left, _)), Some((right, _))) => Arc::ptr_eq(left, right),
-      (None, None) => true,
+      (Ok((left, _)), Ok((right, _))) => Arc::ptr_eq(left, right),
+      (Err(_), Err(_)) => true,
       _ => false,
     };
     for (index, (input, unordered)) in self.saved_inputs.iter_mut().enumerate()
@@ -570,27 +1035,30 @@ impl Io {
       let next = other.saved_inputs.get(index);
       if next.map(|(input, _)| input) != Some(input)
         || (!same_stream
-          && input.as_ref().is_some_and(|(saved, _)| {
+          && input.as_ref().is_ok_and(|(saved, _)| {
             [self.input.as_ref(), other.input.as_ref()]
               .into_iter()
               .flatten()
               .any(|(active, _)| Arc::ptr_eq(active, saved))
           }))
       {
-        *input = None;
+        *input =
+          Err(next.map_or(ValueIssue::Dynamic, |(other, _)| {
+            input_issue(input, other)
+          }));
       }
       *unordered |= next.is_some_and(|(_, unordered)| *unordered);
     }
     if self.input != other.input {
-      self.input = None;
+      self.input = Err(input_issue(&self.input, &other.input));
     }
     self.input_order_unknown |= other.input_order_unknown;
   }
 
-  pub fn forget_inputs(&mut self) {
-    self.input = None;
+  pub fn forget_inputs(&mut self, issue: ValueIssue) {
+    self.input = Err(issue);
     for (input, _) in &mut self.saved_inputs {
-      *input = None;
+      *input = Err(issue);
     }
   }
 
@@ -614,17 +1082,19 @@ impl Io {
 
   pub fn consume_input(&mut self, offset: Option<usize>) {
     if self.input_order_unknown {
-      self.forget_inputs();
+      self.forget_inputs(ValueIssue::Unspecified);
       return;
     }
-    let Some((stream, _)) = &self.input else {
+    let Ok((stream, _)) = &self.input else {
       return;
     };
-    let next = offset.map(|offset| (Arc::clone(stream), offset));
+    let next = offset
+      .map(|offset| (Arc::clone(stream), offset))
+      .ok_or(ValueIssue::Dynamic);
     for (saved, _) in &mut self.saved_inputs {
       if saved
         .as_ref()
-        .is_some_and(|(old, _)| Arc::ptr_eq(old, stream))
+        .is_ok_and(|(old, _)| Arc::ptr_eq(old, stream))
       {
         saved.clone_from(&next);
       }

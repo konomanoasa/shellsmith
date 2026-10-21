@@ -19,9 +19,8 @@ mod assignments {
       ("f; : &", "0"),
       (":; x=$(f) y=$(:)", "0"),
       (":; x=$(:) y=$(f)", "7"),
-      (":; x=$(f) >output", "7"),
-      (":; >\"$(f)\"", "7"),
-      (":; x=$(f) >\"$(f)\"", "7"),
+      (":; >\"$(f)\"", "1"),
+      (":; x=$(f) >\"$(f)\"", "1"),
       ("f; : \"$(f)\"", "0"),
       ("f; g() { :; }", "0"),
       ("f; x=$( )", "0"),
@@ -37,6 +36,12 @@ mod assignments {
         "{source}"
       );
     }
+    let (workspace, analysis) =
+      analyze("f() { return 7; }; x=$(f) >output; out=$?; : \"$out\"");
+    assert_eq!(
+      reads(&workspace, &analysis, b"out"),
+      [Value::Unknown(ValueIssue::Dynamic)]
+    );
     let (workspace, analysis) =
       analyze("out=kept; (out=changed); : \"$(out=other)\"; : \"$out\"");
     assert_eq!(
@@ -64,6 +69,7 @@ mod assignments {
       "read name; tool=$(command -p printf '%s' \"$name\"; command -p printf /suffix); \"$tool\"",
       "if condition; then tool=$(command -v missing); else tool=$(command -v other); fi; \"$tool\"",
       "tool=/bin/; while condition; do tool=${tool}x; done; \"$tool\"",
+      "read tail; tool=; while condition; do tool=${tail}x; done; \"$tool\"",
       "f() { read name; \"/bin/$name\"; command -v f; f; }; f",
     ] {
       let source = format!("keep=yes; {body}; out=$keep; : \"$out\"");
@@ -207,6 +213,72 @@ mod assignments {
   }
 
   #[test]
+  fn unchanged_state_keeps_branch_choices_and_readonly_values() {
+    let branches = "u=$(external); if condition; then unset x; y=expected; else x=expected; y=unused; fi";
+    for step in [
+      "readonly x; x=other",
+      "readonly x; f() { case $u in a) f; x=1 ;; esac; }; f",
+    ] {
+      let source = format!("{branches}; {step}; out=${{x-$y}}; : \"$out\"");
+      let (workspace, analysis) = analyze(&source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Literal(b"expected".to_vec())],
+        "{source}"
+      );
+    }
+    for (source, expected) in [
+      (
+        "if condition; then set -- ok; f() { value=; }; else set --; f() { value=ok; }; fi; read -Z v; f; out=$value${1-}; : \"$out\"",
+        "ok",
+      ),
+      ("readonly x; read -Z v; out=${x-unset}; : \"$out\"", "unset"),
+      (
+        "readonly x; u=$(external); read \"x$u\"; out=${x-unset}; : \"$out\"",
+        "unset",
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Literal(expected.as_bytes().to_vec())],
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn undecoded_definitions_forget_branch_choices_and_keep_readonly_values() {
+    for (source, name, expected) in [
+      (
+        "if condition; then f() { out=a; }; else f() { out=b; }; fi; g() { a | ; }; f; : \"$out\"",
+        b"out".as_slice(),
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "readonly r=1; x=$(a | ); : \"$r\"",
+        b"r",
+        Value::Literal(b"1".to_vec()),
+      ),
+    ] {
+      let document = support::parse(1, 1, source);
+      assert!(document.has_syntax_errors(), "{source}");
+      let mut request = AnalysisRequest::new(document.snapshot());
+      request.initial = InitialEnvironment::empty();
+      let mut workspace = Workspace::default();
+      workspace.insert(document).unwrap();
+      let analysis = workspace
+        .analyze(
+          request,
+          &mut support::Inputs::default(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
+      assert_eq!(reads(&workspace, &analysis, name), [expected], "{source}");
+    }
+  }
+
+  #[test]
   fn captured_output_uses_shared_results_and_restores_redirections() {
     for (body, expected) in [
       (":", ""),
@@ -280,6 +352,25 @@ mod assignments {
   }
 
   #[test]
+  fn command_queries_may_report_words_an_implementation_reserves() {
+    for name in ["time", "[[", "select", "label:"] {
+      let source = format!("out=$(command -v '{name}'); : \"$out\"");
+      let (workspace, analysis) = analyze(&source);
+      let values = reads(&workspace, &analysis, b"out");
+      let [Value::Partial(value)] = values.as_slice() else {
+        panic!("{source}: {values:?}");
+      };
+      assert!(
+        value
+          .choices
+          .iter()
+          .any(|choice| choice.exact && choice.prefix == name.as_bytes()),
+        "{source}: {value:?}"
+      );
+    }
+  }
+
+  #[test]
   fn input_consumption_survives_temporary_and_isolated_redirections() {
     let mut failures = Vec::new();
     for body in [
@@ -329,7 +420,7 @@ mod assignments {
   fn uncertain_input_and_evaluation_order_do_not_fabricate_values() {
     for source in [
       "{ { read -r out; : \"$out\"; } & wait; } <<'END'\nvalue\nEND\n",
-      "f() { return 7; }; x=$(f) >\"$(:)\"; out=$?; : \"$out\"",
+      "f() { return 7; }; x=$(f) >\"$(command -p printf output)\"; out=$?; : \"$out\"",
       "{ : <\"$(unknown_utility)\"; read -r out; } <<'END'\none\ntwo\nEND\n: \"$out\"",
       "{ { if :; then :; else exec <<'INNER'\none\ntwo\nINNER\nfi; read first; } <&0; read -r out; } <<'END'\none\ntwo\nEND\n: \"$out\"",
       "{ out=$(read first; command -p printf %s \"$first\") >\"$(read second; command -p printf output)\"; } <<'END'\none\ntwo\nEND\n: \"$out\"",
@@ -427,16 +518,7 @@ mod assignments {
         "read first out <<'END'\none\\ two three\\\nfour\nEND\n: \"$out\"",
         "threefour",
       ),
-      ("read -r out <<-END\n\t\tvalue\n\tEND\n: \"$out\"", "value"),
       ("read -r out <<END\nfoo\\\nbar\nEND\n: \"$out\"", "foobar"),
-      (
-        "read -r out <<-END\n\tfoo\\\n\tbar\n\tEND\n: \"$out\"",
-        "foobar",
-      ),
-      (
-        "tab='\tvalue'; IFS= read -r out <<-END\n\t$tab\n\tEND\n: \"$out\"",
-        "\tvalue",
-      ),
       (
         "read -r out <<END\n$(command -p printf value)\nEND\n: \"$out\"",
         "value",
@@ -450,7 +532,16 @@ mod assignments {
         "two",
       ),
       ("exec <<'END'\nvalue\nEND\nread -r out; : \"$out\"", "value"),
+      (
+        "out=kept; read -d out other <<'END'\nvalue\nEND\n: \"$out\"",
+        "kept",
+      ),
+      (
+        "out=kept; read -rd out other <<'END'\nvalue\nEND\n: \"$out\"",
+        "kept",
+      ),
       ("OPTIND=1; getopts a out -a; : \"$out\"", "a"),
+      ("OPTIND=1; getopts -- a out -a; : \"$out\"", "a"),
       (
         "OPTIND=1; getopts ab first -ab; getopts ab out -ab; : \"$out\"",
         "b",
@@ -470,6 +561,39 @@ mod assignments {
       (
         "OPTIND=1; getopts ab first -ab; OPTIND=1; getopts ab out -ab; : \"$out\"",
         "a",
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Literal(expected.as_bytes().to_vec())],
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn tab_stripping_here_documents_remove_only_tabs_that_begin_body_lines() {
+    for (source, expected) in [
+      (
+        "IFS= read -r out <<-END\n\t\tvalue\n\tEND\n: \"$out\"",
+        "value",
+      ),
+      (
+        "read -r out <<-END\n\tfoo\\\n\tbar\n\tEND\n: \"$out\"",
+        "foobar",
+      ),
+      (
+        "tab='\tvalue'; IFS= read -r out <<-END\n\t$tab\n\tEND\n: \"$out\"",
+        "\tvalue",
+      ),
+      (
+        "{ IFS= read -r first; IFS= read -r out; } <<-END\n\tone\n\t\ttwo\n\tEND\n: \"$out\"",
+        "two",
+      ),
+      (
+        "{ IFS= read -r first; IFS= read -r out; } <<-'END'\n\tone\n\t\ttwo\n\tEND\n: \"$out\"",
+        "two",
       ),
     ] {
       let (workspace, analysis) = analyze(source);
@@ -533,6 +657,8 @@ mod assignments {
     for command in [
       "set -xvabC",
       "set -o xtrace -o verbose -o allexport",
+      "set -o pipefail -o nolog",
+      "set +o pipefail",
       "set -f",
       "set -o noglob",
       "flags=-eu; set $flags",
@@ -620,6 +746,27 @@ mod assignments {
         ),
       ),
       (
+        "read tail; set -- \"$tail\" b; path=$*; : \"$path\"",
+        Value::Partial(
+          shellsmith::interface::application::engine::PartialValue {
+            choices: vec![
+              shellsmith::interface::application::engine::ValueConstraint {
+                prefix: Vec::new(),
+                suffix: b" b".to_vec(),
+                minimum: 2,
+                required: b" b".iter().copied().collect(),
+                exact: false,
+              },
+            ],
+            issue: ValueIssue::Dynamic,
+          },
+        ),
+      ),
+      (
+        "read tail; set -- \"$tail\"*; path=$#; : \"$path\"",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
         "if condition; then path=$((1/0)); else path=one; fi; : \"$path\"",
         Value::Unknown(ValueIssue::Arithmetic),
       ),
@@ -659,6 +806,7 @@ mod assignments {
       "path=kept; f() { f; }; f; : \"$path\"",
       "path=kept; f() { x=changed; f; }; f; : \"$path\"",
       "path=kept; f() { g; }; g() { f; }; f; : \"$path\"",
+      "path=kept; f() { path=changed & f; }; f; : \"$path\"",
     ] {
       let (workspace, analysis) = analyze(source);
       assert_eq!(
@@ -668,6 +816,31 @@ mod assignments {
       );
       assert!(analysis.has_recursive_calls());
     }
+  }
+
+  #[test]
+  fn recursion_summaries_include_any_function_an_undecoded_definition_may_name()
+  {
+    use shellsmith::interface::application::engine::{
+      ResolutionStatus, UseSite,
+    };
+    let (workspace, analysis) = analyze(
+      "g() { :; }\ncat <<EOF\n$(f() { if c; then f; g; fi; h\\\nx() { :; }; }; f)\nEOF\n",
+    );
+    let call = workspace
+      .document(DocumentId(1))
+      .unwrap()
+      .occurrences()
+      .iter()
+      .rfind(|site| {
+        site.kind == OccurrenceKind::Command
+          && site.name == Value::Literal(b"g".to_vec())
+      })
+      .unwrap();
+    assert!(!matches!(
+      analysis.summarize(UseSite::Syntax(call.id)).status(),
+      ResolutionStatus::Resolved(_)
+    ));
   }
 
   #[test]
@@ -701,14 +874,7 @@ mod assignments {
           EffectTarget::Variable(b"OPTIND".to_vec()),
         ],
       ),
-      (
-        "cd ./sub",
-        vec![
-          EffectTarget::Directory,
-          EffectTarget::Variable(b"PWD".to_vec()),
-          EffectTarget::Variable(b"OLDPWD".to_vec()),
-        ],
-      ),
+      ("cd ./sub", vec![EffectTarget::Directory]),
       (
         "set -- value",
         vec![EffectTarget::Options, EffectTarget::Positionals],
@@ -746,6 +912,7 @@ mod assignments {
    {
     for command in [
       "set -euo unknown",
+      "set -o hashall",
       "set -z",
       "set -",
       "flags=$(echo -eu); set \"$flags\"",
@@ -1025,23 +1192,43 @@ mod assignments {
       if let Some(binding) = binding {
         request.initial.variables.insert(b"path".to_vec(), binding);
       }
-      workspace.set_analysis_request(request.clone()).unwrap();
-      let result = workspace.analyze(&AtomicBool::new(false)).unwrap();
+      let result = workspace
+        .analyze(
+          request.clone(),
+          &mut support::Inputs::default(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
       assert_eq!(reads(&workspace, &result, b"path"), vec![expected]);
     }
   }
 
   #[test]
   fn expanded_value_limits_stop_growth_without_discarding_later_analysis() {
-    let document =
-      support::parse(1, 1, "x=ab; x=$x$x; x=$x$x; : \"$x\"; x=ok; : \"$x\"");
-    let mut request = AnalysisRequest::new(document.snapshot());
-    request.initial = InitialEnvironment::empty();
-    request.limits.value_bytes = 4;
-    let mut workspace = Workspace::default();
-    workspace.insert(document).unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let result = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let analyze = |source| {
+      let document = support::parse(1, 1, source);
+      let mut request = AnalysisRequest::new(document.snapshot());
+      request.initial = InitialEnvironment::empty();
+      request.limits.value_bytes = 4;
+      let mut workspace = Workspace::default();
+      workspace.insert(document).unwrap();
+      let result = workspace
+        .analyze(
+          request,
+          &mut support::Inputs::default(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
+      (workspace, result)
+    };
+    let limited = |result: &Analysis| {
+      result
+        .gaps()
+        .iter()
+        .any(|gap| gap.issue == ResolutionIssue::ValueLimit)
+    };
+    let (workspace, result) =
+      analyze("x=ab; x=$x$x; x=$x$x; : \"$x\"; x=ok; : \"$x\"");
     assert_eq!(
       reads(&workspace, &result, b"x"),
       vec![
@@ -1053,12 +1240,9 @@ mod assignments {
         Value::Literal(b"ok".to_vec()),
       ]
     );
-    assert!(
-      result
-        .gaps()
-        .iter()
-        .any(|gap| gap.issue == ResolutionIssue::ValueLimit)
-    );
+    assert!(limited(&result));
+    let (_, result) = analyze("x=$'\\0'abcdefgh; : \"$x\"");
+    assert!(limited(&result));
   }
 
   #[test]
@@ -1081,6 +1265,17 @@ mod assignments {
         Value::Literal(b"updated".to_vec()),
       ),
       ("readonly 'x=updated'", Value::Literal(b"updated".to_vec())),
+      (
+        "readonly \"z$(external)\"; x=updated",
+        Value::Literal(b"updated".to_vec()),
+      ),
+      ("export -- x=updated", Value::Literal(b"updated".to_vec())),
+      ("export x=updated -p", Value::Literal(b"updated".to_vec())),
+      ("export x=-p", Value::Literal(b"-p".to_vec())),
+      ("time :", Value::Literal(b"old".to_vec())),
+      ("x=new [[ -n a ]]", Value::Literal(b"old".to_vec())),
+      ("\\[[ -n a ]]", Value::Literal(b"old".to_vec())),
+      ("'label:' operand", Value::Literal(b"old".to_vec())),
     ] {
       let source = format!(
         "x=old; y=keep; f() {{ :; }}; {command}; : \"$x\"; : \"$y\"; f"
@@ -1116,6 +1311,12 @@ mod assignments {
         true,
       ),
       (
+        "read -p prompt value",
+        vec![EffectTarget::Variables],
+        false,
+        true,
+      ),
+      (
         "unset -v -- \"$target\"",
         vec![EffectTarget::Variables],
         false,
@@ -1126,6 +1327,20 @@ mod assignments {
         vec![EffectTarget::Functions],
         true,
         false,
+      ),
+      (
+        "unset -f -v x",
+        vec![EffectTarget::Variables, EffectTarget::Functions],
+        false,
+        false,
+      ),
+      ("export -p x=1", vec![EffectTarget::Variables], false, true),
+      ("export -n x=1", vec![EffectTarget::Variables], false, true),
+      (
+        "readonly -p x=1",
+        vec![EffectTarget::Variables, EffectTarget::Attributes],
+        false,
+        true,
       ),
       (
         "set \"$target\"",
@@ -1139,20 +1354,10 @@ mod assignments {
         true,
         true,
       ),
-      (
-        "cd \"$target\"",
-        vec![
-          EffectTarget::Variable(b"PWD".to_vec()),
-          EffectTarget::Variable(b"OLDPWD".to_vec()),
-          EffectTarget::Directory,
-        ],
-        true,
-        true,
-      ),
+      ("cd \"$target\"", vec![EffectTarget::Directory], true, true),
     ] {
-      let source = format!(
-        "x=keep; f() {{ :; }}; target=$(external); {command}; : \"$x\"; f"
-      );
+      let source =
+        format!("x=keep; f() {{ :; }}; read target; {command}; : \"$x\"; f");
       let (workspace, result) = analyze(&source);
       let expected = if keep_variable {
         Value::Literal(b"keep".to_vec())
@@ -1189,6 +1394,23 @@ mod assignments {
   }
 
   #[test]
+  fn unknown_directory_changes_make_pwd_and_oldpwd_unknown() {
+    use shellsmith::interface::application::engine::{
+      EffectTarget, SymbolKind,
+    };
+    let (workspace, result) = analyze(
+      "PWD=/a; OLDPWD=/b; target=$(external); cd \"$target\"; : \"$PWD\" \"$OLDPWD\"",
+    );
+    for name in [b"PWD".as_slice(), b"OLDPWD"] {
+      assert!(EffectTarget::Directory.covers(SymbolKind::Variable, name));
+      assert_eq!(
+        reads(&workspace, &result, name),
+        [Value::Unknown(ValueIssue::UnsupportedExpansion)]
+      );
+    }
+  }
+
+  #[test]
   fn unknown_sources_preserve_known_readonly_but_prevent_unproven_overwrites() {
     let (workspace, result) = analyze(
       "readonly kept=value; x=before; . missing; x=after; : \"$kept\"; : \"$x\"",
@@ -1197,9 +1419,13 @@ mod assignments {
       reads(&workspace, &result, b"kept"),
       [Value::Literal(b"value".to_vec())]
     );
+    let values = reads(&workspace, &result, b"x");
+    let [Value::Unknown(issue)] = values.as_slice() else {
+      panic!("{values:?}")
+    };
     assert_eq!(
-      reads(&workspace, &result, b"x"),
-      [Value::Unknown(ValueIssue::Dynamic)]
+      issue.causes().collect::<Vec<_>>(),
+      [ValueIssue::Dynamic, ValueIssue::Unspecified]
     );
   }
 
@@ -1302,7 +1528,8 @@ mod assignments {
 mod expansion {
   use crate::support;
   use shellsmith::interface::application::engine::{
-    AnalysisRequest, DocumentId, InitialEnvironment, Value, ValueIssue,
+    AnalysisRequest, CharacterEncoding, DocumentId, InitialEnvironment,
+    InputQuery, InputResult, PartialValue, Value, ValueConstraint, ValueIssue,
     Workspace,
   };
   use std::sync::atomic::AtomicBool;
@@ -1311,28 +1538,166 @@ mod expansion {
     last_value_with_limit(source, initial, 1024 * 1024)
   }
 
+  #[test]
+  fn definite_preparation_errors_complete_with_status_one() {
+    for command in [
+      "unset x; : \"${x:?missing}\"",
+      "unset x; x=${x?missing}",
+      "x=$((1/0))",
+      "expr=08; x=$(( $expr ))",
+      ": \"$((1%0))\"",
+      "read n; : \"$((n/0))\"",
+      "n=2; : \"$((n/=0))\"",
+      "expr='1/0'; x=$(( $expr ))",
+      "expr='1+'; x=$(( $expr ))",
+      "readonly x=1; x=2",
+      "readonly x=1; x=2 :",
+      "readonly x=1; : \"$((x=2))\"",
+      "readonly x=; : \"${x:=2}\"",
+      "set -u; unset x; : \"$x\"",
+      "set -u; unset x; : \"${#x}\"",
+      "set -u; set --; : \"$1\"",
+      ": < ''",
+      ": > ''",
+      "> ''",
+      "x=kept > ''",
+      "f() { return 7; }; x=$(f) >\"$(:)\"",
+      "{ :; } > ''",
+      "(:) > ''",
+      ": > \"${x:?missing}\"",
+      ": <<EOF\n$((1/0))\nEOF\n",
+    ] {
+      let source = format!("(exit 7); {command}\nresult=$?; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(b"1".to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn preparation_errors_respect_command_and_substitution_boundaries() {
+    for (command, expected) in [
+      ("x=$((1/0)); :", "0"),
+      ("x=$((1/0)); : \"$x\"", "0"),
+      ("x=$((1/0)); y=$x", "0"),
+      ("readonly x=1; x=2; :", "0"),
+      (": > ''; :", "0"),
+      ("(x=$((1/0)))", "1"),
+      ("x=$(x=$((1/0)))", "1"),
+      (": \"$(x=$((1/0)))\"", "0"),
+      ("f() { x=$((1/0)); }; f", "1"),
+      ("f() { :; }; f \"$((1/0))\"", "1"),
+      (": \"$((1/0))\" \"$(:)\"", "1"),
+      ("x=$((0 && 1/0))", "0"),
+      ("x=$((1 || 1/0))", "0"),
+      ("x=$((1 ? 2 : 1/0))", "0"),
+      ("x=yes; : \"${x:?$((1/0))}\"", "0"),
+      ("set -u; unset x; : \"${x:-default}\"", "0"),
+      ("set -u; set --; : \"$@\"", "0"),
+    ] {
+      let source = format!("{command}; result=$?; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{source}"
+      );
+    }
+    assert_eq!(
+      last_value(
+        "kept=ok; readonly x=before; x=after; result=$?/$x/$kept; : \"$result\"",
+        InitialEnvironment::empty()
+      ),
+      Value::Literal(b"1/before/ok".to_vec())
+    );
+  }
+
+  #[test]
+  fn uncertain_preparation_does_not_become_definite_failure_or_success() {
+    for (command, issue) in [
+      ("read x; : \"$((x))\"", ValueIssue::Dynamic),
+      (": > file", ValueIssue::Dynamic),
+      (": >&9", ValueIssue::Dynamic),
+      ("{ :; } > file", ValueIssue::Dynamic),
+      (
+        "if read condition; then x=yes; else unset x; fi; : \"${x:?missing}\"",
+        ValueIssue::Dynamic,
+      ),
+      ("x=$((9223372036854775807+1))", ValueIssue::Arithmetic),
+    ] {
+      let source = format!("{command}; result=$?; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Unknown(issue),
+        "{source}"
+      );
+    }
+    assert_eq!(
+      last_value(
+        "read x; : \"$x\"; result=$?; : \"$result\"",
+        InitialEnvironment::empty()
+      ),
+      Value::Literal(b"0".to_vec())
+    );
+    let value = last_value(
+      "read x; : \"$((x && 1/0))\"; result=$?; : \"$result\"",
+      InitialEnvironment::empty(),
+    );
+    let Value::Unknown(issue) = value else {
+      panic!("{value:?}");
+    };
+    assert_eq!(
+      issue.causes().collect::<Vec<_>>(),
+      [ValueIssue::Dynamic, ValueIssue::Arithmetic]
+    );
+    assert_eq!(
+      last_value_with_limit(
+        "x=abcdefghijklmnopqrstuvwxyz; : \"$x\"; result=$?; : \"$result\"",
+        InitialEnvironment::empty(),
+        16,
+      ),
+      Value::Literal(b"0".to_vec())
+    );
+    assert_eq!(
+      last_value_with_limit(
+        "expr=abcdefghijklmnopqrstuvwxyz; : \"$(( $expr ))\"; result=$?; : \"$result\"",
+        InitialEnvironment::empty(),
+        16,
+      ),
+      Value::Unknown(ValueIssue::SizeLimit)
+    );
+  }
+
   fn last_value_with_limit(
     source: &str,
     initial: InitialEnvironment,
     limit: usize,
+  ) -> Value {
+    let mut inputs = support::Inputs::default();
+    inputs.evaluated.insert(
+      InputQuery::Encoding(b"en_US.UTF-8".to_vec()),
+      InputResult::Encoding(CharacterEncoding::Utf8),
+    );
+    last_value_with_inputs(source, initial, limit, &mut inputs)
+  }
+
+  fn last_value_with_inputs(
+    source: &str,
+    initial: InitialEnvironment,
+    limit: usize,
+    inputs: &mut support::Inputs,
   ) -> Value {
     let document = support::parse(1, 1, source);
     assert!(!document.has_syntax_errors(), "{source}");
     let mut request = AnalysisRequest::new(document.snapshot());
     request.initial = initial;
     request.limits.value_bytes = limit;
-    request.inputs.insert(
-      shellsmith::interface::application::engine::InputQuery::Encoding(
-        b"en_US.UTF-8".to_vec(),
-      ),
-      shellsmith::interface::application::engine::InputResult::Encoding(
-        shellsmith::interface::application::engine::CharacterEncoding::Utf8,
-      ),
-    );
     let mut workspace = Workspace::default();
     workspace.insert(document).unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let result = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let result = workspace
+      .analyze(request, inputs, &AtomicBool::new(false))
+      .unwrap();
     let site = workspace
       .document(DocumentId(1))
       .unwrap()
@@ -1375,6 +1740,267 @@ mod expansion {
   }
 
   #[test]
+  fn undetermined_choices_keep_the_reasons_of_their_conditions() {
+    for source in [
+      "x=abcdefgh; result=${x:+set}; : \"$result\"",
+      "x=abcdefgh; result=$((x ? 1 : 2)); : \"$result\"",
+      "x=abcdefgh; y=$(external); result=$((y + x)); : \"$result\"",
+    ] {
+      let value = last_value_with_limit(source, InitialEnvironment::empty(), 4);
+      assert!(
+        matches!(value, Value::Unknown(issue)
+          if issue.causes().any(|cause| cause == ValueIssue::SizeLimit)),
+        "{source}: {value:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn derived_values_preserve_the_causes_that_prevent_their_evaluation() {
+    let mut failures = Vec::new();
+    for body in [
+      "set -- $x; result=$1",
+      "set -- $x; result=$#",
+      "set -- $x; result=\"$@\"",
+      "set -- $x; result=\"$*\"",
+      "set -- \"$x\"; result=$1",
+      "f() { result=$1; }; f $x",
+      "set -- a b; shift \"$x\"; result=$1",
+      "set -- $x; shift; result=$1",
+      "set -- $x; shift; result=$?",
+      "set \"$x\"; result=$#",
+      "set \"$x\"; result=$?",
+      "result=$(command -p echo \"$x\")",
+      "result=$(command -p echo $x)",
+      "result=$(command -p printf '%s' $x)",
+      "result=$(command -p printf \"$x\" a)",
+      "result=$(command -v \"$x\")",
+      "result=$(command -v $x)",
+      "cd \"$x\"; result=$PWD",
+      "HOME=$x; cd; result=$PWD",
+      "CDPATH=$x; cd relative; result=$PWD",
+      "getopts a result \"$x\"",
+      "getopts \"$x\" result -a",
+      "set -- $x; getopts a result",
+      "OPTIND=$x; getopts a result -a",
+      "IFS=$x; read result <<'EOF'\na b\nEOF\n",
+      "read result <<'EOF'\nabcdefghijklmnopqrstuvwxyz\nEOF\n",
+      "read result <<EOF\n$x\nEOF\n",
+      "read value <<EOF\n$x\nEOF\nresult=$?",
+      "set -- ${x:+yes}; result=$1",
+      "IFS=$x; set -- a b; result=\"$*\"",
+      "getopts a: flag -a \"$x\"; result=$OPTARG",
+      "kept=a; unset -- \"$x\"; result=$kept",
+      "kept=a; export \"$x\"; result=$kept",
+      "result=$(command -v -- \"$x\")",
+      "result=$(command -v -- $x)",
+      "set -- $x; for value; do result=$value; done",
+    ] {
+      let source = format!(
+        "OPTIND=1; x=abcdefghijklmnopqrstuvwxyz; {body}\n: \"$result\""
+      );
+      let mut initial = InitialEnvironment::empty();
+      initial.cwd = Some(b"/work".to_vec());
+      let value = last_value_with_limit(&source, initial, 16);
+      if value != Value::Unknown(ValueIssue::SizeLimit) {
+        failures.push(format!("{body}: {value:?}"));
+      }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+  }
+
+  #[test]
+  fn known_results_drop_causes_from_inputs_they_no_longer_depend_on() {
+    for (body, expected) in [
+      ("set -- \"$x\"; result=$#", "1"),
+      ("set -- \"$x\" kept; result=$2", "kept"),
+      ("set -- \"$x\" kept; shift; result=$1", "kept"),
+      ("set -- $x; set -- kept; result=$1", "kept"),
+      ("result=$(command -p printf ok \"$x\")", "ok"),
+      ("result=$(command -p printf ok $x)", "ok"),
+      ("result=$(set -- $x)", ""),
+      ("getopts a: result -a \"$x\"", "a"),
+      ("getopts a: flag -a \"$x\"; result=$OPTIND", "3"),
+      ("getopts a flag -a \"$x\"; result=$OPTARG", ""),
+      ("set -- a; shift 0; result=$1", "a"),
+      ("IFS=$x; set -- a; result=$#", "1"),
+      ("IFS=$x; set -- a; result=\"$*\"", "a"),
+      ("IFS=$x; set --; result=\"$*\"", ""),
+      ("set -- \"$x\"; result=${1+yes}", "yes"),
+      ("result=${x:+}", ""),
+      ("set -- \"${x:+}\"; result=$1", ""),
+    ] {
+      let source = format!(
+        "OPTIND=1; x=abcdefghijklmnopqrstuvwxyz; {body}; : \"$result\""
+      );
+      assert_eq!(
+        last_value_with_limit(&source, InitialEnvironment::empty(), 16),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn provider_causes_survive_state_changes_until_a_known_result_replaces_them()
+  {
+    for (body, expected) in [
+      (
+        "cd /unknown; result=$PWD",
+        Value::Unknown(ValueIssue::SizeLimit),
+      ),
+      (
+        "cd /unknown; result=$?",
+        Value::Unknown(ValueIssue::SizeLimit),
+      ),
+      (
+        "cd /unknown; result=$(command -p pwd)",
+        Value::Unknown(ValueIssue::SizeLimit),
+      ),
+      (
+        "cd /unknown; cd /known; result=$PWD",
+        Value::Literal(b"/known".to_vec()),
+      ),
+      (
+        "cd /unknown; cd /known; result=$OLDPWD",
+        Value::Unknown(ValueIssue::SizeLimit),
+      ),
+      (
+        "set -- *.sh; result=$1",
+        Value::Unknown(ValueIssue::Arithmetic),
+      ),
+      (
+        "set -- *.sh; result=$#",
+        Value::Unknown(ValueIssue::Arithmetic),
+      ),
+    ] {
+      let mut inputs = support::Inputs::default();
+      for (path, result) in [
+        (
+          b"/unknown".as_slice(),
+          InputResult::Unknown(ValueIssue::SizeLimit),
+        ),
+        (b"/known", InputResult::Path(b"/known".to_vec())),
+      ] {
+        inputs.evaluated.insert(
+          InputQuery::Directory {
+            cwd: Vec::new(),
+            path: path.to_vec(),
+            physical: false,
+          },
+          result,
+        );
+      }
+      inputs.evaluated.insert(
+        InputQuery::Glob {
+          cwd: b"/work".to_vec(),
+          pattern: b"*.sh".to_vec(),
+          quoted: vec![false; 4],
+          utf8: false,
+          portable_collation: true,
+        },
+        InputResult::Unknown(ValueIssue::Arithmetic),
+      );
+      let mut initial = InitialEnvironment::empty();
+      initial.cwd = Some(b"/work".to_vec());
+      initial.values.insert(b"PWD".to_vec(), b"/work".to_vec());
+      let source = format!("{body}; : \"$result\"");
+      assert_eq!(
+        last_value_with_inputs(&source, initial, 1024, &mut inputs),
+        expected,
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn source_operands_keep_the_same_cause_through_argument_and_output_paths() {
+    for body in [
+      ". $x",
+      "set -- $x; . \"$1\"",
+      "set -- \"$x\"; . \"$1\"",
+      ". \"$(command -p echo \"$x\")\"",
+    ] {
+      let source = format!("x=abcdefghijklmnopqrstuvwxyz; {body}");
+      let document = support::parse(1, 1, &source);
+      let mut request = AnalysisRequest::new(document.snapshot());
+      request.initial = InitialEnvironment::empty();
+      request.limits.value_bytes = 16;
+      let mut workspace = Workspace::default();
+      workspace.insert(document).unwrap();
+      let result = workspace
+        .analyze(
+          request,
+          &mut support::Inputs::default(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
+      assert_eq!(
+        result
+          .source_inputs()
+          .map(|(_, _, input)| input.operand.clone())
+          .collect::<Vec<_>>(),
+        [Value::Unknown(ValueIssue::SizeLimit)],
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn derived_values_combine_independent_causes_without_adding_processing_steps()
+  {
+    for body in [
+      "set -- $x $y; result=$1",
+      "set -- $x $y; result=$#",
+      "set -- $x$y; result=$1",
+      "set -- \"$x\"$y; result=$1",
+      "result=$(command -p echo \"$x\" \"$y\")",
+      "result=$(command -p printf '%s' $x $y)",
+      "result=${x#$y}",
+    ] {
+      let source = format!(
+        "x=abcdefghijklmnopqrstuvwxyz; y=$((1/0)); {body}; : \"$result\""
+      );
+      let value =
+        last_value_with_limit(&source, InitialEnvironment::empty(), 16);
+      let Value::Unknown(issue) = value else {
+        panic!("{source}: {value:?}")
+      };
+      assert_eq!(
+        issue.causes().collect::<Vec<_>>(),
+        [ValueIssue::SizeLimit, ValueIssue::Arithmetic],
+        "{source}"
+      );
+    }
+    let value = last_value_with_limit(
+      "x=abcdefghijklmnopqrstuvwxyz; result=$(command -p echo -n \"$x\"); : \"$result\"",
+      InitialEnvironment::empty(),
+      16,
+    );
+    let Value::Unknown(issue) = value else {
+      panic!("{value:?}")
+    };
+    assert_eq!(
+      issue.causes().collect::<Vec<_>>(),
+      [ValueIssue::SizeLimit, ValueIssue::Unspecified]
+    );
+    for body in [
+      "set -- \"$x\" $y",
+      "set -- \"$x\"$y",
+      "set -- \"$x\"$y; set -- \"$@\"",
+    ] {
+      let source = format!(
+        "x=abcdefghijklmnopqrstuvwxyz; y=$((1/0)); {body}; result=$#; : \"$result\""
+      );
+      assert_eq!(
+        last_value_with_limit(&source, InitialEnvironment::empty(), 16),
+        Value::Unknown(ValueIssue::Arithmetic),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
   fn branch_values_preserve_correlations_until_a_write_replaces_them() {
     for (source, expected) in [
       (
@@ -1387,6 +2013,22 @@ mod expansion {
       ),
       (
         "if outer; then if inner; then a=1; b=1; else a=2; b=2; fi; else a=3; b=3; fi; x=$a; y=$b; result=$((x-y)); : \"$result\"",
+        "0",
+      ),
+      (
+        "if c; then a=1; else a=2; fi; if d; then b=3; else b=4; fi; sum=$((a+b)); f() { result=$((sum-a-b)); }; f; : \"$result\"",
+        "0",
+      ),
+      (
+        "if c; then a=1; else a=2; fi; if d; then b=3; else b=4; fi; joined=\"$a$b\"; result=$((joined-10*a-b)); : \"$result\"",
+        "0",
+      ),
+      (
+        "if c; then a=1; else a=2; fi; if d; then b=3; else b=4; fi; joined=\"$a$b\"; tail=${joined#?}; result=$((tail-b)); : \"$result\"",
+        "0",
+      ),
+      (
+        "if c; then a=1; else a=2; fi; if d; then b=3; else b=4; fi; joined=\"$a$b\"; : \"$((result=joined-10*a-b))\"; : \"$result\"",
         "0",
       ),
       (
@@ -1463,6 +2105,38 @@ mod expansion {
   }
 
   #[test]
+  fn computed_values_retain_independent_branch_choices_across_assignments() {
+    use std::fmt::Write;
+    let mut source = String::new();
+    let mut sum = String::from("0");
+    let mut difference = String::from("sum");
+    let mut joined = String::new();
+    for index in 0..32 {
+      writeln!(source, "if condition; then x{index}=1; else x{index}=2; fi")
+        .unwrap();
+      write!(sum, "+x{index}").unwrap();
+      write!(difference, "-x{index}").unwrap();
+      write!(joined, "$x{index}").unwrap();
+    }
+    for (body, expected) in [
+      (format!("sum=$(({sum})); result=$(({difference}))"), "0"),
+      (
+        format!("joined=\"{joined}\"; copied=$joined; result=${{#copied}}"),
+        "32",
+      ),
+    ] {
+      assert_eq!(
+        last_value(
+          &format!("{source}{body}; : \"$result\""),
+          InitialEnvironment::empty(),
+        ),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{body}"
+      );
+    }
+  }
+
+  #[test]
   fn unknown_values_preserve_all_failure_causes_across_words_and_branches() {
     for source in [
       "read x; result=\"$x$((1/0))\"; : \"$result\"",
@@ -1493,6 +2167,18 @@ mod expansion {
       ("result=$((1 + 2 * 3)); : \"$result\"", "7"),
       ("n='1+2'; result=$(( $n * 3 )); : \"$result\"", "7"),
       ("n=3; result=$(( $n + 2 )); : \"$result\"", "5"),
+      (
+        "n=3; case $(( m = $n + 2 )) in *) ;; esac; result=$m; : \"$result\"",
+        "5",
+      ),
+      (
+        "n=3; { :; } >\"$(( m = $n + 2 ))\"; result=$m; : \"$result\"",
+        "5",
+      ),
+      (
+        "n=3; : <<EOF\n$(( m = $n + 2 ))\nEOF\nresult=$m; : \"$result\"",
+        "5",
+      ),
       ("n=4; result=$(( $((n+1)) * 2 )); : \"$result\"", "10"),
       ("n=010; result=$((n + 0x10)); : \"$result\"", "24"),
       (
@@ -1521,8 +2207,14 @@ mod expansion {
         "{source}"
       );
     }
-    for expression in ["1 / 0", "9223372036854775807 + 1", "1 << 64", "-1 >> 2"]
-    {
+    for expression in [
+      "1 / 0",
+      "9223372036854775807 + 1",
+      "1 << 64",
+      "-1 >> 2",
+      "1 / 0 ? 1 : 1",
+      "9223372036854775807 + 1 ? 1 : 2",
+    ] {
       let source = format!("result=$(({expression})); : \"$result\"");
       assert_eq!(
         last_value(&source, InitialEnvironment::empty()),
@@ -1611,6 +2303,74 @@ mod expansion {
         last_value(&source, InitialEnvironment::empty()),
         Value::Unknown(ValueIssue::Arithmetic),
         "{expression}"
+      );
+    }
+  }
+
+  #[test]
+  fn nonempty_arithmetic_variables_require_signed_integer_constants() {
+    for (value, expected) in [
+      ("-0x10", Some("-16")),
+      ("+7", Some("7")),
+      ("--5", None),
+      ("+-5", None),
+      ("0x-5", None),
+      ("0-5", None),
+      (" 5", None),
+      ("5 ", None),
+      (" ", None),
+      ("\t", None),
+      ("08", None),
+      ("0x", None),
+    ] {
+      let source = format!("v='{value}'; result=$((v)); : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        expected.map_or(Value::Unknown(ValueIssue::Arithmetic), |expected| {
+          Value::Literal(expected.as_bytes().to_vec())
+        }),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn arithmetic_uses_zero_only_for_known_unset_or_empty_variables() {
+    for (body, expected) in [
+      ("unset x; result=$((x))", "0"),
+      ("unset x; result=$((x + 1))", "1"),
+      ("x=; result=$((x + 1))", "1"),
+      ("unset x; result=$((x += 1)); result=$result/$x", "1/1"),
+      ("x=; result=$((x += 1)); result=$result/$x", "1/1"),
+      ("unset x; : $((x + 1)); result=${x-unset}", "unset"),
+      ("x=; : $((x + 1)); result=${x+set}:$x", "set:"),
+      ("unset x; result=$((x = 3)); result=$result/$x", "3/3"),
+      ("unset x; result=$((${x:-0} + 1))", "1"),
+      ("x=; result=$(($x + 1))", "1"),
+      (
+        "unset x y; result=$((x && (y = 1))); result=$result/${y-unset}",
+        "0/unset",
+      ),
+      ("x=; result=$((x || (y = 1))); result=$result/$y", "1/1"),
+    ] {
+      let source = format!("{body}; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{source}"
+      );
+    }
+    for (body, issue) in [
+      ("read x; result=$((x + 1))", ValueIssue::Dynamic),
+      ("read x; result=$((x += 1)); result=$x", ValueIssue::Dynamic),
+      ("x=$((1 / 0)); result=$((x + 1))", ValueIssue::Arithmetic),
+      ("x=; result=$(($x))", ValueIssue::Arithmetic),
+    ] {
+      let source = format!("{body}; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Unknown(issue),
+        "{source}"
       );
     }
   }
@@ -1714,6 +2474,129 @@ mod expansion {
   }
 
   #[test]
+  fn compound_commands_complete_with_zero_when_no_branch_or_body_runs() {
+    let statuses = |choices: &[&[u8]]| {
+      Value::Partial(PartialValue {
+        choices: choices
+          .iter()
+          .map(|status| ValueConstraint {
+            prefix: status.to_vec(),
+            suffix: status.to_vec(),
+            minimum: status.len(),
+            required: status.iter().copied().collect(),
+            exact: true,
+          })
+          .collect(),
+        issue: ValueIssue::Dynamic,
+      })
+    };
+    for (command, expected) in [
+      ("if (exit 3); then (exit 3); fi", statuses(&[b"0", b"3"])),
+      (
+        "(exit 3); if (exit 3); then :; fi",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
+        "if (exit 3); then :; elif (exit 5); then (exit 4); fi",
+        statuses(&[b"0", b"4"]),
+      ),
+      ("while (exit 3); do (exit 3); done", statuses(&[b"0", b"3"])),
+      ("until (exit 0); do (exit 3); done", statuses(&[b"0", b"3"])),
+      (
+        "(exit 3); while (exit 0); do :; done",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
+        "(exit 4); for item in a; do (exit 3); done",
+        statuses(&[b"0", b"3"]),
+      ),
+      (
+        "(exit 3); for item in; do :; done",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
+        "(exit 3); case a in b) :;; esac",
+        Value::Literal(b"0".to_vec()),
+      ),
+      ("(exit 3); case a in esac", Value::Literal(b"0".to_vec())),
+      (
+        "(exit 7); case a in a) (exit 3);; esac",
+        statuses(&[b"0", b"3"]),
+      ),
+      (
+        "(exit 7); case a in a) ;& b) :;; esac",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
+        "(exit 7); case a in a) ;& b) (exit \"$?\");; esac",
+        statuses(&[b"0", b"7"]),
+      ),
+      (
+        "(exit 7); case a in a) ;& b) ;& c) (exit 3);; esac",
+        statuses(&[b"0", b"3"]),
+      ),
+      (
+        "(exit 7); case a in a) ;; esac; :",
+        Value::Literal(b"0".to_vec()),
+      ),
+    ] {
+      let source = format!("{command}; result=$?; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        expected,
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn case_status_is_zero_when_the_last_executed_clause_has_no_body() {
+    for command in [
+      "case a in a) ;; esac",
+      "case a in b) ;; esac",
+      "case a in a) esac",
+      "case a in a) # comment\n ;; esac",
+      "case a in a) # comment\n esac",
+      "case a in a) ;& esac",
+      "case a in a) (exit 3);& b) ;; esac",
+      "case a in a) (exit 3);& b) ;& c) esac",
+      "case a in a) (exit 3);& b) ;& esac",
+      "case a in \"$(command -p printf a; exit 4)\") ;; esac",
+    ] {
+      let source = format!("(exit 7); {command}; result=$?; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(b"0".to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn empty_case_clauses_preserve_variables_functions_arguments_and_io() {
+    let source = r#"
+      result=$(
+        value=kept
+        f() { command -p printf '%s' "$value/$1/$line"; }
+        set -- argument
+        {
+          command -p printf before/
+          case a in a) ;; esac
+          IFS= read -r line
+          f "$1"
+        } <<'EOF'
+input
+EOF
+      )
+      : "$result"
+    "#;
+    assert_eq!(
+      last_value(source, InitialEnvironment::empty()),
+      Value::Literal(b"before/kept/argument/input".to_vec())
+    );
+  }
+
+  #[test]
   fn parameter_lengths_and_pattern_removal_respect_quotes_and_match_extent() {
     for (expression, expected) in [
       ("${#p}", "12"),
@@ -1739,6 +2622,23 @@ mod expansion {
       last_value(source, InitialEnvironment::empty()),
       Value::Literal("3/本語".as_bytes().to_vec())
     );
+    for (source, expected) in [
+      ("set -- a b; p='a b'; result=${p#$*}; : \"$result\"", ""),
+      (
+        "IFS='*'; set -- a b; p=a-b; result=${p#$*}; : \"$result\"",
+        "",
+      ),
+      (
+        "IFS='*'; set -- a b; p=a-b; result=${p#\"$*\"}; : \"$result\"",
+        "a-b",
+      ),
+    ] {
+      assert_eq!(
+        last_value(source, InitialEnvironment::empty()),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{source}"
+      );
+    }
   }
 
   #[test]
@@ -1817,6 +2717,36 @@ mod expansion {
   }
 
   #[test]
+  fn expanded_backslashes_escape_pattern_characters_unless_posix_leaves_them_unspecified()
+   {
+    for (assignments, expression, expected) in [
+      (r"x='a*b' p='\*'", "${x#*$p}", Some("b")),
+      (r"x='a*b' p='\*'", "${x%$p*}", Some("a")),
+      (r"x='a?b' p='a\?'", "${x#$p}", Some("b")),
+      (r"x='*b' p='\'", "${x#$p*}", Some("b")),
+      (r"x='\b' p='\\'", "${x#$p}", Some("b")),
+      (r"x='a*b' p='\*'", r#"${x#*"$p"}"#, Some("a*b")),
+      (r"x=ab p='a\'", "${x#$p}", None),
+      (r"x='*b' p='\'", r#"${x#$p""*}"#, None),
+      (r"x='*b' p='\'", "${x#$p'*'}", None),
+      (r"x='*b' p='\'", r"${x#$p\*}", None),
+      (r"x='\b' p='[\]'", "${x#$p}", None),
+      ("x=abc", "${x#[^a]}", None),
+      ("x=bcd", "${x#[[=a=]-c]}", None),
+    ] {
+      let source =
+        format!("LC_ALL=C; {assignments}; result={expression}; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        expected.map_or(Value::Unknown(ValueIssue::Unspecified), |expected| {
+          Value::Literal(expected.as_bytes().to_vec())
+        }),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
   fn dollar_single_quotes_decode_portable_escapes_without_expanding_text() {
     for (word, expected) in [
       (r"$'\a\b\f\n\r\t\v'", b"\x07\x08\x0c\n\r\t\x0b".as_slice()),
@@ -1889,9 +2819,13 @@ mod expansion {
   fn undefined_expansions_and_readonly_arithmetic_do_not_prove_values() {
     for source in [
       "n=1; result=$((n += (n=2))); : \"$result\"",
+      "n=1; : $((n = (n=2) + 1)); result=$n; : \"$result\"",
       "readonly n=1; result=$((n=2)); : \"$result\"",
       "set --; x=; set -- \"$@$x\"; result=$#; : \"$result\"",
       "read expression; result=$(( $expression )); : \"$result\"",
+      "set -- a; result=${@:+set}; : \"$result\"",
+      "set -- a; result=${*+set}; : \"$result\"",
+      "f() { result=$r; }; x=é; LC_ALL=en_US.UTF-8 r=${#x} f; : \"$result\"",
     ] {
       assert!(
         matches!(
@@ -1904,23 +2838,45 @@ mod expansion {
   }
 
   #[test]
+  fn unordered_arithmetic_writes_keep_readonly_values() {
+    for source in [
+      "readonly n=1; : $(( (n=2) + n )); result=$n; : \"$result\"",
+      "readonly n=1; : $(( n += (n=2) )); result=$n; : \"$result\"",
+    ] {
+      assert_eq!(
+        last_value(source, InitialEnvironment::empty()),
+        Value::Literal(b"1".to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
   fn explicit_shell_inputs_and_tilde_values_do_not_depend_on_the_host_environment()
    {
     let mut initial = InitialEnvironment::empty();
     initial.positional = Some(vec![b"first".to_vec(), b"second".to_vec()]);
     initial.special.insert(b"0".to_vec(), b"script".to_vec());
     initial.special.insert(b"$".to_vec(), b"123".to_vec());
-    initial
-      .user_homes
-      .insert(b"example".to_vec(), b"/home/example".to_vec());
+    let mut inputs = support::Inputs::default();
+    inputs.evaluated.insert(
+      InputQuery::Home(b"example".to_vec()),
+      InputResult::Path(b"/home/example".to_vec()),
+    );
     assert_eq!(
       last_value("result=$0/$$/$1/$2/$#; : \"$result\"", initial.clone()),
       Value::Literal(b"script/123/first/second/2".to_vec())
     );
     assert_eq!(
-      last_value("result=~example/lib; : \"$result\"", initial),
+      last_value_with_inputs(
+        "result=~example/lib; : \"$result\"",
+        initial,
+        1024 * 1024,
+        &mut inputs
+      ),
       Value::Literal(b"/home/example/lib".to_vec())
     );
+    assert_eq!(inputs.queries, [InputQuery::Home(b"example".to_vec())]);
     assert_eq!(
       last_value(
         "set --; set -- \"${missing-}\"; result=$#; : \"$result\"",
@@ -2034,6 +2990,26 @@ mod words {
       ),
       ("IFS=:; x=; value=${x:-\"a:b\"}; : \"$value\"", Some("a:b")),
       ("set -f; x='*.sh'; value=$x; : \"$value\"", Some("*.sh")),
+      (
+        "set -- a b; IFS=:; set -- \"${x:-$*}\"; value=$#/$1; : \"$value\"",
+        Some("1/a:b"),
+      ),
+      (
+        "set -- a b; IFS=:; set -- \"pre${x:-$*}post\"; value=$#/$1; : \"$value\"",
+        Some("1/prea:bpost"),
+      ),
+      (
+        "set -- a b; IFS=:; set -- \"${x:-$@}\"; value=$#/$1/$2; : \"$value\"",
+        Some("2/a/b"),
+      ),
+      (
+        "set -- a b; IFS=:; set -- ${x:-$*}; value=$#/$1/$2; : \"$value\"",
+        Some("2/a/b"),
+      ),
+      (
+        "set -- a b; IFS='*'; p=a-b; value=\"${p#${x:-$*}}\"; : \"$value\"",
+        Some(""),
+      ),
     ] {
       let name = if source.contains("do : \"$item\"") {
         b"item".as_slice()
@@ -2050,6 +3026,39 @@ mod words {
       } else {
         assert!(matches!(actual, Value::Partial(_)), "{source}: {actual:?}");
       }
+    }
+  }
+
+  #[test]
+  fn possibly_unset_or_unknown_ifs_does_not_prove_joined_or_split_values() {
+    use shellsmith::interface::application::engine::ValueIssue;
+    for (source, expected) in [
+      (
+        "unset IFS; set -- a b; out=\"$*\"; : \"$out\"",
+        Value::Literal(b"a b".to_vec()),
+      ),
+      (
+        "IFS=; set -- a b; out=\"$*\"; : \"$out\"",
+        Value::Literal(b"ab".to_vec()),
+      ),
+      (
+        "IFS=; if condition; then unset IFS; fi; set -- a b; out=\"$*\"; : \"$out\"",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "IFS=; if condition; then unset IFS; fi; x='a b'; set -- $x; out=$#; : \"$out\"",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "IFS=; if condition; then unset IFS; fi; read -r out <<'END'\n  value  \nEND\n: \"$out\"",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "IFS=$(unknown); x='a b'; set -- $x; out=$#; : \"$out\"",
+        Value::Unknown(ValueIssue::UnsupportedExpansion),
+      ),
+    ] {
+      assert_eq!(last_value(source, b"out"), expected, "{source}");
     }
   }
 
@@ -2093,24 +3102,31 @@ mod words {
         Value::Literal(b"./lib other".to_vec()),
       ),
       (
-        "x='*.sh'; . $x",
-        Value::Unknown(ValueIssue::PathnameExpansion),
+        "IFS=; if condition; then unset IFS; fi; x='./lib other'; . $x",
+        Value::Unknown(ValueIssue::Dynamic),
       ),
+      ("x='*.sh'; . $x", Value::Unknown(ValueIssue::Dynamic)),
       ("set -f; x='*.sh'; . $x", Value::Literal(b"*.sh".to_vec())),
+      (r"x='./\*.sh'; . $x", Value::Literal(br"./\*.sh".to_vec())),
+      (r"x='./\'; . $x", Value::Literal(br"./\".to_vec())),
+      (
+        r#"x='./\'; . $x""*"#,
+        Value::Unknown(ValueIssue::Unspecified),
+      ),
       (
         "set -f; set +f; x='*.sh'; . $x",
-        Value::Unknown(ValueIssue::PathnameExpansion),
+        Value::Unknown(ValueIssue::Dynamic),
       ),
       (". ./]literal[", Value::Literal(b"./]literal[".to_vec())),
       (". ./'['abc']'", Value::Literal(b"./[abc]".to_vec())),
-      (". ./[abc]", Value::Unknown(ValueIssue::PathnameExpansion)),
+      (". ./[abc]", Value::Unknown(ValueIssue::Dynamic)),
       (
         "IFS=é; x='./élib'; . $x",
         Value::Unknown(ValueIssue::FieldSplitting),
       ),
       (
         "IFS=$(unknown); x=./lib; . $x",
-        Value::Unknown(ValueIssue::FieldSplitting),
+        Value::Unknown(ValueIssue::UnsupportedExpansion),
       ),
       (". \"$1\"", Value::Unknown(ValueIssue::EmptyOperand)),
       (". \"$@\"", Value::Unknown(ValueIssue::MissingOperand)),

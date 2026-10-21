@@ -1,8 +1,12 @@
-use super::environment::{Binding, Environment};
-use crate::interface::application::engine::Value;
-use std::cell::RefCell;
+use super::environment::{Binding, Environment, Positionals};
+use super::values::{ValueId, Values};
+use crate::interface::application::engine::{
+  Error, Resolution, check_cancelled,
+};
+use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(in crate::interface::application::engine::analysis) enum StateKey {
@@ -14,7 +18,7 @@ pub(in crate::interface::application::engine::analysis) enum StateKey {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum StateValue {
   Binding(Binding),
-  Positionals(Option<Vec<Value>>),
+  Positionals(Positionals),
 }
 
 impl StateKey {
@@ -50,6 +54,10 @@ type DecisionId = usize;
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Decision {
   Value(StateValue),
+  Computed {
+    value: ValueId,
+    resolution: Resolution,
+  },
   Branch {
     choice: usize,
     left: DecisionId,
@@ -62,6 +70,8 @@ struct Decisions {
   nodes: Vec<Decision>,
   index: BTreeMap<Decision, DecisionId>,
   next: usize,
+  expressions: Values,
+  scalars: HashMap<DecisionId, ValueId>,
 }
 
 impl Decisions {
@@ -99,6 +109,63 @@ impl Decisions {
       .get(name)
       .copied()
       .unwrap_or_else(|| self.intern(Decision::Value(name.read(env))))
+  }
+
+  fn computed(&mut self, value: ValueId, resolution: Resolution) -> DecisionId {
+    if self.expressions.choice(value).is_none() {
+      self.intern(Decision::Value(StateValue::Binding(Binding {
+        value: self.expressions.projected(value).clone(),
+        resolution,
+      })))
+    } else {
+      self.intern(Decision::Computed { value, resolution })
+    }
+  }
+
+  fn scalar(
+    &mut self,
+    root: DecisionId,
+    cancelled: &AtomicBool,
+  ) -> Result<ValueId, Error> {
+    let mut pending = vec![(root, false)];
+    while let Some((id, visited)) = pending.pop() {
+      check_cancelled(cancelled)?;
+      if self.scalars.contains_key(&id) {
+        continue;
+      }
+      let result = match &self.nodes[id] {
+        Decision::Value(StateValue::Binding(binding)) => {
+          self.expressions.literal(binding.value.clone())
+        }
+        Decision::Value(StateValue::Positionals(_)) => unreachable!(),
+        Decision::Computed { value, .. } => *value,
+        Decision::Branch {
+          choice,
+          left,
+          right,
+        } => {
+          if !visited {
+            pending.extend([(id, true), (*right, false), (*left, false)]);
+            continue;
+          }
+          self.expressions.branch(
+            *choice,
+            self.scalars[left],
+            self.scalars[right],
+          )
+        }
+      };
+      self.scalars.insert(id, result);
+    }
+    Ok(self.scalars[&root])
+  }
+
+  fn choice(&self, id: DecisionId) -> Option<usize> {
+    match self.nodes[id] {
+      Decision::Branch { choice, .. } => Some(choice),
+      Decision::Computed { value, .. } => self.expressions.choice(value),
+      Decision::Value(_) => None,
+    }
   }
 
   // Preserve correlations even for unread variables.
@@ -140,6 +207,14 @@ impl Decisions {
           }
           self.branch(current, cache[&left], cache[&right])
         }
+        Decision::Computed {
+          value,
+          ref resolution,
+        } => {
+          let resolution = resolution.clone();
+          let value = self.expressions.restrict(value, choice, right_side);
+          self.computed(value, resolution)
+        }
         _ => id,
       };
       cache.insert(id, result);
@@ -164,15 +239,48 @@ impl PartialEq for Alternatives {
 impl Eq for Alternatives {}
 
 impl Alternatives {
+  pub fn expressions(&self) -> RefMut<'_, Values> {
+    RefMut::map(self.decisions.borrow_mut(), |nodes| &mut nodes.expressions)
+  }
+
+  pub fn scalar(
+    &self,
+    env: &Environment,
+    name: &[u8],
+    cancelled: &AtomicBool,
+  ) -> Result<ValueId, Error> {
+    let mut nodes = self.decisions.borrow_mut();
+    let value = nodes.value(env, &StateKey::Variable(name.to_vec()));
+    nodes.scalar(value, cancelled)
+  }
+
+  pub fn store(&mut self, name: &[u8], value: ValueId, resolution: Resolution) {
+    let mut nodes = self.decisions.borrow_mut();
+    let value = nodes.computed(value, resolution);
+    if !matches!(nodes.nodes[value], Decision::Value(_)) {
+      self.values.insert(StateKey::Variable(name.to_vec()), value);
+    }
+  }
+
   pub fn is_empty(&self) -> bool {
     self.values.is_empty()
   }
 
-  pub fn forget_functions(&mut self) {
+  /// Forgets the choices of the variables, or the functions, that `changed`
+  /// accepts.
+  pub fn forget_names(
+    &mut self,
+    functions: bool,
+    changed: impl Fn(&[u8]) -> bool,
+  ) {
     let keys: Vec<_> = self
       .values
       .keys()
-      .filter(|key| matches!(key, StateKey::Function(_)))
+      .filter(|key| match key {
+        StateKey::Variable(name) => !functions && changed(name),
+        StateKey::Function(name) => functions && changed(name),
+        StateKey::Positionals => false,
+      })
       .cloned()
       .collect();
     for key in keys {
@@ -221,21 +329,16 @@ impl Alternatives {
     {
       return left.alternatives.clone();
     }
+    // Other names have equal bindings and no choices on both sides.
     let names: BTreeSet<_> = left
       .variables
-      .values
-      .keys()
-      .chain(right.variables.values.keys())
-      .cloned()
-      .map(StateKey::Variable)
+      .differences(&right.variables)
+      .map(|(name, _, _)| StateKey::Variable(name.clone()))
       .chain(
         left
           .functions
-          .values
-          .keys()
-          .chain(right.functions.values.keys())
-          .cloned()
-          .map(StateKey::Function),
+          .differences(&right.functions)
+          .map(|(name, _, _)| StateKey::Function(name.clone())),
       )
       .chain(std::iter::once(StateKey::Positionals))
       .chain(left.alternatives.values.keys().cloned())
@@ -250,7 +353,7 @@ impl Alternatives {
       let a = nodes.value(left, &name);
       let b = nodes.value(right, &name);
       let value = nodes.branch(choice, a, b);
-      if matches!(nodes.nodes[value], Decision::Branch { .. }) {
+      if !matches!(nodes.nodes[value], Decision::Value(_)) {
         values.insert(name.clone(), value);
       }
     }
@@ -314,12 +417,7 @@ impl Iterator for AlternativeStates {
         self
           .names
           .iter()
-          .filter_map(|name| {
-            match nodes.nodes[*env.alternatives.values.get(name)?] {
-              Decision::Branch { choice, .. } => Some(choice),
-              Decision::Value(_) => None,
-            }
-          })
+          .filter_map(|name| nodes.choice(*env.alternatives.values.get(name)?))
           .max()
       };
       let Some(choice) = choice else {

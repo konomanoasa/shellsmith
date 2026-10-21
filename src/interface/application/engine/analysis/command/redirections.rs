@@ -1,5 +1,5 @@
 use super::super::execution::children;
-use super::super::execution::{Environment, Flow};
+use super::super::execution::{CommandFailure, Environment, Flow};
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
   Document, Error, ResolutionIssue, Snapshot, Value, ValueIssue,
@@ -16,12 +16,7 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let source = self
-      .workspace
-      .document(frame.snapshot.document)
-      .expect("document")
-      .source
-      .as_bytes();
+    let source = self.workspace.source(frame.snapshot.document);
     let fd = descriptor(node, source);
     let operator = node
       .child_by_field_name("operator")
@@ -30,16 +25,39 @@ impl<'a> Resolver<'a> {
     let Some(filename) = node.child_by_field_name("filename") else {
       return Task::Done(Flow::next(env));
     };
-    Task::expand(filename, env, frame).then_word(move |_, mut result| {
+    Task::expand(filename, false, env, frame).then_word(move |_, mut result| {
       let target = result.word.scalar();
       let env = &mut result.env;
+      if matches!(operator.as_slice(), b"<" | b"<>" | b">" | b">>" | b">|") {
+        if target == Value::Literal(Vec::new()) {
+          env.failure = CommandFailure::Definite;
+        } else {
+          env.failure.uncertain(target.issue().unwrap_or(ValueIssue::Dynamic));
+        }
+      } else {
+        let known = matches!(
+          (fd, operator.as_slice(), &target),
+          (_, b"<&" | b">&", Value::Literal(target)) if target == b"-"
+        ) || matches!(
+          (fd, operator.as_slice(), &target),
+          (0, b"<&", Value::Literal(target)) if target == b"0"
+        ) || matches!(
+          (fd, operator.as_slice(), &target),
+          (1 | 2, b">&", Value::Literal(target)) if matches!(target.as_slice(), b"1" | b"2")
+        );
+        if !known {
+          env.failure.uncertain(target.issue().unwrap_or(ValueIssue::Dynamic));
+        }
+      }
       match (fd, operator.as_slice(), &target) {
         (0, b"<&", Value::Literal(target)) if target == b"0" => {}
         (0, b"<" | b"<>" | b">" | b">>" | b">|", _) => {
-          env.io.connect_input(None);
+          env
+            .io
+            .connect_input(Err(target.issue().unwrap_or(ValueIssue::Dynamic)));
         }
         (0, b"<&", Value::Literal(target)) if target == b"-" => {
-          env.io.connect_input(None);
+          env.io.connect_input(Err(ValueIssue::Dynamic));
         }
         (1, b"<" | b"<>" | b">" | b">>" | b">|", _) => {
           env.io.stdout_redirected = true;
@@ -62,9 +80,12 @@ impl<'a> Resolver<'a> {
           env.io.stderr_captured = false;
         }
         _ => {
-          env.io.forget_inputs();
+          env
+            .io
+            .forget_inputs(target.issue().unwrap_or(ValueIssue::Dynamic));
           if let Some(output) = &mut env.io.output {
-            output.fail(ValueIssue::UnsupportedExpansion);
+            output
+              .fail(target.issue().unwrap_or(ValueIssue::UnsupportedExpansion));
           }
         }
       }
@@ -78,25 +99,16 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let Some(body) = self
-      .index
-      .heredocs
-      .get(&(frame.snapshot, node.start_byte()))
-      .copied()
-    else {
+    let Some(body) = self.index.heredoc(frame.snapshot, node) else {
       return Task::Done(self.opaque(
         node,
         env,
         frame,
         ResolutionIssue::Recovery,
+        None,
       ));
     };
-    let source = self
-      .workspace
-      .document(frame.snapshot.document)
-      .expect("document")
-      .source
-      .as_bytes();
+    let source = self.workspace.source(frame.snapshot.document);
     let fd = descriptor(node, source);
     let strip = node
       .child_by_field_name("operator")
@@ -115,20 +127,13 @@ impl<'a> Resolver<'a> {
     task.then_word(move |_, mut result| {
       if fd == 0 {
         let input = match result.word.scalar() {
-          Value::Literal(bytes) => {
-            let bytes = if strip && body.kind() == "quoted_here_document_body" {
-              bytes
-                .split_inclusive(|byte| *byte == b'\n')
-                .flat_map(|line| {
-                  line.iter().skip_while(|byte| **byte == b'\t').copied()
-                })
-                .collect()
-            } else {
-              bytes
-            };
-            Some((std::sync::Arc::new(bytes), 0))
+          Value::Literal(mut bytes) => {
+            if strip && body.kind() == "quoted_here_document_body" {
+              word::strip_leading_tabs(&mut bytes, true);
+            }
+            Ok((std::sync::Arc::new(bytes), 0))
           }
-          _ => None,
+          value => Err(value.issue().expect("unknown input")),
         };
         result.env.io.connect_input(input);
       } else if fd == 1 {
@@ -251,7 +256,7 @@ impl Redirections {
     &self,
     flow: &mut Flow,
   ) {
-    for env in flow.0.values_mut() {
+    for env in flow.environments_mut() {
       if let Some(input) = self.input {
         env.io.restore_input(input);
       }

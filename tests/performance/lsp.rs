@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use shellsmith::interface::application::Settings;
 use shellsmith::interface::application::engine::InitialEnvironment;
-#[path = "../tests/common/lsp.rs"]
+#[path = "../common/lsp.rs"]
 mod lsp_client;
 use lsp_client::Client;
 use std::path::PathBuf;

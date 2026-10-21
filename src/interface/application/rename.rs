@@ -1,10 +1,11 @@
 use super::engine::{
-  self, Access, Alternative, EffectTarget, ExecutionContextId, Location, Name,
+  self, Access, Alternative, ExecutionContextId, Location, Name,
   NameEnvironment, NameId, ResolutionIssue, SymbolId, SymbolKind,
-  special_builtin, valid_name,
+  check_cancelled, optional_reserved_word, reserved_word, special_builtin,
+  valid_name,
 };
 use super::support::{EntryNames, NameCollection};
-use super::{Application, Error, check};
+use super::{Application, Error};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,6 +76,8 @@ impl Application {
       })?;
     if !valid_name(new_name.as_bytes())
       || reserved(selection.kind, new_name.as_bytes())
+      || selection.kind == SymbolKind::Function
+        && optional_reserved_word(new_name.as_bytes())
     {
       return Err(Error::InvalidName("The new name must be a portable shell name without special shell meaning".into()));
     }
@@ -83,7 +86,7 @@ impl Application {
     }
     let mut edits = BTreeMap::new();
     for &(entry, site) in &selection.sites {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       let location = names.entries[entry].relations.occurrences[site]
         .spelling
         .editable()
@@ -100,7 +103,7 @@ impl Application {
     let mapping = SourceMap::new(&edits)?;
     let mut changed = BTreeMap::new();
     for (range, edit) in edits.iter().rev() {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       let text = changed.entry(range.path.clone()).or_insert_with(|| {
         names.documents[&edit.location.snapshot].1.to_string()
       });
@@ -127,9 +130,7 @@ impl Application {
       .workspace
       .document(id)
       .ok_or(engine::Error::UnknownDocument(id))?;
-    if offset > document.source().len()
-      || !document.source().is_char_boundary(offset)
-    {
+    if !document.source().is_char_boundary(offset) {
       return Err(engine::Error::InvalidPosition.into());
     }
     let mut candidates = Vec::new();
@@ -196,7 +197,7 @@ impl Selection {
     let mut by_source: BTreeMap<SourceRange, Vec<Site>> = BTreeMap::new();
     for (entry, result) in names.entries.iter().enumerate() {
       for (index, site) in result.relations.occurrences.iter().enumerate() {
-        check(cancelled)?;
+        check_cancelled(cancelled)?;
         for id in &site.names {
           by_name
             .entry((entry, *id))
@@ -215,7 +216,7 @@ impl Selection {
     let mut expanded_sources = BTreeSet::new();
     let mut pending: VecDeque<_> = candidates.into();
     while let Some((entry, index)) = pending.pop_front() {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       if !self.sites.insert((entry, index)) {
         continue;
       }
@@ -318,7 +319,10 @@ fn uncertain_name(entry: &EntryNames, name: &Name) -> bool {
     entry
       .relations
       .may_inherit(effect.environment, name.environment)
-      && effect.targets.iter().any(|target| affects(target, name))
+      && effect
+        .targets
+        .iter()
+        .any(|target| target.covers(name.kind, &name.text))
   }) || entry.relations.dependencies.iter().any(|dependency| {
     entry
       .relations
@@ -326,28 +330,8 @@ fn uncertain_name(entry: &EntryNames, name: &Name) -> bool {
       && dependency
         .targets
         .iter()
-        .any(|target| affects(target, name))
+        .any(|target| target.covers(name.kind, &name.text))
   })
-}
-
-fn affects(target: &EffectTarget, name: &Name) -> bool {
-  match target {
-    EffectTarget::Variable(text) => {
-      name.kind == SymbolKind::Variable && name.text == *text
-    }
-    EffectTarget::Function(text) => {
-      name.kind == SymbolKind::Function && name.text == *text
-    }
-    EffectTarget::VariablePattern(value) => {
-      name.kind == SymbolKind::Variable && value.can_equal(&name.text)
-    }
-    EffectTarget::FunctionPattern(value) => {
-      name.kind == SymbolKind::Function && value.can_equal(&name.text)
-    }
-    EffectTarget::Variables => name.kind == SymbolKind::Variable,
-    EffectTarget::Functions => name.kind == SymbolKind::Function,
-    _ => false,
-  }
 }
 
 fn source_range(
@@ -472,7 +456,7 @@ fn verify(
   for (index, (old, new)) in
     before.entries.iter().zip(&after.entries).enumerate()
   {
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     if old.path != new.path {
       return Err(refused("The analysis entries changed after the edit"));
     }
@@ -519,7 +503,7 @@ fn relationships<'a>(
   };
   let mut identities = Vec::new();
   for name in &entry.relations.names {
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let identity = Arc::new(Identity {
       kind: name.kind,
       text: renamed(name.id)
@@ -561,7 +545,7 @@ fn relationships<'a>(
     identities.push(identity);
   }
   for site in &entry.relations.occurrences {
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let location = map(source_range(
       collection,
       site.spelling.editable().unwrap_or(&site.location),
@@ -590,25 +574,7 @@ fn relationships<'a>(
 
 fn reserved(kind: SymbolKind, name: &[u8]) -> bool {
   match kind {
-    SymbolKind::Function => {
-      special_builtin(name)
-        || matches!(
-          name,
-          b"if"
-            | b"then"
-            | b"else"
-            | b"elif"
-            | b"fi"
-            | b"do"
-            | b"done"
-            | b"case"
-            | b"esac"
-            | b"while"
-            | b"until"
-            | b"for"
-            | b"in"
-        )
-    }
+    SymbolKind::Function => special_builtin(name) || reserved_word(name),
     SymbolKind::Variable => matches!(
       name,
       b"ENV"

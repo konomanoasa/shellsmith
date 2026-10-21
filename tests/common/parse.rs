@@ -1,8 +1,74 @@
 use shellsmith::interface::application::engine::{
-  Analysis, AnalysisRequest, Document, DocumentId, ExecutionContextId,
-  ExecutionKind, InitialEnvironment, Revision, Snapshot, Workspace,
+  Analysis, AnalysisInputs, AnalysisRequest, Document, DocumentId, Error,
+  ExecutionContextId, ExecutionKind, InitialEnvironment, InputQuery,
+  InputResult, Revision, Snapshot, SourceDocument, SourceInput, Value,
+  ValueIssue, Workspace,
 };
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+#[derive(Default)]
+pub struct Inputs {
+  pub sources: BTreeMap<SourceInput, SourceDocument>,
+  pub evaluated: BTreeMap<InputQuery, InputResult>,
+  pub source_queries: Vec<SourceInput>,
+  pub queries: Vec<InputQuery>,
+}
+
+impl Inputs {
+  pub fn sources<'a>(
+    documents: impl IntoIterator<Item = (&'a str, Document)>,
+  ) -> Self {
+    Self {
+      sources: documents
+        .into_iter()
+        .map(|(path, document)| {
+          assert!(path.starts_with('/'), "fixture paths must be absolute");
+          (
+            SourceInput {
+              operand: Value::Literal(path.as_bytes().to_vec()),
+              cwd: None,
+              search_path: None,
+              annotation: None,
+            },
+            SourceDocument::Resolved(Arc::new(document)),
+          )
+        })
+        .collect(),
+      ..Self::default()
+    }
+  }
+}
+
+impl AnalysisInputs for Inputs {
+  fn source(&mut self, input: &SourceInput) -> Result<SourceDocument, Error> {
+    self.source_queries.push(input.clone());
+    Ok(match self.sources.get(input) {
+      Some(SourceDocument::Resolved(document)) => {
+        SourceDocument::Resolved(document.clone())
+      }
+      Some(SourceDocument::Unresolved(reason)) => {
+        SourceDocument::Unresolved(reason.clone())
+      }
+      Some(SourceDocument::Failed(reason)) => {
+        SourceDocument::Failed(reason.clone())
+      }
+      None => SourceDocument::Unresolved("No matching source input".into()),
+    })
+  }
+
+  fn evaluate(&mut self, query: &InputQuery) -> Result<InputResult, Error> {
+    self.queries.push(query.clone());
+    Ok(
+      self
+        .evaluated
+        .get(query)
+        .cloned()
+        .unwrap_or(InputResult::Unknown(ValueIssue::Dynamic)),
+    )
+  }
+}
 
 pub fn parse(id: u64, revision: u64, source: &str) -> Document {
   Document::parse(
@@ -37,7 +103,8 @@ pub fn analyze_with(
   request.initial = initial;
   let mut workspace = Workspace::default();
   workspace.insert(document).unwrap();
-  workspace.set_analysis_request(request).unwrap();
-  let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+  let analysis = workspace
+    .analyze(request, &mut Inputs::default(), &AtomicBool::new(false))
+    .unwrap();
   (workspace, analysis)
 }

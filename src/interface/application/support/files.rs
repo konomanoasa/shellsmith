@@ -7,10 +7,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use super::{Error, check};
+use super::Error;
 use crate::interface::application::engine::word::{Pattern, characters};
 use crate::interface::application::engine::{
-  InputQuery, InputResult, Value, ValueIssue,
+  InputQuery, InputResult, Value, ValueIssue, check_cancelled,
 };
 
 pub(super) fn absolute(cwd: &Path, path: &Path) -> PathBuf {
@@ -110,6 +110,16 @@ fn shell(source: &[u8], path: &Path) -> bool {
   path.extension().is_some_and(|extension| extension == "sh")
 }
 
+/// The path whose entry is the document `id`.
+pub(super) fn entry_path(
+  entries: &BTreeMap<PathBuf, Snapshot>,
+  id: DocumentId,
+) -> Option<&Path> {
+  entries
+    .iter()
+    .find_map(|(path, entry)| (entry.document == id).then_some(path.as_path()))
+}
+
 pub(super) fn resolve(
   input: &crate::interface::application::engine::SourceInput,
   opened: &BTreeMap<PathBuf, std::sync::Arc<str>>,
@@ -119,10 +129,8 @@ pub(super) fn resolve(
     && let Some(annotation) = &input.annotation
   {
     let path = path_bytes(&annotation.path)?;
-    let directory = entries
-      .iter()
-      .find(|(_, snapshot)| snapshot.document == annotation.document)
-      .and_then(|(path, _)| path.parent())
+    let directory = entry_path(entries, annotation.document)
+      .and_then(Path::parent)
       .ok_or("Source annotation document is unavailable")?;
     return resolve_file(&directory.join(path), directory, opened);
   }
@@ -145,7 +153,7 @@ pub(super) fn resolve(
     vec![cwd.join(&path)]
   } else {
     let Some(Value::Literal(search_path)) = &input.search_path else {
-      return Err("PATH is unset or unknown".into());
+      return Err("PATH search is undetermined".into());
     };
     search_path
       .split(|byte| *byte == b':')
@@ -169,7 +177,7 @@ fn resolve_file(
   opened: &BTreeMap<PathBuf, Arc<str>>,
 ) -> Result<PathBuf, String> {
   let identity = absolute(cwd, candidate);
-  let overlay = opened.contains_key(&identity);
+  let overlay = opened.contains_key(&identity) && parents_exist(candidate);
   ordinary(candidate, overlay).map_err(|error| error.to_string())?;
   if !overlay {
     std::fs::File::open(candidate).map_err(|error| error.to_string())?;
@@ -177,8 +185,19 @@ fn resolve_file(
   Ok(identity)
 }
 
+/// Whether each directory that a `..` component leaves exists, as pathname
+/// resolution requires even when an unsaved document replaces the file.
+fn parents_exist(path: &Path) -> bool {
+  let mut prefix = PathBuf::new();
+  path.components().all(|component| {
+    let exists = component != Component::ParentDir || prefix.is_dir();
+    prefix.push(component);
+    exists
+  })
+}
+
 #[cfg(unix)]
-pub(super) fn path_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+fn path_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
   use std::os::unix::ffi::OsStrExt;
   if bytes.contains(&0) {
     return Err("NUL in path".into());
@@ -186,7 +205,7 @@ pub(super) fn path_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
   Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
 }
 #[cfg(not(unix))]
-pub(super) fn path_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+fn path_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
   std::str::from_utf8(bytes)
     .map(PathBuf::from)
     .map_err(|error| error.to_string())
@@ -196,7 +215,7 @@ pub(super) fn evaluate(
   query: &InputQuery,
   cancelled: &AtomicBool,
 ) -> Result<InputResult, Error> {
-  check(cancelled)?;
+  check_cancelled(cancelled)?;
   let result = match query {
     InputQuery::Home(name) => home(name, cancelled)?,
     InputQuery::Encoding(name) => encoding(name),
@@ -213,18 +232,21 @@ pub(super) fn evaluate(
       portable_collation,
     } => glob(cwd, pattern, quoted, *utf8, *portable_collation, cancelled)?,
   };
-  check(cancelled)?;
+  check_cancelled(cancelled)?;
   Ok(result)
 }
 
 fn directory(cwd: &[u8], path: &[u8], physical: bool) -> InputResult {
-  let (Ok(cwd), Ok(path)) = (path_bytes(cwd), path_bytes(path)) else {
+  let mut curpath = Vec::new();
+  if !path.starts_with(b"/") {
+    curpath.extend(cwd);
+    if !curpath.ends_with(b"/") {
+      curpath.push(b'/');
+    }
+  }
+  curpath.extend(path);
+  let Ok(joined) = path_bytes(&curpath) else {
     return InputResult::Unknown(ValueIssue::Nul);
-  };
-  let joined = if path.is_absolute() {
-    path
-  } else {
-    cwd.join(path)
   };
   if physical {
     return match joined.canonicalize() {
@@ -235,27 +257,64 @@ fn directory(cwd: &[u8], path: &[u8], physical: bool) -> InputResult {
       Err(error) => failure(&error),
     };
   }
-  let mut logical = PathBuf::new();
-  for component in joined.components() {
-    match component {
-      Component::CurDir => {}
-      Component::ParentDir => match std::fs::metadata(&logical) {
-        Ok(metadata) if metadata.is_dir() => {
-          logical.pop();
-        }
-        Ok(_) => return InputResult::Missing,
-        Err(error) => return failure(&error),
-      },
-      component => logical.push(component),
+  match logical(&curpath)
+    .and_then(|curpath| existing_directory(&curpath).map(|()| curpath))
+  {
+    Ok(curpath) => InputResult::Path(curpath),
+    Err(result) => result,
+  }
+}
+
+fn existing_directory(path: &[u8]) -> Result<(), InputResult> {
+  match path_bytes(path).map(std::fs::metadata) {
+    Ok(Ok(metadata)) if metadata.is_dir() => Ok(()),
+    Ok(Ok(_)) => Err(InputResult::Missing),
+    Ok(Err(error)) => Err(failure(&error)),
+    Err(_) => Err(InputResult::Unknown(ValueIssue::Nul)),
+  }
+}
+
+/// Applies POSIX `cd` steps 8a and 8b to an absolute path, keeping the
+/// slashes that step 8c only permits removing.
+fn logical(curpath: &[u8]) -> Result<Vec<u8>, InputResult> {
+  let render = |leading: usize, components: &[(&[u8], usize)]| {
+    let mut path = vec![b'/'; leading];
+    for (component, slashes) in components {
+      path.extend(*component);
+      path.extend(std::iter::repeat_n(b'/', *slashes));
+    }
+    path
+  };
+  let mut leading = curpath.iter().take_while(|byte| **byte == b'/').count();
+  let mut components: Vec<(&[u8], usize)> = Vec::new();
+  let mut rest = &curpath[leading..];
+  while !rest.is_empty() {
+    let end = rest.iter().position(|byte| *byte == b'/');
+    let end = end.unwrap_or(rest.len());
+    let slashes = rest[end..].iter().take_while(|byte| **byte == b'/').count();
+    let component = &rest[..end];
+    rest = &rest[end + slashes..];
+    let removed = match component {
+      b"." => true,
+      b".." if components.last().is_some_and(|last| last.0 != b"..") => {
+        existing_directory(&render(leading, &components))?;
+        components.pop();
+        true
+      }
+      _ => {
+        components.push((component, slashes));
+        false
+      }
+    };
+    // Slashes after a removed final component are not separators to delete.
+    if removed && rest.is_empty() {
+      match components.last_mut() {
+        Some(last) => last.1 += slashes,
+        None => leading += slashes,
+      }
     }
   }
-  match std::fs::metadata(&logical) {
-    Ok(metadata) if metadata.is_dir() => {
-      InputResult::Path(logical.as_os_str().as_encoded_bytes().to_vec())
-    }
-    Ok(_) => InputResult::Missing,
-    Err(error) => failure(&error),
-  }
+  Ok(render(leading, &components))
 }
 
 fn failure(error: &std::io::Error) -> InputResult {
@@ -283,7 +342,7 @@ fn glob(
   let mut paths = vec![Vec::new()];
   let mut offset = 0;
   for part in bytes.split(|c| *c == b'/') {
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let protection = &quoted[offset..offset + part.len()];
     let pattern = match Pattern::compile(part, protection, utf8, portable) {
       Ok(p) => p,
@@ -292,13 +351,15 @@ fn glob(
     if pattern.ambiguous_glob(cancelled) {
       return Ok(InputResult::Unknown(ValueIssue::Unspecified));
     }
+    let last = offset + part.len() == bytes.len();
+    let literal = pattern.literal();
     let mut next = Vec::new();
     for prefix in paths {
-      check(cancelled)?;
-      if pattern.is_literal() {
-        let mut path = prefix;
-        path.extend(part);
-        if offset + part.len() < bytes.len() {
+      check_cancelled(cancelled)?;
+      let found = if let Some(literal) = &literal {
+        let mut path = prefix.clone();
+        path.extend(literal);
+        if !last {
           path.push(b'/');
         }
         let Ok(relative) = path_bytes(&path) else {
@@ -309,62 +370,30 @@ fn glob(
         } else {
           cwd.join(relative)
         };
-        if candidate.exists() || std::fs::symlink_metadata(candidate).is_ok() {
-          next.push(path);
-        }
-        continue;
-      }
-      let directory = path_bytes(&prefix).map_err(Error::Message)?;
-      let directory = if directory.is_absolute() {
-        directory
-      } else {
-        cwd.join(directory)
-      };
-      let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error)
-          if matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound
-              | std::io::ErrorKind::NotADirectory
-              | std::io::ErrorKind::PermissionDenied
-          ) =>
-        {
+        let found = (candidate.exists()
+          || std::fs::symlink_metadata(candidate).is_ok())
+        .then_some(path);
+        if literal.as_slice() == part {
+          next.extend(found);
           continue;
         }
-        Err(_) => {
-          return Ok(InputResult::Unknown(ValueIssue::PathnameExpansion));
-        }
+        Some(found)
+      } else {
+        None
       };
-      for entry in entries {
-        check(cancelled)?;
-        let Ok(entry) = entry else {
-          return Ok(InputResult::Unknown(ValueIssue::PathnameExpansion));
-        };
-        let name = entry.file_name();
-        let name = name.as_encoded_bytes();
-        let chars = match characters(name, utf8) {
-          Ok(c) => c,
+      let matched =
+        match listed(&cwd, &prefix, &pattern, last, utf8, cancelled)? {
+          Ok(matched) => matched,
           Err(issue) => return Ok(InputResult::Unknown(issue)),
         };
-        if name.starts_with(b".") && !pattern.starts_dot() {
-          if pattern.ambiguous_dot() && pattern.matches(&chars, cancelled) {
-            return Ok(InputResult::Unknown(ValueIssue::Unspecified));
-          }
-          continue;
-        }
-        if pattern.matches(&chars, cancelled) {
-          let mut path = prefix.clone();
-          path.extend(name);
-          if offset + part.len() < bytes.len() {
-            if !entry.path().is_dir() {
-              continue;
-            }
-            path.push(b'/');
-          }
-          next.push(path);
-        }
+      // An escaped component may be looked up by name or matched against
+      // directory entries, so only an agreeing result is determined.
+      if found
+        .is_some_and(|found| found.into_iter().ne(matched.iter().cloned()))
+      {
+        return Ok(InputResult::Unknown(ValueIssue::Unspecified));
       }
+      next.extend(matched);
     }
     paths = next;
     offset += part.len() + 1;
@@ -377,6 +406,67 @@ fn glob(
   Ok(InputResult::Paths(paths))
 }
 
+fn listed(
+  cwd: &Path,
+  prefix: &[u8],
+  pattern: &Pattern,
+  last: bool,
+  utf8: bool,
+  cancelled: &AtomicBool,
+) -> Result<Result<Vec<Vec<u8>>, ValueIssue>, Error> {
+  let directory = path_bytes(prefix).map_err(Error::Message)?;
+  let directory = if directory.is_absolute() {
+    directory
+  } else {
+    cwd.join(directory)
+  };
+  let entries = match std::fs::read_dir(directory) {
+    Ok(entries) => entries,
+    Err(error)
+      if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+          | std::io::ErrorKind::NotADirectory
+          | std::io::ErrorKind::PermissionDenied
+      ) =>
+    {
+      return Ok(Ok(Vec::new()));
+    }
+    Err(_) => return Ok(Err(ValueIssue::PathnameExpansion)),
+  };
+  let mut matched = Vec::new();
+  for entry in entries {
+    check_cancelled(cancelled)?;
+    let Ok(entry) = entry else {
+      return Ok(Err(ValueIssue::PathnameExpansion));
+    };
+    let name = entry.file_name();
+    let name = name.as_encoded_bytes();
+    let chars = match characters(name, utf8) {
+      Ok(c) => c,
+      Err(issue) => return Ok(Err(issue)),
+    };
+    if name.starts_with(b".") && !pattern.starts_dot() {
+      if pattern.ambiguous_dot(&chars, cancelled) {
+        return Ok(Err(ValueIssue::Unspecified));
+      }
+      continue;
+    }
+    if pattern.matches(&chars, cancelled) {
+      let mut path = prefix.to_vec();
+      path.extend(name);
+      if !last {
+        if !entry.path().is_dir() {
+          continue;
+        }
+        path.push(b'/');
+      }
+      matched.push(path);
+    }
+  }
+  Ok(Ok(matched))
+}
+
 #[cfg(unix)]
 fn home(name: &[u8], cancelled: &AtomicBool) -> Result<InputResult, Error> {
   let Ok(name) = std::ffi::CString::new(name) else {
@@ -384,7 +474,7 @@ fn home(name: &[u8], cancelled: &AtomicBool) -> Result<InputResult, Error> {
   };
   let mut size = 1024;
   loop {
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     let mut buffer = Vec::<libc::c_char>::new();
     buffer
       .try_reserve_exact(size)
@@ -487,7 +577,22 @@ struct ParsedFile {
 }
 
 impl Documents {
-  pub(super) fn parse(
+  /// Parses `bytes` as the next revision of the document at `path` and makes
+  /// it the entry of `path`.
+  pub(super) fn parse_entry(
+    &self,
+    entries: &mut BTreeMap<PathBuf, Snapshot>,
+    path: &Path,
+    bytes: &[u8],
+    cancelled: &AtomicBool,
+  ) -> Result<Arc<Document>, Error> {
+    let after = entries.get(path).map_or(0, |entry| entry.revision.0);
+    let document = self.parse(path, bytes, after, cancelled)?;
+    entries.insert(path.to_path_buf(), document.snapshot());
+    Ok(document)
+  }
+
+  fn parse(
     &self,
     path: &Path,
     bytes: &[u8],
@@ -514,7 +619,7 @@ impl Documents {
     let mut file = file
       .lock()
       .map_err(|error| Error::Message(error.to_string()))?;
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     if let Some(document) = &file.document
       && document.snapshot().revision.0 > after
       && document.source().as_bytes() == bytes

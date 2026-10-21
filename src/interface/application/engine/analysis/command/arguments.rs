@@ -1,30 +1,19 @@
 use super::super::execution::Environment;
 use super::super::expansion::Argument;
 use super::super::{Frame, Resolver};
-use crate::interface::application::engine::word::{self, WordContext};
+use crate::interface::application::engine::word;
+use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
-  Access, ArgumentKind, ArgumentRole, AttributeState, EffectTarget,
-  ExecutionContextId, Location, Resolution, ResolutionIssue, Snapshot, UseSite,
-  Value, ValueIssue, valid_name,
+  Access, ArgumentKind, ArgumentRole, AttributeState, ExecutionContextId,
+  Location, Resolution, Snapshot, UseSite, Value, ValueIssue, valid_name,
 };
-use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
-pub(super) fn uses_arguments(name: &[u8]) -> bool {
-  numeric_argument(name)
-    || matches!(
-      name,
-      b"export"
-        | b"readonly"
-        | b"unset"
-        | b"set"
-        | b"cd"
-        | b"command"
-        | b"."
-        | b"read"
-        | b"getopts"
-        | b"trap"
-    )
+pub(super) fn argument_issue(args: &[Argument<'_>]) -> Option<ValueIssue> {
+  args
+    .iter()
+    .filter_map(|arg| arg.value.issue())
+    .reduce(ValueIssue::combine)
 }
 
 pub(super) fn numeric_argument(name: &[u8]) -> bool {
@@ -37,20 +26,23 @@ pub(super) fn numeric_argument(name: &[u8]) -> bool {
 pub(super) fn trap_action(args: &[Argument<'_>]) -> Result<Option<usize>, ()> {
   let mut index = 0;
   if let Some(first) = args.first() {
-    if !first.boundary_known {
+    if first.boundary.is_err() {
       return Err(());
     }
-    if first.value == Value::Literal(b"--".to_vec()) {
-      index = 1;
-    } else if matches!(&first.value, Value::Literal(value) if value.starts_with(b"-") && value != b"-")
-    {
-      return Ok(None);
+    match &first.value {
+      Value::Literal(value) if value == b"--" => index = 1,
+      Value::Literal(value) if value.starts_with(b"-") && value != b"-" => {
+        return Ok(None);
+      }
+      Value::Literal(_) => {}
+      value if value.may_start_with(b"-") => return Err(()),
+      _ => {}
     }
   }
   let Some(action) = args.get(index) else {
     return Ok(None);
   };
-  if !action.boundary_known {
+  if action.boundary.is_err() {
     return Err(());
   }
   if matches!(&action.value, Value::Literal(body)
@@ -62,14 +54,11 @@ pub(super) fn trap_action(args: &[Argument<'_>]) -> Result<Option<usize>, ()> {
 }
 
 pub(in crate::interface::application::engine) fn invariant_arguments(
-  snapshot: crate::interface::application::engine::Snapshot,
+  snapshot: Snapshot,
   node: Node<'_>,
   source: &[u8],
 ) -> Vec<ArgumentRole> {
-  let Some(command) = node
-    .child_by_field_name("name")
-    .or_else(|| node.child_by_field_name("word"))
-  else {
+  let Some(command) = parser::command_word(node) else {
     return Vec::new();
   };
   let Value::Literal(name) = word::literal_value(command, source) else {
@@ -84,31 +73,14 @@ pub(in crate::interface::application::engine) fn invariant_arguments(
   {
     return Vec::new();
   }
-  argument_candidates(snapshot, node, source)
-}
-
-fn argument_candidates(
-  snapshot: crate::interface::application::engine::Snapshot,
-  node: Node<'_>,
-  source: &[u8],
-) -> Vec<ArgumentRole> {
-  let Some(command) = node
-    .child_by_field_name("name")
-    .or_else(|| node.child_by_field_name("word"))
-  else {
-    return Vec::new();
-  };
-  let Value::Literal(name) = word::literal_value(command, source) else {
-    return Vec::new();
-  };
   let mut args = syntax_arguments(node, source);
   classify_arguments(&name, &mut args, None, source);
   argument_roles(args, snapshot, source)
 }
 
-fn argument_roles(
+pub(super) fn argument_roles(
   args: Vec<Argument<'_>>,
-  snapshot: crate::interface::application::engine::Snapshot,
+  snapshot: Snapshot,
   source: &[u8],
 ) -> Vec<ArgumentRole> {
   args
@@ -116,6 +88,16 @@ fn argument_roles(
     .filter(|arg| arg.kind.is_some())
     .map(|arg| arg.role(arg.kind.clone(), snapshot, source, None))
     .collect()
+}
+
+/// The index of the first operand of a utility whose only option is a
+/// leading `--` (XCU 1.4).
+pub(in crate::interface::application::engine::analysis) fn operand_index(
+  args: &[Argument<'_>],
+) -> usize {
+  usize::from(args.first().is_some_and(|arg| {
+    arg.boundary.is_ok() && arg.value == Value::Literal(b"--".to_vec())
+  }))
 }
 
 pub(in crate::interface::application::engine::analysis) fn syntax_arguments<
@@ -137,51 +119,18 @@ pub(super) fn syntax_argument<'a>(
   node: Node<'a>,
   source: &[u8],
 ) -> Argument<'a> {
-  let value = word::literal_value(node, source);
-  let mut partial = word::Word::default();
-  for part in word::Parts::new(node, source) {
-    match part {
-      word::Part::Fragment(fragment) => {
-        partial.append(fragment, usize::MAX);
-      }
-      word::Part::Invalid(issue) => partial.fail(issue),
-      word::Part::Expansion(expansion, quoted) => {
-        let scalar = quoted
-          && (expansion.kind() != "parameter_expansion"
-            || (expansion.child_by_field_name("operator").is_none()
-              && expansion.child_by_field_name("parameter").is_none_or(
-                |parameter| word::lexical(parameter, source) != b"@",
-              )));
-        partial.extend(
-          word::Word::value(Value::Unknown(ValueIssue::Dynamic), quoted),
-          usize::MAX,
-        );
-        partial.unknown_fields |= !scalar;
-      }
-    }
-  }
-  let fields = partial
-    .fields(
-      WordContext::Argument,
-      &Value::Unknown(ValueIssue::Dynamic),
-      false,
-    )
-    .ok();
-  let field =
-    fields.and_then(|mut fields| (fields.len() == 1).then(|| fields.remove(0)));
-  let boundary_known = !partial.unknown_fields
-    && field.as_ref().is_some_and(|field| {
-      word::Pattern::compile(&field.bytes, &field.quoted, true, true)
-        .is_ok_and(|pattern| pattern.is_literal())
-    });
-  let value = if boundary_known {
-    field.as_ref().map_or(value.clone(), word::Field::value)
-  } else {
-    value
+  let (field, boundary_known) = word::syntax_field(node, source);
+  let value = match &field {
+    Some(field) if boundary_known => field.value(),
+    _ => word::literal_value(node, source),
   };
   Argument {
     node,
-    boundary_known,
+    boundary: if boundary_known {
+      Ok(())
+    } else {
+      Err(value.issue().unwrap_or(ValueIssue::Dynamic))
+    },
     origins: field.map_or_else(Vec::new, |field| field.origins),
     value,
     kind: None,
@@ -206,11 +155,9 @@ pub(super) fn classify_arguments(
       }
     }
     b"exec" => {
-      let first = usize::from(args.first().is_some_and(|arg| {
-        arg.boundary_known && arg.value == Value::Literal(b"--".to_vec())
-      }));
+      let first = operand_index(args);
       if let Some(arg) = args.get_mut(first)
-        && arg.boundary_known
+        && arg.boundary.is_ok()
         && matches!(&arg.value, Value::Literal(name) if !name.is_empty() && (first > 0 || !name.starts_with(b"-")))
       {
         arg.kind = Some(ArgumentKind::Command {
@@ -219,13 +166,15 @@ pub(super) fn classify_arguments(
       }
     }
     b"export" | b"readonly" => {
-      declaration_roles(name, args, env, source);
+      if let Some(start) = declaration_operands(args) {
+        declaration_roles(name, &mut args[start..], env, source);
+      }
     }
     b"unset" => {
       if let Some((index, functions, _)) = unset_options(args) {
         for arg in &mut args[index..] {
           if let Value::Literal(name) = &arg.value
-            && arg.boundary_known
+            && arg.boundary.is_ok()
             && valid_name(name)
           {
             arg.kind = Some(if functions {
@@ -238,10 +187,12 @@ pub(super) fn classify_arguments(
       }
     }
     b"read" => {
-      let index = read_options(args);
-      for arg in &mut args[index..] {
+      let Some(options) = read_options(args) else {
+        return;
+      };
+      for arg in &mut args[options.operands..] {
         if let Value::Literal(name) = &arg.value
-          && arg.boundary_known
+          && arg.boundary.is_ok()
           && valid_name(name)
         {
           arg.kind = Some(variable_role(name, Access::Write, false, env));
@@ -249,7 +200,11 @@ pub(super) fn classify_arguments(
       }
     }
     b"getopts" => {
-      let known_prefix = args.iter().take(2).all(|arg| arg.boundary_known);
+      let Some(start) = getopts_operands(args) else {
+        return;
+      };
+      let args = &mut args[start..];
+      let known_prefix = args.iter().take(2).all(|arg| arg.boundary.is_ok());
       if let Some(arg) = args.get_mut(1)
         && known_prefix
         && let Value::Literal(name) = &arg.value
@@ -262,253 +217,14 @@ pub(super) fn classify_arguments(
   }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(in crate::interface::application::engine) struct UnattemptedCommand {
-  pub arguments: Vec<ArgumentRole>,
-  pub dependencies: BTreeSet<EffectTarget>,
-  pub targets: BTreeSet<EffectTarget>,
-  pub bodies: BTreeMap<
-    (usize, usize),
-    (
-      Value,
-      Vec<crate::interface::application::engine::OriginPart>,
-    ),
-  >,
-  pub incomplete_body: bool,
-}
-
-pub(in crate::interface::application::engine) fn unattempted_command(
-  snapshot: crate::interface::application::engine::Snapshot,
-  node: Node<'_>,
-  source: &[u8],
-) -> UnattemptedCommand {
-  let name = node
-    .child_by_field_name("name")
-    .or_else(|| node.child_by_field_name("word"))
-    .map(|command| syntax_argument(command, source).value);
-  let mut result = UnattemptedCommand::default();
-  let mut args = syntax_arguments(node, source);
-  if let Some(name) = &name {
-    if let Some(dependency) = command_dependency(name) {
-      result.dependencies.insert(dependency);
-      result
-        .targets
-        .extend([EffectTarget::Variables, EffectTarget::Functions]);
-    }
-    unattempted_utilities(name, &args, source, &mut result);
-    if let Value::Literal(name) = name {
-      classify_arguments(name, &mut args, None, source);
-    }
-  }
-  result.arguments = argument_roles(args, snapshot, source);
-  result
-}
-
-fn command_dependency(name: &Value) -> Option<EffectTarget> {
-  if !name.may_be_name()
-    || matches!(name, Value::Literal(name) if super::dispatch::special_builtin(name))
-  {
-    return None;
-  }
-  Some(match name {
-    Value::Literal(name) => EffectTarget::Function(name.clone()),
-    Value::Partial(_) => EffectTarget::FunctionPattern(name.clone()),
-    Value::Unknown(_) => EffectTarget::Functions,
-  })
-}
-
-fn unattempted_utilities(
-  name: &Value,
-  args: &[Argument<'_>],
-  source: &[u8],
-  result: &mut UnattemptedCommand,
-) {
-  let mut pending = vec![(name, args)];
-  while let Some((name, args)) = pending.pop() {
-    for candidate in super::dispatch::builtin_candidates(name) {
-      if candidate == b"command" {
-        let Some((operands, query)) = forwarded_arguments(args) else {
-          result
-            .dependencies
-            .extend([EffectTarget::Variables, EffectTarget::Functions]);
-          result
-            .targets
-            .extend([EffectTarget::Variables, EffectTarget::Functions]);
-          continue;
-        };
-        if query {
-          for arg in operands {
-            if arg.boundary_known {
-              result.dependencies.extend(command_dependency(&arg.value));
-            } else {
-              result.dependencies.insert(EffectTarget::Functions);
-            }
-          }
-        } else if let Some((command, rest)) = operands.split_first() {
-          result
-            .dependencies
-            .extend(command_dependency(&command.value));
-          if command.boundary_known {
-            pending.push((&command.value, rest));
-          } else {
-            result
-              .dependencies
-              .extend([EffectTarget::Variables, EffectTarget::Functions]);
-            result
-              .targets
-              .extend([EffectTarget::Variables, EffectTarget::Functions]);
-          }
-        }
-      } else {
-        if candidate == b"trap" {
-          match trap_action(args) {
-            Ok(Some(index)) => {
-              let argument = &args[index];
-              result.bodies.insert(
-                (argument.node.start_byte(), argument.node.end_byte()),
-                (argument.value.clone(), argument.origins.clone()),
-              );
-            }
-            Err(()) => result.incomplete_body = true,
-            Ok(None) => {}
-          }
-        }
-        let mut targets = BTreeSet::new();
-        if builtin_targets(candidate, &mut args.to_vec(), source, &mut targets)
-          .is_none()
-        {
-          targets.extend([EffectTarget::Variables, EffectTarget::Functions]);
-        }
-        result.dependencies.extend(targets.iter().cloned());
-        result.targets.extend(targets);
-      }
-    }
-  }
-}
-
-fn forwarded_arguments<'a, 'tree>(
-  args: &'a [Argument<'tree>],
-) -> Option<(&'a [Argument<'tree>], bool)> {
-  use super::dispatch::{ForwardOption, forward_option};
-  let mut query = false;
-  for (index, argument) in args.iter().enumerate() {
-    match forward_option(argument) {
-      ForwardOption::Name => return Some((&args[index..], query)),
-      ForwardOption::End => return Some((&args[index + 1..], query)),
-      ForwardOption::Search => {}
-      ForwardOption::Query => query = true,
-      ForwardOption::Invalid | ForwardOption::Unknown => return None,
-    }
-  }
-  Some((&[], query))
-}
-
-pub(super) fn builtin_targets(
-  name: &[u8],
-  args: &mut [Argument<'_>],
-  source: &[u8],
-  targets: &mut BTreeSet<EffectTarget>,
-) -> Option<()> {
-  classify_arguments(name, args, None, source);
-  match name {
-    b"." | b"fc" | b"newgrp" | b"command" => return None,
-    b"read" => {
-      named_targets(
-        &args[read_options(args)..],
-        NameTarget::Variable,
-        false,
-        targets,
-      );
-    }
-    b"getopts" => {
-      if args.iter().take(2).all(|arg| arg.boundary_known) {
-        named_targets(
-          args.get(1..2).unwrap_or(&[]),
-          NameTarget::Variable,
-          false,
-          targets,
-        );
-      } else {
-        targets.insert(EffectTarget::Variables);
-      }
-      targets.extend([
-        EffectTarget::Variable(b"OPTIND".to_vec()),
-        EffectTarget::Variable(b"OPTARG".to_vec()),
-      ]);
-    }
-    b"unset" => {
-      if let Some((index, functions, explicit)) = unset_options(args) {
-        named_targets(
-          &args[index..],
-          if functions {
-            NameTarget::Function
-          } else {
-            NameTarget::Variable
-          },
-          false,
-          targets,
-        );
-        if !explicit {
-          named_targets(&args[index..], NameTarget::Function, false, targets);
-        }
-      } else {
-        targets.extend([EffectTarget::Variables, EffectTarget::Functions]);
-      }
-    }
-    b"readonly" | b"export" => {
-      named_targets(
-        args,
-        NameTarget::Declaration,
-        name == b"readonly",
-        targets,
-      );
-    }
-    b"cd" => {
-      targets.extend([
-        EffectTarget::Directory,
-        EffectTarget::Variable(b"PWD".to_vec()),
-        EffectTarget::Variable(b"OLDPWD".to_vec()),
-      ]);
-    }
-    b"set" => {
-      targets.extend([EffectTarget::Options, EffectTarget::Positionals]);
-    }
-    b"shift" => {
-      targets.insert(EffectTarget::Positionals);
-    }
-    _ => {}
-  }
-  Some(())
-}
-
-fn named_targets(
-  args: &[Argument<'_>],
-  kind: NameTarget,
-  attributes: bool,
-  targets: &mut BTreeSet<EffectTarget>,
-) {
-  for arg in args {
-    match &arg.kind {
-      Some(
-        ArgumentKind::Variable { name, .. } | ArgumentKind::Function { name },
-      ) => {
-        targets.insert(if matches!(kind, NameTarget::Function) {
-          EffectTarget::Function(name.clone())
-        } else {
-          EffectTarget::Variable(name.clone())
-        });
-        if attributes {
-          targets.insert(EffectTarget::Attribute(name.clone()));
-        }
-      }
-      _ if !arg.boundary_known || arg.value.issue().is_some() => {
-        targets.insert(argument_target(arg, kind));
-        if attributes {
-          targets.insert(EffectTarget::Attributes);
-        }
-      }
-      _ => {}
-    }
+/// Index of the first `getopts` operand after a discarded leading `--`, or
+/// `None` when that argument is unknown.
+pub(super) fn getopts_operands(args: &[Argument<'_>]) -> Option<usize> {
+  match args.first() {
+    Some(first) if first.boundary.is_err() => None,
+    Some(first) if first.value == Value::Literal(b"--".to_vec()) => Some(1),
+    Some(first) if first.value.can_equal(b"--") => None,
+    _ => Some(0),
   }
 }
 
@@ -522,7 +238,7 @@ fn declaration_roles(
     let declaration =
       if let Some(variable) = arg.node.child_by_field_name("name") {
         Some((word::lexical(variable, source), true))
-      } else if arg.boundary_known {
+      } else if arg.boundary.is_ok() {
         declaration_operand(&arg.value)
           .map(|(name, value)| (name, value.is_some()))
       } else {
@@ -579,14 +295,18 @@ pub(super) fn declaration_operand(
 pub(super) fn unset_options(
   args: &[Argument<'_>],
 ) -> Option<(usize, bool, bool)> {
-  let mut functions = false;
-  let mut explicit = false;
+  let mut namespace = None;
   let mut index = 0;
   while let Some(arg) = args.get(index) {
     match &arg.value {
       Value::Literal(value) if value == b"-f" || value == b"-v" => {
-        functions = value == b"-f";
-        explicit = true;
+        // POSIX does not specify `-f` together with `-v`.
+        if namespace
+          .replace(value[1])
+          .is_some_and(|other| other != value[1])
+        {
+          return None;
+        }
         index += 1;
       }
       Value::Literal(value) if value == b"--" => {
@@ -595,44 +315,123 @@ pub(super) fn unset_options(
       }
       Value::Literal(value) if !value.starts_with(b"-") => break,
       Value::Unknown(_) | Value::Partial(_)
-        if arg.boundary_known && !arg.value.may_start_with(b"-") =>
+        if arg.boundary.is_ok() && !arg.value.may_start_with(b"-") =>
       {
         break;
       }
       _ => return None,
     }
   }
-  Some((index, functions, explicit))
+  Some((index, namespace == Some(b'f'), namespace.is_some()))
 }
 
-pub(super) fn read_options(args: &[Argument<'_>]) -> usize {
+/// Index of the first `export` or `readonly` operand, or `None` when an
+/// argument may be an option other than `-p`, or `-p` precedes operands.
+pub(super) fn declaration_operands(args: &[Argument<'_>]) -> Option<usize> {
+  let mut print = false;
   let mut index = 0;
   while let Some(arg) = args.get(index) {
+    if arg.node.child_by_field_name("name").is_some() {
+      break;
+    }
+    if arg.boundary.is_err() {
+      return None;
+    }
     match &arg.value {
-      Value::Literal(value) if value == b"-r" => index += 1,
-      Value::Literal(value) if value == b"--" => return index + 1,
+      Value::Literal(value) if value == b"--" => {
+        index += 1;
+        break;
+      }
+      Value::Literal(value) if value.len() > 1 && value.starts_with(b"-") => {
+        if value[1..].iter().any(|letter| *letter != b'p') {
+          return None;
+        }
+        print = true;
+        index += 1;
+      }
+      Value::Literal(_) => break,
+      value if value.may_start_with(b"-") => return None,
       _ => break,
     }
   }
-  index
+  (!print || index == args.len()).then_some(index)
 }
 
-pub(super) fn decimal_operand<'a>(
-  args: &'a [Argument<'_>],
-) -> Option<&'a [u8]> {
+pub(super) struct ReadOptions {
+  pub operands: usize,
+  pub raw: bool,
+  /// Whether `-d` replaces the newline delimiter.
+  pub delimiter: bool,
+}
+
+/// Parses `read` options, or returns `None` when an argument may be an
+/// option that changes which arguments are operands.
+pub(super) fn read_options(args: &[Argument<'_>]) -> Option<ReadOptions> {
+  let mut options = ReadOptions {
+    operands: 0,
+    raw: false,
+    delimiter: false,
+  };
+  while let Some(arg) = args.get(options.operands) {
+    if arg.boundary.is_err() {
+      return None;
+    }
+    let Value::Literal(value) = &arg.value else {
+      return (!arg.value.may_start_with(b"-")).then_some(options);
+    };
+    if value == b"--" {
+      options.operands += 1;
+      break;
+    }
+    if !value.starts_with(b"-") || value == b"-" {
+      break;
+    }
+    options.operands += 1;
+    for (index, letter) in value.iter().enumerate().skip(1) {
+      match letter {
+        b'r' => options.raw = true,
+        b'd' => {
+          options.delimiter = true;
+          if index + 1 == value.len() {
+            if args.get(options.operands)?.boundary.is_err() {
+              return None;
+            }
+            options.operands += 1;
+          }
+          break;
+        }
+        _ => return None,
+      }
+    }
+  }
+  Some(options)
+}
+
+fn decimal_operand<'a>(args: &'a [Argument<'_>]) -> Option<&'a [u8]> {
   let [arg] = args else {
     return None;
   };
   let Value::Literal(bytes) = &arg.value else {
     return None;
   };
-  if !arg.boundary_known
+  if arg.boundary.is_err()
     || bytes.is_empty()
     || !bytes.iter().all(u8::is_ascii_digit)
   {
     return None;
   }
   Some(bytes)
+}
+
+/// The only argument as a `T` when it is a decimal number that `T`
+/// represents.
+pub(super) fn decimal_value<T: std::str::FromStr>(
+  args: &[Argument<'_>],
+) -> Option<T> {
+  std::str::from_utf8(decimal_operand(args)?)
+    .ok()?
+    .parse()
+    .ok()
 }
 
 fn variable_role(
@@ -651,55 +450,24 @@ fn variable_role(
   }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum NameTarget {
-  Variable,
-  Function,
-  Declaration,
-}
-
-pub(super) fn argument_target(
-  arg: &Argument<'_>,
-  kind: NameTarget,
-) -> EffectTarget {
-  let value = if matches!(kind, NameTarget::Declaration) {
-    arg.value.before(b'=')
-  } else {
-    arg.value.clone()
-  };
-  match (value, arg.boundary_known, kind) {
-    (Value::Literal(name), true, NameTarget::Function) => {
-      EffectTarget::Function(name)
-    }
-    (Value::Literal(name), true, _) => EffectTarget::Variable(name),
-    (value @ Value::Partial(_), true, NameTarget::Function) => {
-      EffectTarget::FunctionPattern(value)
-    }
-    (value @ Value::Partial(_), true, _) => {
-      EffectTarget::VariablePattern(value)
-    }
-    (_, _, NameTarget::Function) => EffectTarget::Functions,
-    _ => EffectTarget::Variables,
-  }
-}
-
 impl Resolver<'_> {
   pub(super) fn record_argument_use(
     &mut self,
     argument: &Argument<'_>,
-    mut resolution: Resolution,
+    resolution: Resolution,
     env: &Environment,
     frame: Frame,
   ) {
-    if let Some(ArgumentKind::Variable { name, .. }) = &argument.kind
-      && env.uncertain_variable(name)
-    {
-      resolution.issues.insert(ResolutionIssue::EvaluationOrder);
-    }
+    let variable = match &argument.kind {
+      Some(ArgumentKind::Variable { name, .. }) => Some(name.as_slice()),
+      _ => None,
+    };
     self.record_use(
       UseSite::argument(&frame.location(argument.node)),
       frame.context,
       resolution,
+      variable,
+      env,
     );
   }
 
@@ -709,14 +477,10 @@ impl Resolver<'_> {
     kind: Option<ArgumentKind>,
     frame: Frame,
   ) {
-    let doc = self
-      .workspace
-      .document(frame.snapshot.document)
-      .expect("current document");
     let role = argument.role(
       kind,
       frame.snapshot,
-      doc.source.as_bytes(),
+      self.workspace.source(frame.snapshot.document),
       Some(frame.context),
     );
     self
@@ -729,14 +493,14 @@ impl Resolver<'_> {
 }
 
 impl Argument<'_> {
-  pub(super) fn role(
+  fn role(
     &self,
     kind: Option<ArgumentKind>,
     snapshot: Snapshot,
     source: &[u8],
     context: Option<ExecutionContextId>,
   ) -> ArgumentRole {
-    let spelled = self.boundary_known
+    let spelled = self.boundary.is_ok()
       && matches!(word::literal_value(self.node, source), Value::Literal(_));
     let location = Location {
       snapshot,

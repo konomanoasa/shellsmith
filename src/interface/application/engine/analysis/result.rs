@@ -1,9 +1,10 @@
 use crate::interface::application::engine::{
   self, Access, AnalysisRequest, DependencyState, Location, OccurrenceId,
-  ReferenceId, Snapshot, SymbolId, UseSite, Workspace,
+  ReferenceId, Snapshot, SymbolId, SymbolKind, UseSite, Workspace,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Valid only within the analysis result that issued it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -25,6 +26,21 @@ pub enum ExecutionKind {
   Asynchronous,
   Pipeline,
   TemporaryAssignments,
+}
+
+impl ExecutionKind {
+  /// Whether the context runs in its own execution environment.
+  pub(super) const fn separate(&self) -> bool {
+    matches!(
+      self,
+      Self::Deferred(_)
+        | Self::Subshell
+        | Self::Substitution
+        | Self::Redirection
+        | Self::Asynchronous
+        | Self::Pipeline
+    )
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,8 +103,7 @@ impl Resolution {
     self.issues.extend(&other.issues);
   }
 
-  #[must_use]
-  pub fn is_environment(&self) -> bool {
+  fn is_environment(&self) -> bool {
     self.candidates.is_empty()
       && self.issues.is_empty()
       && self.alternatives == BTreeSet::from([Alternative::Environment])
@@ -153,13 +168,36 @@ pub enum EffectTarget {
   VariablePattern(engine::Value),
   FunctionPattern(engine::Value),
   Attribute(Vec<u8>),
+  AttributePattern(engine::Value),
   Variables,
   Functions,
   Attributes,
+  /// The working directory with the PWD and OLDPWD values that `cd` sets.
   Directory,
   Positionals,
   Options,
   SpecialParameters,
+}
+
+impl EffectTarget {
+  /// Whether the target may be the variable or function `name`.
+  #[must_use]
+  pub fn covers(&self, kind: SymbolKind, name: &[u8]) -> bool {
+    match (self, kind) {
+      (Self::Variable(text), SymbolKind::Variable)
+      | (Self::Function(text), SymbolKind::Function) => text == name,
+      (Self::VariablePattern(value), SymbolKind::Variable)
+      | (Self::FunctionPattern(value), SymbolKind::Function) => {
+        value.can_equal(name)
+      }
+      (Self::Variables, SymbolKind::Variable)
+      | (Self::Functions, SymbolKind::Function) => true,
+      (Self::Directory, SymbolKind::Variable) => {
+        matches!(name, b"PWD" | b"OLDPWD")
+      }
+      _ => false,
+    }
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +211,28 @@ pub struct UnknownEffect {
 pub(super) type EffectKey =
   (ExecutionContextId, Snapshot, usize, usize, ResolutionIssue);
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AttributeState {
+  Known(bool),
+  Conditional,
+  Unknown,
+}
+
+impl AttributeState {
+  pub(in crate::interface::application::engine) fn join(
+    self,
+    other: Self,
+  ) -> Self {
+    if self == other {
+      self
+    } else if self == Self::Unknown || other == Self::Unknown {
+      Self::Unknown
+    } else {
+      Self::Conditional
+    }
+  }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArgumentKind {
   Number,
@@ -181,7 +241,7 @@ pub enum ArgumentKind {
     name: Vec<u8>,
     access: Access,
     declaration: bool,
-    readonly: engine::AttributeState,
+    readonly: AttributeState,
   },
   Function {
     name: Vec<u8>,
@@ -249,7 +309,7 @@ impl ArgumentRole {
     }
   }
 
-  pub(super) fn is_reference(&self) -> bool {
+  fn is_reference(&self) -> bool {
     matches!(
       self.kind,
       Some(
@@ -280,12 +340,10 @@ pub struct Analysis {
     BTreeMap<(UseSite, ExecutionContextId), BTreeSet<SymbolId>>,
   pub(in crate::interface::application::engine) effects:
     BTreeMap<EffectKey, UnknownEffect>,
-  pub(in crate::interface::application::engine) queries:
-    BTreeSet<engine::InputQuery>,
   pub(in crate::interface::application::engine) derived:
     engine::workspace::derived::DerivedDocuments,
   pub(in crate::interface::application::engine) attributes:
-    BTreeMap<(OccurrenceId, ExecutionContextId), engine::AttributeState>,
+    BTreeMap<(OccurrenceId, ExecutionContextId), AttributeState>,
   pub(in crate::interface::application::engine) generation: Arc<()>,
   pub(in crate::interface::application::engine) request: AnalysisRequest,
   pub(in crate::interface::application::engine) contexts: Vec<ExecutionContext>,
@@ -308,6 +366,60 @@ pub struct Analysis {
 }
 
 impl Analysis {
+  pub(super) fn new(
+    request: AnalysisRequest,
+    entry: ExecutionContext,
+    readable: BTreeSet<OccurrenceId>,
+  ) -> Self {
+    Self {
+      argument_roles: BTreeMap::new(),
+      argument_definitions: BTreeMap::new(),
+      effects: BTreeMap::new(),
+      derived: engine::workspace::derived::DerivedDocuments::default(),
+      attributes: BTreeMap::new(),
+      generation: Arc::default(),
+      request,
+      contexts: vec![entry],
+      uses: BTreeMap::new(),
+      writes: BTreeSet::new(),
+      temporary: BTreeMap::new(),
+      gaps: Vec::new(),
+      snapshots: Vec::new(),
+      source_bindings: BTreeMap::new(),
+      readable,
+      references: BTreeMap::new(),
+      source_inputs: BTreeMap::new(),
+      source_operands: BTreeMap::new(),
+      values: BTreeMap::new(),
+    }
+  }
+
+  /// Marks argument uses without a reference role as having unknown effects
+  /// and indexes the uses of each symbol.
+  pub(super) fn index_uses(
+    &mut self,
+    cancelled: &AtomicBool,
+  ) -> Result<(), engine::Error> {
+    for (key, site) in &mut self.uses {
+      if matches!(site.site, UseSite::Argument { .. })
+        && self
+          .argument_roles
+          .get(&(site.site, site.context))
+          .is_none_or(|role| !role.is_reference())
+      {
+        site
+          .resolution
+          .issues
+          .insert(ResolutionIssue::UnknownEffect);
+      }
+      engine::check_cancelled(cancelled)?;
+      for candidate in &site.resolution.candidates {
+        self.references.entry(*candidate).or_default().insert(*key);
+      }
+    }
+    engine::check_cancelled(cancelled)
+  }
+
   pub(in crate::interface::application::engine) fn name_environment(
     &self,
     context: ExecutionContextId,
@@ -354,10 +466,6 @@ impl Analysis {
     self.effects.values()
   }
 
-  pub fn input_queries(&self) -> impl Iterator<Item = &engine::InputQuery> {
-    self.queries.iter()
-  }
-
   pub fn source_operand(&self, reference: ReferenceId) -> Option<&Location> {
     self
       .source_operands
@@ -402,8 +510,7 @@ impl Analysis {
       .map(|((_, context), value)| (*context, value.as_ref()))
   }
 
-  #[must_use]
-  pub fn is_environment(&self, id: OccurrenceId) -> bool {
+  pub(super) fn is_environment(&self, id: OccurrenceId) -> bool {
     self
       .summarize(UseSite::Syntax(id))
       .resolution
@@ -419,18 +526,18 @@ impl Analysis {
   }
 
   #[must_use]
-  pub fn readonly(&self, id: OccurrenceId) -> engine::AttributeState {
+  pub fn readonly(&self, id: OccurrenceId) -> AttributeState {
     self
       .readonly_contexts(id)
       .map(|(_, state)| state)
-      .reduce(engine::AttributeState::join)
-      .unwrap_or(engine::AttributeState::Unknown)
+      .reduce(AttributeState::join)
+      .unwrap_or(AttributeState::Unknown)
   }
 
   pub fn readonly_contexts(
     &self,
     id: OccurrenceId,
-  ) -> impl Iterator<Item = (ExecutionContextId, engine::AttributeState)> {
+  ) -> impl Iterator<Item = (ExecutionContextId, AttributeState)> {
     self
       .attributes
       .range((id, ExecutionContextId(0))..=(id, ExecutionContextId(usize::MAX)))

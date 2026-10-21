@@ -1,6 +1,6 @@
-use super::{Application, Error, check, files};
+use super::{Application, Error, files};
 use crate::interface::application::engine;
-use engine::{Document, Workspace};
+use engine::{Document, Workspace, check_cancelled};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,8 +19,8 @@ pub(in crate::interface::application) struct EntryNames {
 pub(in crate::interface::application) struct NameCollection {
   pub entries: Vec<EntryNames>,
   pub documents: BTreeMap<engine::Snapshot, (PathBuf, Arc<str>)>,
-  pub roots: BTreeSet<PathBuf>,
-  pub explicit: BTreeSet<PathBuf>,
+  roots: BTreeSet<PathBuf>,
+  explicit: BTreeSet<PathBuf>,
 }
 
 impl Application {
@@ -35,7 +35,7 @@ impl Application {
     {
       return Ok(names.clone());
     }
-    self.refresh_for(None, false, cancelled)?;
+    self.refresh_for(None, cancelled)?;
     if self.document_id(&path).is_none() {
       self.load(&path, cancelled)?;
     }
@@ -60,7 +60,42 @@ impl Application {
     Ok(names)
   }
 
+  /// Collects the names of each of `roots` and adds the documents that the
+  /// collection loaded to the workspace.
   fn collect_names(
+    &mut self,
+    roots: BTreeSet<PathBuf>,
+    cancelled: &AtomicBool,
+  ) -> Result<NameCollection, Error> {
+    let workspace = std::mem::take(&mut self.workspace);
+    let collection = self.collect_entries(roots, cancelled);
+    self.workspace = workspace;
+    let collection = collection?;
+    let loaded: Vec<_> = self
+      .cache
+      .loaded
+      .values()
+      .filter_map(|loaded| loaded.as_ref().ok())
+      .filter(|document| {
+        self
+          .workspace
+          .document(document.snapshot().document)
+          .is_none()
+      })
+      .cloned()
+      .collect();
+    for document in loaded {
+      let id = document.snapshot().document;
+      self.workspace.insert_shared(document)?;
+      self
+        .workspace
+        .index_document(id, self.settings.limits, cancelled)?;
+    }
+    Ok(collection)
+  }
+
+  /// Analyzes each of `roots` alone, in a workspace of its own.
+  fn collect_entries(
     &mut self,
     roots: BTreeSet<PathBuf>,
     cancelled: &AtomicBool,
@@ -70,7 +105,7 @@ impl Application {
       ..NameCollection::default()
     };
     for path in &collection.roots {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       collection
         .entries
         .push(self.collect_entry_names(path, cancelled)?);
@@ -81,20 +116,6 @@ impl Application {
             (path.to_path_buf(), Arc::from(document.source())),
           );
         }
-      }
-    }
-    for document in self
-      .cache
-      .loaded
-      .values()
-      .filter_map(|loaded| loaded.as_ref().ok())
-    {
-      if self
-        .workspace
-        .document(document.snapshot().document)
-        .is_none()
-      {
-        self.workspace.insert_shared(document.clone())?;
       }
     }
     Ok(collection)
@@ -137,8 +158,7 @@ impl Application {
         self
           .workspace
           .symbol(*symbol)
-          .and_then(|symbol| self.workspace.occurrence(symbol.definition))
-          .and_then(|site| self.workspace.navigation_location(&site.location))
+          .and_then(|symbol| self.workspace.definition_location(symbol))
       });
     }
     let dependencies = analysis
@@ -178,13 +198,15 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<NameCollection, Error> {
     let mut scratch = self.clone();
-    scratch.names = None;
-    scratch.workspace.clear_analysis();
     scratch.cache.frozen = true;
-    for (path, text) in collection.documents.values() {
-      let text = changed.get(path).map_or(text.as_ref(), String::as_str);
-      scratch.opened.insert(path.clone(), Arc::from(text));
-      scratch.replace(path, text.as_bytes(), cancelled)?;
+    for (path, source) in collection.documents.values() {
+      let Some(text) = changed
+        .get(path)
+        .filter(|text| text.as_str() != source.as_ref())
+      else {
+        continue;
+      };
+      scratch.stage(path, text.as_bytes(), cancelled)?;
     }
     let mut result =
       scratch.collect_names(collection.roots.clone(), cancelled)?;
@@ -197,7 +219,7 @@ impl Application {
     collection: &NameCollection,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
-    check(cancelled)?;
+    check_cancelled(cancelled)?;
     if !self.failures.is_empty() {
       return Err(Error::RenameRefused(
         "Some workspace inputs could not be read".into(),
@@ -221,7 +243,7 @@ impl Application {
       return Ok(false);
     }
     for (path, source) in collection.documents.values() {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       if !self.opened.contains_key(path)
         && !files::read(path, &self.opened)
           .is_ok_and(|bytes| bytes == source.as_bytes())
@@ -230,13 +252,13 @@ impl Application {
       }
     }
     for (input, expected) in &self.cache.paths {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       if &self.resolve_source(input) != expected {
         return Ok(false);
       }
     }
     for (input, expected) in &self.cache.evaluated {
-      check(cancelled)?;
+      check_cancelled(cancelled)?;
       if files::evaluate(input, cancelled)? != *expected {
         return Ok(false);
       }

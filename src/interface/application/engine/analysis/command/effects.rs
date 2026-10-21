@@ -1,12 +1,21 @@
 use super::super::execution::children;
 use super::super::execution::{Environment, Flow};
+use super::super::expansion::Argument;
 use super::super::{Frame, Resolver};
-use super::dispatch::{ForwardOption, builtin_names, forward_option};
-use crate::interface::application::engine::{
-  Access, Alternative, EffectTarget, OccurrenceKind, ResolutionIssue, Snapshot,
-  Value, ValueIssue,
+use super::arguments::{
+  argument_roles, classify_arguments, declaration_operands, getopts_operands,
+  read_options, syntax_argument, syntax_arguments, trap_action, unset_options,
 };
-use std::collections::BTreeSet;
+use super::dispatch::{
+  Search, builtin_candidates, builtin_names, command_options, special_name,
+};
+use crate::interface::application::engine::workspace::parser;
+use crate::interface::application::engine::{
+  Access, Alternative, ArgumentKind, ArgumentRole, EffectTarget,
+  OccurrenceKind, OriginPart, ResolutionIssue, Snapshot, UnknownEffect, Value,
+  ValueIssue,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
 fn all() -> BTreeSet<EffectTarget> {
@@ -20,6 +29,60 @@ fn all() -> BTreeSet<EffectTarget> {
     EffectTarget::SpecialParameters,
   ]
   .into()
+}
+
+impl<'a> Resolver<'a> {
+  pub(in crate::interface::application::engine::analysis) fn expansion_targets(
+    &self,
+    nodes: impl IntoIterator<Item = Node<'a>>,
+    frame: Frame,
+  ) -> BTreeSet<EffectTarget> {
+    let mut pending: Vec<_> = nodes.into_iter().collect();
+    let mut targets = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+      if parser::subshell(node.kind()) {
+        continue;
+      }
+      if node.kind() == "io_here" {
+        pending.extend(self.index.heredoc(frame.snapshot, node));
+      }
+      self.node_writes(node, frame, &mut targets);
+      pending.extend(children(node));
+    }
+    targets
+  }
+
+  /// Adds the state that `node` itself may write, apart from the commands
+  /// it contains.
+  fn node_writes(
+    &self,
+    node: Node<'_>,
+    frame: Frame,
+    targets: &mut BTreeSet<EffectTarget>,
+  ) {
+    if matches!(
+      node.kind(),
+      "arithmetic_dynamic_expression"
+        | "parenthesized_arithmetic_dynamic_source"
+    ) {
+      targets.insert(EffectTarget::Variables);
+    }
+    if let Some(site) = self
+      .site(node, frame)
+      .and_then(|id| self.workspace.occurrence(id))
+      && site.kind != OccurrenceKind::Command
+      && site.access != Access::Read
+    {
+      targets.insert(match (&site.kind, &site.name) {
+        (OccurrenceKind::FunctionDefinition, Value::Literal(name)) => {
+          EffectTarget::Function(name.clone())
+        }
+        (OccurrenceKind::FunctionDefinition, _) => EffectTarget::Functions,
+        (_, Value::Literal(name)) => EffectTarget::Variable(name.clone()),
+        _ => EffectTarget::Variables,
+      });
+    }
+  }
 }
 
 impl Resolver<'_> {
@@ -50,43 +113,22 @@ impl Resolver<'_> {
         continue;
       }
       let frame = Frame { snapshot, ..frame };
-      if crate::interface::application::engine::workspace::parser::damaged(node)
-      {
+      if parser::damaged(node) {
         return None;
       }
-      if matches!(
-        node.kind(),
-        "subshell" | "command_substitution" | "backquote_substitution"
-      ) {
+      if parser::subshell(node.kind()) {
+        continue;
+      }
+      if parser::asynchronous(node) {
+        targets.insert(EffectTarget::SpecialParameters);
         continue;
       }
       if node.kind() == "io_here"
-        && let Some(body) =
-          self.index.heredocs.get(&(snapshot, node.start_byte()))
+        && let Some(body) = self.index.heredoc(snapshot, node)
       {
-        pending.push((*body, snapshot));
+        pending.push((body, snapshot));
       }
-      if let Some(site) = self
-        .site(node, frame)
-        .and_then(|id| self.workspace.occurrence(id))
-        && site.kind != OccurrenceKind::Command
-        && site.access != Access::Read
-      {
-        targets.insert(match (&site.kind, &site.name) {
-          (OccurrenceKind::FunctionDefinition, Value::Literal(name)) => {
-            EffectTarget::Function(name.clone())
-          }
-          (_, Value::Literal(name)) => EffectTarget::Variable(name.clone()),
-          _ => EffectTarget::Variables,
-        });
-      }
-      if matches!(
-        node.kind(),
-        "arithmetic_dynamic_expression"
-          | "parenthesized_arithmetic_dynamic_source"
-      ) {
-        targets.insert(EffectTarget::Variables);
-      }
+      self.node_writes(node, frame, &mut targets);
       if node.kind() == "simple_command" {
         self.command_targets(
           node,
@@ -110,21 +152,12 @@ impl Resolver<'_> {
     pending: &mut Vec<(Node<'a>, Snapshot)>,
     targets: &mut BTreeSet<EffectTarget>,
   ) -> Option<()> {
-    let document = self
-      .workspace
-      .document(snapshot.document)
-      .expect("summary document");
-    let Some(command) = node
-      .child_by_field_name("name")
-      .or_else(|| node.child_by_field_name("word"))
-    else {
+    let source = self.workspace.source(snapshot.document);
+    let Some(command) = parser::command_word(node) else {
       return Some(());
     };
-    let mut name =
-      super::arguments::syntax_argument(command, document.source.as_bytes())
-        .value;
-    let mut args =
-      super::arguments::syntax_arguments(node, document.source.as_bytes());
+    let mut name = syntax_argument(command, source).value;
+    let mut args = syntax_arguments(node, source);
     let mut suppress = false;
     while name == Value::Literal(b"command".to_vec()) {
       let resolution = Self::command_resolution(&name, env, suppress);
@@ -134,44 +167,35 @@ impl Resolver<'_> {
       {
         break;
       }
-      while let Some(arg) = args.first() {
-        match forward_option(arg) {
-          ForwardOption::Query => return Some(()),
-          ForwardOption::Search => {
-            args.remove(0);
-          }
-          ForwardOption::End => {
-            args.remove(0);
-            break;
-          }
-          ForwardOption::Name => break,
-          ForwardOption::Invalid | ForwardOption::Unknown => return None,
-        }
+      let options = command_options(&args).ok()?;
+      if options.query {
+        return Some(());
       }
+      args.drain(..options.operands);
       if args.is_empty() {
         return Some(());
       }
       name = args.remove(0).value;
       suppress = true;
     }
-    let resolution = Self::command_resolution(&name, env, suppress);
+    let search = if suppress {
+      Search::SuppressFunctions
+    } else {
+      Self::name_search(command, source, &name, env)
+    };
+    let resolution = Self::search_resolution(&name, env, search);
     if !resolution.issues.is_empty()
       || resolution.alternatives.contains(&Alternative::External)
     {
       return None;
     }
     for candidate in resolution.candidates {
-      let body = self.index.functions.get(&candidate)?;
-      pending.push((*body, candidate.snapshot));
+      let body = self.index.function_body(candidate)?;
+      pending.push((body, candidate.snapshot));
     }
     if resolution.alternatives.contains(&Alternative::Builtin) {
       for candidate in builtin_names(&name, env, suppress) {
-        super::arguments::builtin_targets(
-          &candidate,
-          &mut args,
-          document.source.as_bytes(),
-          targets,
-        )?;
+        builtin_targets(&candidate, &args, source, targets)?;
       }
     }
     Some(())
@@ -185,11 +209,9 @@ impl Resolver<'_> {
     env: &mut Environment,
     frame: Frame,
     issue: ResolutionIssue,
-    targets: impl IntoIterator<
-      Item = crate::interface::application::engine::EffectTarget,
-    >,
+    value_issue: ValueIssue,
+    targets: impl IntoIterator<Item = EffectTarget>,
   ) {
-    use crate::interface::application::engine::{EffectTarget, UnknownEffect};
     let targets: BTreeSet<_> = targets.into_iter().collect();
     if targets.is_empty() {
       return;
@@ -198,13 +220,7 @@ impl Resolver<'_> {
     self
       .result
       .effects
-      .entry((
-        frame.context,
-        frame.snapshot,
-        node.start_byte(),
-        node.end_byte(),
-        issue,
-      ))
+      .entry(frame.effect_key(node, issue))
       .or_insert_with(|| UnknownEffect {
         context: frame.context,
         location: frame.location(node),
@@ -214,113 +230,309 @@ impl Resolver<'_> {
       .targets
       .extend(targets.iter().cloned());
     for target in targets {
-      let functions = matches!(target, EffectTarget::FunctionPattern(_));
-      match target {
-        EffectTarget::VariablePattern(pattern)
-        | EffectTarget::FunctionPattern(pattern) => {
-          env.invalidate_pattern(pattern, functions, issue);
-        }
-        EffectTarget::Function(name) => {
-          env.alternatives.forget_function(&name);
-          let mut binding = env.functions.get(&name).clone();
-          binding.taint(issue);
-          env.functions.values.insert(name, binding);
-        }
-        EffectTarget::Attribute(name) => {
-          if !env.readonly.contains_key(&name) {
-            env.readonly.insert(name, false);
-          }
-        }
-        EffectTarget::Variable(name) => {
-          env.alternatives.forget(&name);
-          if env.readonly(&name) == Some(true) {
-            continue;
-          }
-          env.variable_changed(&name, None);
-          let mut binding = env.variables.get(&name).clone();
-          binding.taint(issue);
-          env.variables.values.insert(name, binding);
-        }
-        EffectTarget::Variables => {
-          env.variable_changed(b"OPTIND", None);
-          env.alternatives.clear();
-          for (name, mut binding) in env.variables.values.clone() {
-            if env.readonly.get(&name) != Some(&true) {
-              binding.taint(issue);
-              env.variables.values.insert(name, binding);
-            }
-          }
-          env.variables.fallback.taint(issue);
-          env.variables.patterns.clear();
-          env.variables.uncertain = None;
-        }
-        EffectTarget::Functions => {
-          env.functions.taint(issue);
-          env.alternatives.forget_functions();
-        }
-        EffectTarget::Attributes => {
-          env.unknown_attributes = true;
-        }
-        EffectTarget::Directory => {
-          env.cwd = Value::Unknown(ValueIssue::Dynamic);
-        }
-        EffectTarget::Positionals => {
-          env.positional = None;
-          env.alternatives.forget_positionals();
-        }
-        EffectTarget::Options => {
-          env.errexit = None;
-          env.nounset = None;
-          env.noglob = None;
-          env.special.remove(b"-".as_slice());
-        }
-        EffectTarget::SpecialParameters => env
-          .special
-          .retain(|name, _| matches!(name.as_slice(), b"0" | b"$")),
-      }
+      env.invalidate(target, issue, value_issue);
     }
   }
 
-  pub(in crate::interface::application::engine::analysis) fn unknown(
-    &mut self,
-    node: Node<'_>,
-    mut env: Environment,
-    frame: Frame,
-    issue: ResolutionIssue,
-  ) -> Flow {
-    use crate::interface::application::engine::EffectTarget;
-    env.io.consume_input(None);
-    if let Some(output) = &mut env.io.output {
-      output.fail(ValueIssue::UnsupportedExpansion);
-    }
-    self.invalidate(
-      node,
-      &mut env,
-      frame,
-      issue,
-      [
-        EffectTarget::Variables,
-        EffectTarget::Functions,
-        EffectTarget::Directory,
-        EffectTarget::Positionals,
-        EffectTarget::Options,
-        EffectTarget::SpecialParameters,
-      ],
-    );
-    Flow::next(env)
-  }
-}
-
-impl Resolver<'_> {
+  /// Runs a command whose effects on the shell state are unknown.
   pub(in crate::interface::application::engine::analysis) fn opaque(
     &mut self,
     node: Node<'_>,
     mut env: Environment,
     frame: Frame,
     issue: ResolutionIssue,
+    value_issue: Option<ValueIssue>,
   ) -> Flow {
-    use crate::interface::application::engine::EffectTarget;
-    self.invalidate(node, &mut env, frame, issue, [EffectTarget::Attributes]);
-    self.unknown(node, env, frame, issue)
+    env.io.consume_input(None);
+    if let Some(output) = &mut env.io.output {
+      output.fail(value_issue.unwrap_or(ValueIssue::UnsupportedExpansion));
+    }
+    self.invalidate(
+      node,
+      &mut env,
+      frame,
+      issue,
+      value_issue.unwrap_or(ValueIssue::Dynamic),
+      all(),
+    );
+    Flow::next(env)
+  }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(in crate::interface::application::engine) struct UnattemptedCommand {
+  pub arguments: Vec<ArgumentRole>,
+  pub dependencies: BTreeSet<EffectTarget>,
+  pub targets: BTreeSet<EffectTarget>,
+  pub bodies: BTreeMap<(usize, usize), (Value, Vec<OriginPart>)>,
+  pub incomplete_body: bool,
+}
+
+pub(in crate::interface::application::engine) fn unattempted_command(
+  snapshot: Snapshot,
+  node: Node<'_>,
+  source: &[u8],
+) -> UnattemptedCommand {
+  let name = parser::command_word(node)
+    .map(|command| syntax_argument(command, source).value);
+  let mut result = UnattemptedCommand::default();
+  let mut args = syntax_arguments(node, source);
+  if let Some(name) = &name {
+    if let Some(dependency) = command_dependency(name) {
+      result.dependencies.insert(dependency);
+      result
+        .targets
+        .extend([EffectTarget::Variables, EffectTarget::Functions]);
+    }
+    unattempted_utilities(name, &args, source, &mut result);
+    if let Value::Literal(name) = name {
+      classify_arguments(name, &mut args, None, source);
+    }
+  }
+  result.arguments = argument_roles(args, snapshot, source);
+  result
+}
+
+fn command_dependency(name: &Value) -> Option<EffectTarget> {
+  if !name.may_be_name() || special_name(name) {
+    return None;
+  }
+  Some(match name {
+    Value::Literal(name) => EffectTarget::Function(name.clone()),
+    Value::Partial(_) => EffectTarget::FunctionPattern(name.clone()),
+    Value::Unknown(_) => EffectTarget::Functions,
+  })
+}
+
+fn unattempted_utilities(
+  name: &Value,
+  args: &[Argument<'_>],
+  source: &[u8],
+  result: &mut UnattemptedCommand,
+) {
+  let mut pending = vec![(name, args)];
+  while let Some((name, args)) = pending.pop() {
+    for candidate in builtin_candidates(name) {
+      if candidate == b"command" {
+        let Ok(options) = command_options(args) else {
+          result
+            .dependencies
+            .extend([EffectTarget::Variables, EffectTarget::Functions]);
+          result
+            .targets
+            .extend([EffectTarget::Variables, EffectTarget::Functions]);
+          continue;
+        };
+        let operands = &args[options.operands..];
+        if options.query {
+          for arg in operands {
+            if arg.boundary.is_ok() {
+              result.dependencies.extend(command_dependency(&arg.value));
+            } else {
+              result.dependencies.insert(EffectTarget::Functions);
+            }
+          }
+        } else if let Some((command, rest)) = operands.split_first() {
+          result
+            .dependencies
+            .extend(command_dependency(&command.value));
+          if command.boundary.is_ok() {
+            pending.push((&command.value, rest));
+          } else {
+            result
+              .dependencies
+              .extend([EffectTarget::Variables, EffectTarget::Functions]);
+            result
+              .targets
+              .extend([EffectTarget::Variables, EffectTarget::Functions]);
+          }
+        }
+      } else {
+        if candidate == b"trap" {
+          match trap_action(args) {
+            Ok(Some(index)) => {
+              let argument = &args[index];
+              result.bodies.insert(
+                (argument.node.start_byte(), argument.node.end_byte()),
+                (argument.value.clone(), argument.origins.clone()),
+              );
+            }
+            Err(()) => result.incomplete_body = true,
+            Ok(None) => {}
+          }
+        }
+        let mut targets = BTreeSet::new();
+        if builtin_targets(candidate, args, source, &mut targets).is_none() {
+          targets.extend([EffectTarget::Variables, EffectTarget::Functions]);
+        }
+        result.dependencies.extend(targets.iter().cloned());
+        result.targets.extend(targets);
+      }
+    }
+  }
+}
+
+fn builtin_targets(
+  name: &[u8],
+  args: &[Argument<'_>],
+  source: &[u8],
+  targets: &mut BTreeSet<EffectTarget>,
+) -> Option<()> {
+  let mut args = args.to_vec();
+  classify_arguments(name, &mut args, None, source);
+  let args = args.as_slice();
+  match name {
+    b"." | b"fc" | b"newgrp" | b"command" => return None,
+    b"read" => {
+      if let Some(options) = read_options(args) {
+        named_targets(
+          &args[options.operands..],
+          NameTarget::Variable,
+          false,
+          targets,
+        );
+      } else {
+        targets.insert(EffectTarget::Variables);
+      }
+    }
+    b"getopts" => {
+      match getopts_operands(args).map(|start| &args[start..]) {
+        Some(args) if args.iter().take(2).all(|arg| arg.boundary.is_ok()) => {
+          named_targets(
+            args.get(1..2).unwrap_or(&[]),
+            NameTarget::Variable,
+            false,
+            targets,
+          );
+        }
+        _ => {
+          targets.insert(EffectTarget::Variables);
+        }
+      }
+      targets.extend([
+        EffectTarget::Variable(b"OPTIND".to_vec()),
+        EffectTarget::Variable(b"OPTARG".to_vec()),
+      ]);
+    }
+    b"unset" => {
+      if let Some((index, functions, explicit)) = unset_options(args) {
+        named_targets(
+          &args[index..],
+          if functions {
+            NameTarget::Function
+          } else {
+            NameTarget::Variable
+          },
+          false,
+          targets,
+        );
+        if !explicit {
+          named_targets(&args[index..], NameTarget::Function, false, targets);
+        }
+      } else {
+        targets.extend([EffectTarget::Variables, EffectTarget::Functions]);
+      }
+    }
+    b"readonly" | b"export" => {
+      if let Some(start) = declaration_operands(args) {
+        named_targets(
+          &args[start..],
+          NameTarget::Declaration,
+          name == b"readonly",
+          targets,
+        );
+      } else {
+        targets.insert(EffectTarget::Variables);
+        if name == b"readonly" {
+          targets.insert(EffectTarget::Attributes);
+        }
+      }
+    }
+    b"cd" => {
+      targets.insert(EffectTarget::Directory);
+    }
+    b"set" => {
+      targets.extend([EffectTarget::Options, EffectTarget::Positionals]);
+    }
+    b"shift" => {
+      targets.insert(EffectTarget::Positionals);
+    }
+    _ => {}
+  }
+  Some(())
+}
+
+fn named_targets(
+  args: &[Argument<'_>],
+  kind: NameTarget,
+  attributes: bool,
+  targets: &mut BTreeSet<EffectTarget>,
+) {
+  for arg in args {
+    match &arg.kind {
+      Some(
+        ArgumentKind::Variable { name, .. } | ArgumentKind::Function { name },
+      ) => {
+        targets.insert(if matches!(kind, NameTarget::Function) {
+          EffectTarget::Function(name.clone())
+        } else {
+          EffectTarget::Variable(name.clone())
+        });
+        if attributes {
+          targets.insert(EffectTarget::Attribute(name.clone()));
+        }
+      }
+      _ if arg.boundary.is_err() || arg.value.issue().is_some() => {
+        let target = argument_target(arg, kind);
+        if attributes {
+          targets.insert(attribute_target(&target));
+        }
+        targets.insert(target);
+      }
+      _ => {}
+    }
+  }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum NameTarget {
+  Variable,
+  Function,
+  Declaration,
+}
+
+pub(super) fn argument_target(
+  arg: &Argument<'_>,
+  kind: NameTarget,
+) -> EffectTarget {
+  let value = if matches!(kind, NameTarget::Declaration) {
+    arg.value.before(b'=')
+  } else {
+    arg.value.clone()
+  };
+  match (value, arg.boundary.is_ok(), kind) {
+    (Value::Literal(name), true, NameTarget::Function) => {
+      EffectTarget::Function(name)
+    }
+    (Value::Literal(name), true, _) => EffectTarget::Variable(name),
+    (value @ Value::Partial(_), true, NameTarget::Function) => {
+      EffectTarget::FunctionPattern(value)
+    }
+    (value @ Value::Partial(_), true, _) => {
+      EffectTarget::VariablePattern(value)
+    }
+    (_, _, NameTarget::Function) => EffectTarget::Functions,
+    _ => EffectTarget::Variables,
+  }
+}
+
+/// The readonly attributes that a declaration of `target` may set.
+pub(super) fn attribute_target(target: &EffectTarget) -> EffectTarget {
+  match target {
+    EffectTarget::Variable(name) => EffectTarget::Attribute(name.clone()),
+    EffectTarget::VariablePattern(pattern) => {
+      EffectTarget::AttributePattern(pattern.clone())
+    }
+    _ => EffectTarget::Attributes,
   }
 }

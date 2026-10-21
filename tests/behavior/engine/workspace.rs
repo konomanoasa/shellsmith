@@ -301,12 +301,7 @@ mod extraction {
     let spans: Vec<_> = document
       .classifications()
       .iter()
-      .map(|span| {
-        (
-          document.text(&span.location).unwrap(),
-          span.capture.as_str(),
-        )
-      })
+      .map(|span| (document.text(&span.location).unwrap(), span.capture))
       .collect();
     for expected in [
       ("# hello", "comment"),

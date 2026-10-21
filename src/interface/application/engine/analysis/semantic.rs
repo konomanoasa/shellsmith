@@ -2,28 +2,9 @@ use crate::interface::application::engine::workspace::derived::syntax_resolution
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::interface::application::engine::{
-  Access, Alternative, Analysis, ArgumentKind, Classification, Document,
-  Location, OccurrenceKind, Resolution, UseSite,
+  Access, Alternative, Analysis, ArgumentKind, AttributeState, Classification,
+  Document, Location, OccurrenceKind, Resolution, UseSite, Value,
 };
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum AttributeState {
-  Known(bool),
-  Conditional,
-  Unknown,
-}
-
-impl AttributeState {
-  pub(crate) fn join(self, other: Self) -> Self {
-    if self == other {
-      self
-    } else if self == Self::Unknown || other == Self::Unknown {
-      Self::Unknown
-    } else {
-      Self::Conditional
-    }
-  }
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SemanticKind {
@@ -57,51 +38,6 @@ pub struct SemanticSpan {
   pub semantic: bool,
 }
 
-pub(in crate::interface::application::engine) struct ProjectedSpan {
-  pub span: SemanticSpan,
-  pub documents: BTreeSet<crate::interface::application::engine::DocumentId>,
-  pub compatible: bool,
-}
-
-impl ProjectedSpan {
-  pub fn new(
-    span: SemanticSpan,
-    document: crate::interface::application::engine::DocumentId,
-  ) -> Self {
-    Self {
-      span,
-      documents: BTreeSet::from([document]),
-      compatible: true,
-    }
-  }
-
-  pub fn join(
-    &mut self,
-    other: &SemanticSpan,
-    document: crate::interface::application::engine::DocumentId,
-  ) {
-    self.documents.insert(document);
-    if self.span.kind != other.kind {
-      if matches!(
-        self.span.kind,
-        SemanticKind::Function | SemanticKind::Command
-      ) && matches!(
-        other.kind,
-        SemanticKind::Function | SemanticKind::Command
-      ) {
-        self.span.kind = SemanticKind::Command;
-      } else {
-        self.compatible = false;
-      }
-    }
-    self
-      .span
-      .modifiers
-      .retain(|modifier| other.modifiers.contains(modifier));
-    self.span.readonly = self.span.readonly.join(other.readonly);
-  }
-}
-
 impl Document {
   #[must_use]
   pub(in crate::interface::application::engine) fn semantic_spans(
@@ -129,11 +65,7 @@ impl Document {
     }
     for site in self.occurrences() {
       if site.kind == OccurrenceKind::Command
-        && matches!(
-          site.name,
-          crate::interface::application::engine::Value::Unknown(_)
-            | crate::interface::application::engine::Value::Partial(_)
-        )
+        && matches!(site.name, Value::Unknown(_) | Value::Partial(_))
       {
         continue;
       }
@@ -163,7 +95,7 @@ impl Document {
       }
       let readonly = analysis
         .map_or(AttributeState::Unknown, |result| result.readonly(site.id));
-      if analysis.is_some() && readonly == AttributeState::Known(true) {
+      if readonly == AttributeState::Known(true) {
         modifiers.insert(Modifier::Readonly);
       }
       if kind == SemanticKind::Variable
@@ -253,7 +185,7 @@ impl Document {
     &self,
     classification: &Classification,
   ) -> Option<SemanticKind> {
-    Some(match classification.capture.as_str() {
+    Some(match classification.capture {
       "comment" => SemanticKind::Comment,
       "keyword" => SemanticKind::Keyword,
       "operator" => SemanticKind::Operator,

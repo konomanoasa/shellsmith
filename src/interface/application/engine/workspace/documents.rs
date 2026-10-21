@@ -11,25 +11,21 @@ use engine::check_cancelled;
 use engine::{Analysis, AnalysisRequest};
 use engine::{
   Change, DependencyState, DocumentId, Error, ReferenceId, Revision, Snapshot,
-  SourceReference, Value,
+  SourceReference,
 };
 use engine::{Occurrence, OccurrenceId, Symbol, SymbolId};
 
 #[derive(Clone, Debug, Default)]
 pub struct Workspace {
-  pub(in crate::interface::application::engine) documents:
-    BTreeMap<DocumentId, Arc<Document>>,
+  pub(super) documents: BTreeMap<DocumentId, Arc<Document>>,
   revisions: BTreeMap<DocumentId, Revision>,
   dependencies: BTreeMap<ReferenceId, DependencyState>,
   incoming: BTreeMap<DocumentId, BTreeSet<ReferenceId>>,
   symbols: BTreeMap<Vec<u8>, BTreeSet<SymbolId>>,
   pub(in crate::interface::application::engine) generation: Arc<()>,
-  analysis_request: Option<AnalysisRequest>,
   analysis: Option<Arc<Analysis>>,
-  pub(in crate::interface::application::engine) derived:
-    BTreeMap<DocumentId, DerivedUnit>,
-  pub(in crate::interface::application::engine) derived_keys:
-    BTreeMap<DerivedKey, Snapshot>,
+  pub(super) derived: BTreeMap<DocumentId, DerivedUnit>,
+  pub(super) derived_keys: BTreeMap<DerivedKey, Snapshot>,
   pub(super) programs: BTreeMap<Arc<[u8]>, Arc<Document>>,
   pub(super) derived_entries: BTreeMap<DocumentId, BTreeSet<DocumentId>>,
   pub(super) indexed: BTreeMap<DocumentId, (usize, Arc<DerivedDocuments>)>,
@@ -38,21 +34,7 @@ pub struct Workspace {
 
 impl Workspace {
   pub fn clear_analysis(&mut self) {
-    self.analysis_request = None;
     self.changed();
-  }
-
-  pub fn set_analysis_request(
-    &mut self,
-    request: AnalysisRequest,
-  ) -> Result<(), Error> {
-    self.check_current(request.entry)?;
-    engine::analysis::validate(&request)?;
-    if self.analysis_request.as_ref() != Some(&request) {
-      self.analysis_request = Some(request);
-      self.changed();
-    }
-    Ok(())
   }
 
   pub fn publish_analysis(&mut self, analysis: Analysis) -> Result<(), Error> {
@@ -77,10 +59,17 @@ impl Workspace {
     self.documents.get(&id).map(AsRef::as_ref)
   }
 
-  pub(crate) fn shared_documents(
+  pub(in crate::interface::application) fn shared_documents(
     &self,
   ) -> impl Iterator<Item = Arc<Document>> + '_ {
     self.documents.values().cloned()
+  }
+
+  pub(in crate::interface::application::engine) fn shared_document(
+    &self,
+    id: DocumentId,
+  ) -> Option<Arc<Document>> {
+    self.documents.get(&id).cloned()
   }
 
   pub fn documents(&self) -> impl Iterator<Item = &Document> {
@@ -117,9 +106,7 @@ impl Workspace {
     self
       .symbols
       .iter()
-      .filter(move |(name, _)| {
-        query.is_empty() || name.windows(query.len()).any(|part| part == query)
-      })
+      .filter(move |(name, _)| matches_query(name, query))
       .flat_map(|(_, ids)| ids)
       .filter_map(|id| self.symbol(*id))
   }
@@ -154,14 +141,10 @@ impl Workspace {
     self.insert_arc(document)
   }
 
-  pub(super) fn insert_document(
+  pub(super) fn insert_arc(
     &mut self,
-    document: Document,
+    document: Arc<Document>,
   ) -> Result<Change, Error> {
-    self.insert_arc(Arc::new(document))
-  }
-
-  fn insert_arc(&mut self, document: Arc<Document>) -> Result<Change, Error> {
     let snapshot = document.snapshot();
     self.check_new(snapshot)?;
     let affected = self.affected(snapshot.document);
@@ -174,13 +157,12 @@ impl Workspace {
         .insert(symbol.id);
     }
     for reference in document.references() {
-      let state = match &reference.value {
-        Value::Literal(_) => DependencyState::Pending,
-        value @ (Value::Unknown(_) | Value::Partial(_)) => {
-          let issue = value.issue().expect("unknown reference");
+      let state = reference
+        .value
+        .issue()
+        .map_or(DependencyState::Pending, |issue| {
           DependencyState::Unresolved(format!("{issue:?}"))
-        }
-      };
+        });
       self.dependencies.insert(reference.id, state);
     }
     self.revisions.insert(snapshot.document, snapshot.revision);
@@ -264,13 +246,7 @@ impl Workspace {
     let mut pending = vec![root];
     while let Some(id) = pending.pop() {
       if self.documents.contains_key(&id) && seen.insert(id) {
-        pending.extend(
-          self
-            .derived
-            .iter()
-            .filter(|(_, unit)| unit.origin.argument.snapshot.document == id)
-            .map(|(child, _)| *child),
-        );
+        pending.extend(self.derived_children(id));
         pending.extend(
           self
             .dependencies(id)
@@ -279,6 +255,18 @@ impl Workspace {
       }
     }
     seen.into_iter().collect()
+  }
+
+  /// The derived documents whose text comes from `owner`.
+  fn derived_children(
+    &self,
+    owner: DocumentId,
+  ) -> impl Iterator<Item = DocumentId> + '_ {
+    self
+      .derived
+      .iter()
+      .filter(move |(_, unit)| unit.origin.argument.snapshot.document == owner)
+      .map(|(child, _)| *child)
   }
 
   fn check_new(&self, snapshot: Snapshot) -> Result<(), Error> {
@@ -293,9 +281,12 @@ impl Workspace {
     }
   }
 
-  fn check_current(&self, snapshot: Snapshot) -> Result<(), Error> {
+  pub(super) fn check_current(
+    &self,
+    snapshot: Snapshot,
+  ) -> Result<&Document, Error> {
     match self.document(snapshot.document) {
-      Some(document) if document.snapshot() == snapshot => Ok(()),
+      Some(document) if document.snapshot() == snapshot => Ok(document),
       Some(_) => Err(Error::StaleSnapshot(snapshot)),
       None => Err(Error::UnknownDocument(snapshot.document)),
     }
@@ -309,13 +300,7 @@ impl Workspace {
         if let Some(origin) = self.derived_origin(id) {
           pending.push(origin.argument.snapshot.document);
         }
-        pending.extend(
-          self
-            .derived
-            .iter()
-            .filter(|(_, unit)| unit.origin.argument.snapshot.document == id)
-            .map(|(child, _)| *child),
-        );
+        pending.extend(self.derived_children(id));
         pending.extend(
           self
             .dependents(id)
@@ -344,12 +329,7 @@ impl Workspace {
   pub(super) fn discard(&mut self, id: DocumentId) {
     let mut pending = vec![id];
     while let Some(parent) = pending.pop() {
-      let children: Vec<_> = self
-        .derived
-        .iter()
-        .filter(|(_, unit)| unit.origin.argument.snapshot.document == parent)
-        .map(|(id, _)| *id)
-        .collect();
+      let children: Vec<_> = self.derived_children(parent).collect();
       pending.extend(children);
       if let Some(unit) = self.derived.remove(&parent) {
         self.derived_keys.remove(&unit.key);
@@ -400,47 +380,38 @@ impl Workspace {
 }
 
 impl Workspace {
-  pub fn analyze(&mut self, cancelled: &AtomicBool) -> Result<Analysis, Error> {
-    let request = self.analysis_request.clone().ok_or_else(|| {
-      Error::InvalidAnalysis("No analysis request configured".into())
-    })?;
-    self.analyze_with_inputs(request, None, cancelled)
-  }
-
-  pub fn analyze_with(
+  /// Commits a new result generation only when the complete analysis succeeds.
+  pub fn analyze(
     &mut self,
-    request: super::super::AnalysisRequest,
+    request: AnalysisRequest,
     inputs: &mut dyn super::super::AnalysisInputs,
     cancelled: &AtomicBool,
   ) -> Result<Analysis, Error> {
-    self.analyze_with_inputs(request, Some(inputs), cancelled)
-  }
-
-  fn analyze_with_inputs(
-    &mut self,
-    request: super::super::AnalysisRequest,
-    inputs: Option<&mut dyn super::super::AnalysisInputs>,
-    cancelled: &AtomicBool,
-  ) -> Result<Analysis, Error> {
+    check_cancelled(cancelled)?;
+    self.check_current(request.entry)?;
+    request.limits.validate()?;
     let mut staged = self.clone();
+    staged.changed();
     staged.index_document(request.entry.document, request.limits, cancelled)?;
-    staged.set_analysis_request(request.clone())?;
     let arena = typed_arena::Arena::new();
     let mut result = super::super::analysis::analyze(
       &mut staged,
       request,
       &arena,
-      inputs.map(|input| input as &mut dyn super::super::AnalysisInputs),
+      inputs,
       cancelled,
     )?;
-    staged.prune_derived(
-      result.request().entry.document,
-      &result.derived.candidates,
-    );
+    staged.prune_derived(result.request().entry.document, &result.derived);
     result.synchronize(&staged);
     check_cancelled(cancelled)?;
     staged.analysis = None;
     *self = staged;
     Ok(result)
   }
+}
+
+/// Whether a symbol `name` matches a search `query`, which matches every name
+/// when empty and otherwise any name that contains it.
+pub(super) fn matches_query(name: &[u8], query: &[u8]) -> bool {
+  query.is_empty() || name.windows(query.len()).any(|part| part == query)
 }

@@ -14,8 +14,13 @@ mod classification {
     let mut request = AnalysisRequest::new(document.snapshot());
     request.initial = InitialEnvironment::empty();
     workspace.insert(document).unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let analysis = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     workspace.publish_analysis(analysis).unwrap();
     workspace
   }
@@ -469,6 +474,27 @@ mod classification {
   }
 
   #[test]
+  fn trap_actions_are_shell_bodies_only_when_no_option_may_precede_them() {
+    for (action, body) in [
+      ("\"echo $x\" INT", Some("\"echo $x\"")),
+      ("-- \"-$x\" INT", Some("\"-$x\"")),
+      ("\"-$x\" INT", None),
+      ("\"$x\" INT", None),
+    ] {
+      let source = format!("x=$(external); trap {action}");
+      let workspace = workspace(&source);
+      let bodies: Vec<_> = workspace
+        .analysis()
+        .unwrap()
+        .argument_roles()
+        .filter(|role| role.kind == Some(ArgumentKind::ShellBody))
+        .map(|role| &source[role.location.bytes.clone()])
+        .collect();
+      assert_eq!(bodies, Vec::from_iter(body), "{source}");
+    }
+  }
+
+  #[test]
   fn declaration_argument_roles_never_color_assignment_values_as_variable_names()
    {
     for source in [
@@ -584,6 +610,26 @@ mod classification {
   }
 
   #[test]
+  fn syntax_resolutions_do_not_depend_on_earlier_queries() {
+    let source = "f() { :; }\nf\n";
+    let document = support::parse(1, 1, source);
+    let snapshot = document.snapshot();
+    let definition = document.symbols()[0].id;
+    let mut workspace = Workspace::default();
+    workspace.insert(document).unwrap();
+    let at = source.rfind('f').unwrap();
+    let before = workspace.resolution_at(snapshot, at).unwrap();
+    workspace.semantic_spans(DocumentId(1)).unwrap();
+    let after = workspace.resolution_at(snapshot, at).unwrap();
+    for resolution in [before, after] {
+      assert_eq!(
+        resolution.map(|resolution| resolution.candidates),
+        Some([definition].into())
+      );
+    }
+  }
+
+  #[test]
   fn recovery_preserves_prior_calls_and_independent_command_facts() {
     let source = "before() { :; }; before; :; )\nafter() { :; }; after\n";
     let document = support::parse(1, 1, source);
@@ -592,8 +638,13 @@ mod classification {
     request.initial = InitialEnvironment::empty();
     let mut workspace = Workspace::default();
     workspace.insert(document).unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let analysis = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     assert!(analysis.gaps().iter().any(|gap| {
       gap.issue
         == shellsmith::interface::application::engine::ResolutionIssue::Recovery
@@ -835,8 +886,13 @@ mod classification {
     let mut request = AnalysisRequest::new(snapshot.snapshot());
     request.initial = InitialEnvironment::empty();
     workspace.insert(snapshot).unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let analysis = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     workspace.publish_analysis(analysis).unwrap();
     assert_eq!(workspace.documents().count(), 2);
     assert_eq!(workspace.symbols_named(b"old_name").count(), 0);
@@ -947,8 +1003,13 @@ mod environment {
       .insert(b"HOME".to_vec(), b"/initial".to_vec());
     let mut workspace = Workspace::default();
     workspace.insert(document).unwrap();
-    workspace.set_analysis_request(request).unwrap();
-    let analysis = workspace.analyze(&AtomicBool::new(false)).unwrap();
+    let analysis = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
     workspace.publish_analysis(analysis).unwrap();
     let spans = workspace.semantic_spans(DocumentId(1)).unwrap();
     workspace

@@ -1,7 +1,6 @@
-use super::{
-  deferred::InvariantInputs, execution, request::validate,
-  sources::SourceTracking,
-};
+use super::expansion::ArithmeticAccess;
+use super::result::EffectKey;
+use super::{deferred::InvariantInputs, execution, sources::SourceTracking};
 use crate::interface::application::engine;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -9,17 +8,14 @@ use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
 use engine::check_cancelled;
-use engine::workspace::derived::{
-  DerivedCandidate, DerivedDocuments, DerivedKey,
-};
 use engine::{
-  Access, Error, Location, OccurrenceId, OccurrenceKind, ReferenceId, Snapshot,
-  SymbolId, SymbolKind, UseSite, Workspace,
+  Access, Error, Location, OccurrenceId, ReferenceId, Snapshot, SymbolId,
+  SymbolKind, UseSite, Workspace,
 };
 use engine::{
   Analysis, AnalysisGap, AnalysisInputs, AnalysisRequest, DerivedOrigin,
-  EffectTarget, ExecutionContext, ExecutionContextId, ExecutionKind,
-  Resolution, ResolutionIssue, ResolvedUse,
+  ExecutionContext, ExecutionContextId, ExecutionKind, Resolution,
+  ResolutionIssue, ResolvedUse,
 };
 use execution::Environment;
 use execution::Task;
@@ -40,21 +36,36 @@ impl Frame {
       bytes: node.byte_range(),
     }
   }
+
+  /// Identifies the gap or unknown effect of `issue` at `node`.
+  pub(super) fn effect_key(
+    self,
+    node: Node<'_>,
+    issue: ResolutionIssue,
+  ) -> EffectKey {
+    (
+      self.context,
+      self.snapshot,
+      node.start_byte(),
+      node.end_byte(),
+      issue,
+    )
+  }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct ContextKey {
-  pub(super) parent: ExecutionContextId,
-  pub(super) kind: ExecutionKind,
-  pub(super) snapshot: Snapshot,
-  pub(super) start: usize,
-  pub(super) end: usize,
+struct ContextKey {
+  parent: ExecutionContextId,
+  kind: ExecutionKind,
+  snapshot: Snapshot,
+  start: usize,
+  end: usize,
 }
 
 pub(super) struct AnalysisWorkspace<'a> {
   pub(super) workspace: &'a mut Workspace,
-  pub(super) arena: &'a typed_arena::Arena<Arc<engine::Document>>,
-  pub(super) documents: BTreeMap<engine::DocumentId, &'a engine::Document>,
+  arena: &'a typed_arena::Arena<Arc<engine::Document>>,
+  documents: BTreeMap<engine::DocumentId, &'a engine::Document>,
 }
 
 impl<'a> AnalysisWorkspace<'a> {
@@ -63,11 +74,10 @@ impl<'a> AnalysisWorkspace<'a> {
     arena: &'a typed_arena::Arena<Arc<engine::Document>>,
   ) -> Self {
     let documents = workspace
-      .documents
-      .iter()
-      .map(|(id, doc)| {
-        let document: &'a engine::Document = arena.alloc(doc.clone());
-        (*id, document)
+      .shared_documents()
+      .map(|document| {
+        let document: &'a engine::Document = arena.alloc(document);
+        (document.snapshot().document, document)
       })
       .collect();
     Self {
@@ -84,6 +94,14 @@ impl<'a> AnalysisWorkspace<'a> {
     self.documents.get(&id).copied()
   }
 
+  pub(super) fn source(&self, id: engine::DocumentId) -> &'a [u8] {
+    self
+      .document(id)
+      .expect("analyzed document")
+      .source()
+      .as_bytes()
+  }
+
   pub(super) fn occurrence(
     &self,
     id: OccurrenceId,
@@ -95,57 +113,50 @@ impl<'a> AnalysisWorkspace<'a> {
     self.document(id.snapshot.document)?.symbol(id)
   }
 
-  pub(super) fn register(
-    &mut self,
-    snapshot: Snapshot,
-  ) -> &'a engine::Document {
-    let document: &'a engine::Document = self
-      .arena
-      .alloc(self.workspace.documents[&snapshot.document].clone());
+  /// Adds the workspace document `snapshot` to the analysis, returning it
+  /// when it was not part of the analysis.
+  fn register(&mut self, snapshot: Snapshot) -> Option<&'a engine::Document> {
+    if self.documents.contains_key(&snapshot.document) {
+      return None;
+    }
+    let document: &'a engine::Document = self.arena.alloc(
+      self
+        .workspace
+        .shared_document(snapshot.document)
+        .expect("workspace document"),
+    );
     self.documents.insert(snapshot.document, document);
-    document
-  }
-}
-
-impl std::ops::Deref for AnalysisWorkspace<'_> {
-  type Target = Workspace;
-  fn deref(&self) -> &Workspace {
-    self.workspace
+    Some(document)
   }
 }
 
 pub(super) struct Resolver<'a> {
   pub(super) workspace: AnalysisWorkspace<'a>,
-  pub(super) inputs: Option<&'a mut dyn AnalysisInputs>,
+  pub(super) inputs: &'a mut dyn AnalysisInputs,
   pub(super) error: Option<Error>,
   pub(super) sources: SourceTracking,
   pub(super) cancelled: &'a AtomicBool,
   pub(super) result: Analysis,
   pub(super) index: Index<'a>,
-  pub(super) contexts: BTreeMap<ContextKey, ExecutionContextId>,
-  pub(super) gaps:
-    BTreeSet<(ExecutionContextId, Snapshot, usize, usize, ResolutionIssue)>,
+  contexts: BTreeMap<ContextKey, ExecutionContextId>,
+  gaps: BTreeSet<EffectKey>,
   pub(super) invariants: InvariantInputs,
   pub(super) track_invariants: bool,
+  pub(super) arithmetic: ArithmeticAccess,
 }
 
 pub(in crate::interface::application::engine) fn analyze<'a>(
   workspace: &'a mut Workspace,
   request: AnalysisRequest,
   arena: &'a typed_arena::Arena<Arc<engine::Document>>,
-  inputs: Option<&'a mut (dyn AnalysisInputs + 'a)>,
+  inputs: &'a mut dyn AnalysisInputs,
   cancelled: &'a AtomicBool,
 ) -> Result<Analysis, Error> {
   check_cancelled(cancelled)?;
-  validate(&request)?;
   let workspace = AnalysisWorkspace::new(workspace, arena);
-  let generation = workspace.generation.clone();
   let document = workspace
     .document(request.entry.document)
-    .ok_or(Error::UnknownDocument(request.entry.document))?;
-  if document.snapshot() != request.entry {
-    return Err(Error::StaleSnapshot(request.entry));
-  }
+    .expect("analysis entry");
   let root = document.tree.root_node();
   let track_invariants =
     document.has_body_candidates() || !document.references().is_empty();
@@ -158,8 +169,12 @@ pub(in crate::interface::application::engine) fn analyze<'a>(
     dynamic_loops: false,
     returnable: false,
   };
-  let mut index = Index::new(workspace.documents.values().copied(), cancelled)?;
-  let readable = std::mem::take(&mut index.readable);
+  let mut readable = BTreeSet::new();
+  let index = Index::new(
+    workspace.documents.values().copied(),
+    &mut readable,
+    cancelled,
+  )?;
   let mut resolver = Resolver {
     workspace,
     inputs,
@@ -171,40 +186,24 @@ pub(in crate::interface::application::engine) fn analyze<'a>(
     gaps: BTreeSet::new(),
     invariants: InvariantInputs::default(),
     track_invariants,
-    result: Analysis {
-      argument_roles: BTreeMap::new(),
-      argument_definitions: BTreeMap::new(),
-      effects: BTreeMap::new(),
-      queries: BTreeSet::new(),
-      derived: DerivedDocuments::default(),
-      attributes: BTreeMap::new(),
-      generation,
+    arithmetic: ArithmeticAccess::default(),
+    result: Analysis::new(
       request,
-      contexts: vec![ExecutionContext {
+      ExecutionContext {
         id: context,
         parent: None,
         environment: context,
         kind: ExecutionKind::Entry,
         location: frame.location(root),
-      }],
-      uses: BTreeMap::new(),
-      writes: BTreeSet::new(),
-      temporary: BTreeMap::new(),
-      gaps: Vec::new(),
-      snapshots: Vec::new(),
-      source_bindings: BTreeMap::new(),
+      },
       readable,
-      references: BTreeMap::new(),
-      source_inputs: BTreeMap::new(),
-      source_operands: BTreeMap::new(),
-      values: BTreeMap::new(),
-    },
+    ),
   };
   resolver.run(Task::eval(root, initial, frame))?;
   resolver.finish()
 }
 
-impl<'a> Resolver<'a> {
+impl Resolver<'_> {
   fn finish(mut self) -> Result<Analysis, Error> {
     self.analyze_deferred()?;
     let mut derived = std::mem::take(&mut self.result.derived);
@@ -215,9 +214,8 @@ impl<'a> Resolver<'a> {
       .map(|context| context.location.snapshot)
       .chain(
         derived
-          .candidates
-          .keys()
-          .filter_map(|key| self.workspace.derived_keys.get(key).copied()),
+          .materialized(self.workspace.workspace)
+          .map(|(_, snapshot)| snapshot),
       )
       .collect();
     derived.collect(
@@ -234,34 +232,11 @@ impl<'a> Resolver<'a> {
       return Err(error);
     }
     self.commit_sources()?;
-    for (key, site) in &mut self.result.uses {
-      if matches!(site.site, UseSite::Argument { .. })
-        && self
-          .result
-          .argument_roles
-          .get(&(site.site, site.context))
-          .is_none_or(|role| !role.is_reference())
-      {
-        site
-          .resolution
-          .issues
-          .insert(ResolutionIssue::UnknownEffect);
-      }
-      check_cancelled(self.cancelled)?;
-      for candidate in &site.resolution.candidates {
-        self
-          .result
-          .references
-          .entry(*candidate)
-          .or_default()
-          .insert(*key);
-      }
-    }
-    check_cancelled(self.cancelled)?;
+    self.result.index_uses(self.cancelled)?;
     Ok(self.result)
   }
 
-  pub(in crate::interface::application::engine) fn ancestors(
+  pub(super) fn ancestors(
     &self,
     frame: Frame,
   ) -> impl Iterator<Item = &ExecutionContext> {
@@ -271,112 +246,45 @@ impl<'a> Resolver<'a> {
     .map(|id| &self.result.contexts[id.0])
   }
 
-  pub(super) fn expansion_targets(
-    &self,
-    nodes: impl IntoIterator<Item = Node<'a>>,
-    frame: Frame,
-  ) -> BTreeSet<EffectTarget> {
-    let mut pending: Vec<_> = nodes.into_iter().collect();
-    let mut targets = BTreeSet::new();
-    while let Some(node) = pending.pop() {
-      match node.kind() {
-        "command_substitution"
-        | "backquote_substitution"
-        | "subshell"
-        | "function_definition" => continue,
-        "arithmetic_dynamic_expression"
-        | "parenthesized_arithmetic_dynamic_source" => {
-          targets.insert(EffectTarget::Variables);
-        }
-        "io_here" => {
-          pending.extend(
-            self
-              .index
-              .heredocs
-              .get(&(frame.snapshot, node.start_byte()))
-              .copied(),
-          );
-        }
-        _ => {}
-      }
-      if let Some(site) = self
-        .site(node, frame)
-        .and_then(|id| self.workspace.occurrence(id))
-        && site.kind != OccurrenceKind::Command
-        && site.access != Access::Read
-      {
-        targets.insert(match &site.name {
-          engine::Value::Literal(name) => EffectTarget::Variable(name.clone()),
-          engine::Value::Unknown(_) | engine::Value::Partial(_) => {
-            EffectTarget::Variables
-          }
-        });
-      }
-      pending.extend(execution::children(node));
-    }
-    targets
-  }
-
-  pub(in crate::interface::application::engine) fn derive_body(
+  pub(super) fn derive_body(
     &mut self,
     origin: DerivedOrigin,
     body: &[u8],
-  ) -> DerivedKey {
-    let (key, origin) = DerivedKey::new(origin, body, &self.workspace.derived);
-    let candidate = DerivedCandidate {
-      key: key.clone(),
-      origin,
-    };
-    let result = self
+  ) -> Option<Snapshot> {
+    let snapshot = self
       .result
       .derived
-      .materialize(self.workspace.workspace, candidate, self.cancelled)
-      .and_then(|snapshot| {
-        if !self.workspace.documents.contains_key(&snapshot.document) {
-          self.register_document(snapshot)?;
-        }
-        Ok(())
-      });
-    if let Err(error) = result {
+      .derive(self.workspace.workspace, origin, body, self.cancelled)
+      .map_err(|error| self.error = Some(error))
+      .ok()?;
+    if let Err(error) = self.register_document(snapshot) {
       self.error = Some(error);
     }
-    key
+    Some(snapshot)
   }
 
   pub(super) fn input(
     &mut self,
-    query: engine::InputQuery,
+    query: &engine::InputQuery,
   ) -> engine::InputResult {
-    if !self.result.request.inputs.contains_key(&query)
-      && let Some(inputs) = &mut self.inputs
-    {
-      match inputs.evaluate(&query) {
-        Ok(value) => {
-          self.result.request.inputs.insert(query.clone(), value);
-        }
-        Err(error) => {
-          self.error = Some(error);
-        }
+    match self.inputs.evaluate(query) {
+      Ok(result) => result,
+      Err(error) => {
+        self.error = Some(error);
+        engine::InputResult::Unknown(engine::ValueIssue::Dynamic)
       }
     }
-    let result = self
-      .result
-      .request
-      .inputs
-      .get(&query)
-      .cloned()
-      .unwrap_or(engine::InputResult::Unknown(engine::ValueIssue::Dynamic));
-    self.result.queries.insert(query);
-    result
   }
 
   pub(super) fn register_document(
     &mut self,
     snapshot: Snapshot,
   ) -> Result<(), Error> {
-    let document = self.workspace.register(snapshot);
-    self.index.add(document, self.cancelled)?;
-    self.result.readable.append(&mut self.index.readable);
+    if let Some(document) = self.workspace.register(snapshot) {
+      self
+        .index
+        .add(document, &mut self.result.readable, self.cancelled)?;
+    }
     Ok(())
   }
 
@@ -391,13 +299,7 @@ impl<'a> Resolver<'a> {
       location: frame.location(node),
       issue,
     };
-    if self.gaps.insert((
-      frame.context,
-      frame.snapshot,
-      node.start_byte(),
-      node.end_byte(),
-      issue,
-    )) {
+    if self.gaps.insert(frame.effect_key(node, issue)) {
       self.result.gaps.push(gap);
     }
   }
@@ -427,26 +329,19 @@ impl<'a> Resolver<'a> {
       .or_insert(state);
   }
 
-  pub(super) fn record(
-    &mut self,
-    id: OccurrenceId,
-    context: ExecutionContextId,
-    mut resolution: Resolution,
-    environment: &Environment,
-  ) {
-    if self.workspace.occurrence(id).is_some_and(|site|
-      site.kind != OccurrenceKind::Command && matches!(&site.name, engine::Value::Literal(name) if environment.uncertain_variable(name))) {
-      resolution.issues.insert(ResolutionIssue::EvaluationOrder);
-    }
-    self.record_use(UseSite::Syntax(id), context, resolution);
-  }
-
+  /// Records the resolution of a use, which reads the variable `variable`
+  /// if any.
   pub(super) fn record_use(
     &mut self,
     site: UseSite,
     context: ExecutionContextId,
-    resolution: Resolution,
+    mut resolution: Resolution,
+    variable: Option<&[u8]>,
+    env: &Environment,
   ) {
+    if variable.is_some_and(|name| env.uncertain_variable(name)) {
+      resolution.issues.insert(ResolutionIssue::EvaluationOrder);
+    }
     self
       .result
       .uses
@@ -464,11 +359,7 @@ impl<'a> Resolver<'a> {
     node: Node<'_>,
     frame: Frame,
   ) -> Option<OccurrenceId> {
-    self
-      .index
-      .sites
-      .get(&(frame.snapshot, node.start_byte(), node.end_byte()))
-      .copied()
+    self.index.site(frame.snapshot, node)
   }
 
   pub(super) fn execution(
@@ -477,15 +368,16 @@ impl<'a> Resolver<'a> {
     frame: Frame,
     kind: ExecutionKind,
     snapshot: Snapshot,
-    separate: bool,
   ) -> Frame {
+    let separate = kind.separate();
     let boundary =
       matches!(kind, ExecutionKind::Function(_) | ExecutionKind::Source(_));
     let frame = Frame {
       loops: if separate || boundary { 0 } else { frame.loops },
       dynamic_loops: !separate
         && (frame.dynamic_loops || (boundary && frame.loops > 0)),
-      returnable: boundary || frame.returnable,
+      returnable: !matches!(kind, ExecutionKind::Deferred(_))
+        && (boundary || frame.returnable),
       ..frame
     };
     let key = ContextKey {
@@ -525,17 +417,59 @@ impl<'a> Resolver<'a> {
 }
 
 pub(super) struct Index<'a> {
-  pub sites: BTreeMap<(Snapshot, usize, usize), OccurrenceId>,
-  pub definitions: BTreeMap<OccurrenceId, SymbolId>,
-  pub functions: BTreeMap<SymbolId, Node<'a>>,
-  pub heredocs: BTreeMap<(Snapshot, usize), Node<'a>>,
-  pub sources: BTreeMap<(Snapshot, usize, usize), ReferenceId>,
-  pub readable: BTreeSet<OccurrenceId>,
+  sites: BTreeMap<(Snapshot, usize, usize), OccurrenceId>,
+  definitions: BTreeMap<OccurrenceId, SymbolId>,
+  functions: BTreeMap<SymbolId, Node<'a>>,
+  heredocs: BTreeMap<(Snapshot, usize), Node<'a>>,
+  sources: BTreeMap<(Snapshot, usize, usize), ReferenceId>,
 }
 
 impl<'a> Index<'a> {
+  pub fn site(
+    &self,
+    snapshot: Snapshot,
+    node: Node<'_>,
+  ) -> Option<OccurrenceId> {
+    self
+      .sites
+      .get(&(snapshot, node.start_byte(), node.end_byte()))
+      .copied()
+  }
+
+  /// The symbol that the definition `id` defines.
+  pub fn defined_symbol(&self, id: OccurrenceId) -> Option<SymbolId> {
+    self.definitions.get(&id).copied()
+  }
+
+  pub fn function_body(&self, id: SymbolId) -> Option<Node<'a>> {
+    self.functions.get(&id).copied()
+  }
+
+  /// The body of the here-document that the redirection `node` reads.
+  pub fn heredoc(
+    &self,
+    snapshot: Snapshot,
+    node: Node<'_>,
+  ) -> Option<Node<'a>> {
+    self.heredocs.get(&(snapshot, node.start_byte())).copied()
+  }
+
+  /// The `.` reference of the command `node`.
+  pub fn source(
+    &self,
+    snapshot: Snapshot,
+    node: Node<'_>,
+  ) -> Option<ReferenceId> {
+    self
+      .sources
+      .get(&(snapshot, node.start_byte(), node.end_byte()))
+      .copied()
+  }
+
+  /// Indexes `documents` and adds their reading sites to `readable`.
   pub fn new(
     documents: impl Iterator<Item = &'a engine::Document>,
+    readable: &mut BTreeSet<OccurrenceId>,
     cancelled: &AtomicBool,
   ) -> Result<Self, Error> {
     let mut index = Self {
@@ -544,17 +478,17 @@ impl<'a> Index<'a> {
       functions: BTreeMap::new(),
       heredocs: BTreeMap::new(),
       sources: BTreeMap::new(),
-      readable: BTreeSet::new(),
     };
     for document in documents {
-      index.add(document, cancelled)?;
+      index.add(document, readable, cancelled)?;
     }
     Ok(index)
   }
 
-  pub(super) fn add(
+  fn add(
     &mut self,
     document: &'a engine::Document,
+    readable: &mut BTreeSet<OccurrenceId>,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
@@ -580,7 +514,7 @@ impl<'a> Index<'a> {
         site.id,
       );
       if !matches!(site.access, Access::Definition | Access::Write) {
-        self.readable.insert(site.id);
+        readable.insert(site.id);
       }
     }
     for symbol in document.symbols() {

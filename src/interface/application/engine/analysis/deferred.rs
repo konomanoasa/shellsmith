@@ -6,8 +6,21 @@ use crate::interface::application::engine::{
   Snapshot, Value, ValueIssue, check_cancelled,
 };
 use imbl::{OrdMap, ordmap::DiffItem};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
+
+/// Whether analyzing the body `document` depends on the environment that
+/// reaches its registration.
+fn needs_environment(document: &engine::Document) -> bool {
+  document.occurrences().iter().any(|site| {
+    site.kind != engine::OccurrenceKind::Command
+      || super::invariant_command(&site.name).is_none()
+  }) || document.has_body_candidates()
+    || !document.references().is_empty()
+    || document.argument_roles().iter().any(|role| {
+      !matches!(role.kind, None | Some(engine::ArgumentKind::Number))
+    })
+}
 
 impl Resolver<'_> {
   pub(super) fn defer_body(
@@ -38,13 +51,13 @@ impl Resolver<'_> {
         .expect("body registration")
         .incomplete = true;
       self.gap(node, frame, ResolutionIssue::Recursion);
-    } else if self
-      .workspace
-      .workspace
-      .document(snapshot.document)
-      .expect("body document")
-      .needs_environment()
-    {
+    } else if needs_environment(
+      self
+        .workspace
+        .workspace
+        .document(snapshot.document)
+        .expect("body document"),
+    ) {
       let environment = self.result.contexts[frame.context.0].environment;
       self
         .invariants
@@ -61,6 +74,7 @@ impl Resolver<'_> {
   ) -> bool {
     let origin = self
       .workspace
+      .workspace
       .derived_origin(body.document)
       .expect("body origin");
     let source = self
@@ -74,6 +88,7 @@ impl Resolver<'_> {
       };
       self
         .workspace
+        .workspace
         .derived_origin(ancestor.document)
         .is_some_and(|previous| previous.argument == origin.argument)
         && self
@@ -86,13 +101,13 @@ impl Resolver<'_> {
 
   pub(super) fn analyze_deferred(&mut self) -> Result<(), Error> {
     loop {
-      let pending = self.invariants.take_pending();
-      if pending.len() == 0 {
+      let pending = std::mem::take(&mut self.invariants.pending);
+      if pending.is_empty() {
         return Ok(());
       }
       let incomplete =
         self.result.derived.incomplete_bodies(Some(&self.result));
-      for input in pending {
+      for input in pending.into_values() {
         check_cancelled(self.cancelled)?;
         if incomplete.contains(&input.snapshot) {
           continue;
@@ -115,17 +130,9 @@ impl Resolver<'_> {
           input.frame,
           ExecutionKind::Deferred(input.snapshot),
           input.snapshot,
-          true,
         );
         self.sources.start_root(input.snapshot);
-        self.run(Task::eval(
-          document.tree.root_node(),
-          env,
-          Frame {
-            returnable: false,
-            ..frame
-          },
-        ))?;
+        self.run(Task::eval(document.tree.root_node(), env, frame))?;
       }
     }
   }
@@ -135,7 +142,7 @@ struct CapturedState {
   variables: Names,
   functions: Names,
   readonly: OrdMap<Vec<u8>, bool>,
-  unknown_attributes: bool,
+  unknown_attributes: BTreeSet<Value>,
   cwd: Value,
   noglob: Option<bool>,
   directory_variables_modified: bool,
@@ -147,7 +154,7 @@ impl From<&Environment> for CapturedState {
       variables: env.variables.clone(),
       functions: env.functions.clone(),
       readonly: env.readonly.clone(),
-      unknown_attributes: env.unknown_attributes,
+      unknown_attributes: env.unknown_attributes.clone(),
       cwd: env.cwd.clone(),
       noglob: env.noglob,
       directory_variables_modified: env.directory_variables_modified,
@@ -203,7 +210,11 @@ impl NameChanges {
     } else {
       for (pattern, revision) in &self.patterns {
         if *revision > since {
-          names.restrict(pattern.clone(), ResolutionIssue::UnknownEffect);
+          names.restrict(
+            pattern.clone(),
+            ResolutionIssue::UnknownEffect,
+            pattern.issue().unwrap_or(ValueIssue::Dynamic),
+          );
         }
       }
     }
@@ -226,10 +237,10 @@ struct ObservedState {
   changes: StateChanges,
 }
 
-pub(super) struct DeferredInput {
-  pub snapshot: Snapshot,
-  pub registration: Location,
-  pub frame: Frame,
+struct DeferredInput {
+  snapshot: Snapshot,
+  registration: Location,
+  frame: Frame,
   environment: ExecutionContextId,
   state: CapturedState,
   revision: usize,
@@ -243,7 +254,7 @@ pub(super) struct InvariantInputs {
 }
 
 impl InvariantInputs {
-  pub fn capture(
+  fn capture(
     &mut self,
     snapshot: Snapshot,
     registration: Location,
@@ -272,7 +283,7 @@ impl InvariantInputs {
       });
   }
 
-  pub fn observe(
+  pub(super) fn observe(
     &mut self,
     environment: ExecutionContextId,
     env: &Environment,
@@ -303,7 +314,10 @@ impl InvariantInputs {
     observed.state.readonly.clone_from(&env.readonly);
     if observed.state.unknown_attributes != env.unknown_attributes {
       observed.changes.attributes = revision;
-      observed.state.unknown_attributes = env.unknown_attributes;
+      observed
+        .state
+        .unknown_attributes
+        .clone_from(&env.unknown_attributes);
     }
     if observed.state.cwd != env.cwd {
       observed.changes.cwd = revision;
@@ -322,23 +336,17 @@ impl InvariantInputs {
     }
   }
 
-  pub fn take_pending(
-    &mut self,
-  ) -> std::collections::btree_map::IntoValues<
-    (Snapshot, ExecutionContextId),
-    DeferredInput,
-  > {
-    std::mem::take(&mut self.pending).into_values()
-  }
-
-  pub fn input(&self, input: &DeferredInput) -> Environment {
+  fn input(&self, input: &DeferredInput) -> Environment {
     let changes = &self.observed[&input.environment].changes;
     let mut env = Environment {
       variables: input.state.variables.clone(),
       functions: input.state.functions.clone(),
       readonly: input.state.readonly.clone(),
-      unknown_attributes: input.state.unknown_attributes
-        || changes.attributes > input.revision,
+      unknown_attributes: if changes.attributes > input.revision {
+        BTreeSet::from([Value::Unknown(ValueIssue::Dynamic)])
+      } else {
+        input.state.unknown_attributes.clone()
+      },
       cwd: if changes.cwd > input.revision {
         Value::Unknown(ValueIssue::Dynamic)
       } else {

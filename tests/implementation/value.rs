@@ -44,10 +44,17 @@ fn value_constraints_compose_soundly_and_joins_stabilize() {
   assert_eq!(joined.known_prefix(), b"/bin/");
   assert!(!joined.can_equal(b"/bin/"));
   assert!(!joined.may_be_name());
+  let mut suffixed =
+    Value::partial(Vec::new(), b"x".to_vec(), 1, ValueIssue::Dynamic);
+  suffixed.join(&literal(b""));
+  assert!(suffixed.can_equal(b""));
+  assert!(suffixed.can_equal(b"ax"));
+  assert!(!suffixed.can_equal(b"eval"));
   let values = [
     path,
     command,
     joined,
+    suffixed,
     literal(b""),
     literal(b"name"),
     Value::Unknown(ValueIssue::Dynamic),

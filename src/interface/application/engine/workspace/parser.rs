@@ -7,7 +7,6 @@ use tree_sitter::{
 };
 
 use super::names::DeferredNames;
-use crate::interface::application::engine::analysis::deferred_source_input;
 use crate::interface::application::engine::check_cancelled;
 use crate::interface::application::engine::word;
 use crate::interface::application::engine::{
@@ -15,18 +14,16 @@ use crate::interface::application::engine::{
   OccurrenceId, OccurrenceKind, Snapshot, Symbol, SymbolId, SymbolKind, Value,
   ValueIssue,
 };
-use crate::interface::application::engine::{
-  ReferenceId, SourceInput, SourceReference,
-};
+use crate::interface::application::engine::{ReferenceId, SourceReference};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 #[derive(Debug)]
 pub struct Document {
-  pub(in crate::interface::application::engine) snapshot: Snapshot,
-  pub(in crate::interface::application::engine) source: Arc<str>,
+  snapshot: Snapshot,
+  pub(super) source: Arc<str>,
   pub(in crate::interface::application::engine) tree: Tree,
-  pub(in crate::interface::application::engine) facts: Facts,
+  facts: Facts,
   classifications: Vec<Classification>,
   deferred: OnceLock<DeferredNames>,
   deferred_lock: Mutex<()>,
@@ -65,18 +62,25 @@ impl Document {
     check_cancelled(cancelled)?;
     let tree =
       tree.ok_or_else(|| Error::Parser("Parser did not complete".into()))?;
-    let facts = extract(snapshot, bytes, &tree, cancelled)?;
-    let classifications = classify(snapshot, bytes, &tree, cancelled)?;
-    let document = Self {
+    Self::build(snapshot, source.into(), tree, cancelled)
+  }
+
+  fn build(
+    snapshot: Snapshot,
+    source: Arc<str>,
+    tree: Tree,
+    cancelled: &AtomicBool,
+  ) -> Result<Self, Error> {
+    let bytes = source.as_bytes();
+    Ok(Self {
       snapshot,
-      source: source.into(),
+      facts: extract(snapshot, bytes, &tree, cancelled)?,
+      classifications: classify(snapshot, bytes, &tree, cancelled)?,
+      source,
       tree,
-      facts,
-      classifications,
       deferred: OnceLock::new(),
       deferred_lock: Mutex::new(()),
-    };
-    Ok(document)
+    })
   }
 
   #[must_use]
@@ -84,29 +88,38 @@ impl Document {
     self.snapshot
   }
 
-  pub(in crate::interface::application::engine) fn instantiate(
+  pub(super) fn instantiate(
     &self,
     snapshot: Snapshot,
     cancelled: &AtomicBool,
   ) -> Result<Self, Error> {
-    let bytes = self.source.as_bytes();
-    let document = Self {
-      snapshot,
-      source: self.source.clone(),
-      tree: self.tree.clone(),
-      facts: extract(snapshot, bytes, &self.tree, cancelled)?,
-      classifications: classify(snapshot, bytes, &self.tree, cancelled)?,
-      deferred: OnceLock::new(),
-      deferred_lock: Mutex::new(()),
-    };
-    Ok(document)
+    Self::build(snapshot, self.source.clone(), self.tree.clone(), cancelled)
   }
 
-  pub(in crate::interface::application::engine) fn deferred_resolution(
+  pub(super) fn deferred_resolution(
     &self,
     site: crate::interface::application::engine::UseSite,
   ) -> Option<crate::interface::application::engine::Resolution> {
-    self.deferred.get()?.resolution(site)
+    self
+      .deferred_names(&AtomicBool::new(false))
+      .expect("uncancelled deferred names")?
+      .resolution(site)
+  }
+
+  /// Deferred names differ from syntax only where functions are defined.
+  fn deferred_names(
+    &self,
+    cancelled: &AtomicBool,
+  ) -> Result<Option<&DeferredNames>, Error> {
+    if self
+      .symbols()
+      .iter()
+      .any(|symbol| symbol.kind == SymbolKind::Function)
+    {
+      self.deferred(cancelled).map(Some)
+    } else {
+      Ok(None)
+    }
   }
 
   pub(super) fn deferred(
@@ -130,30 +143,7 @@ impl Document {
   pub(in crate::interface::application::engine) fn has_body_candidates(
     &self,
   ) -> bool {
-    self.occurrences().iter().any(|site| {
-      site.kind == OccurrenceKind::Command
-        && (site.name.can_equal(b"trap") || site.name.can_equal(b"command"))
-    })
-  }
-
-  pub(in crate::interface::application::engine) fn needs_environment(
-    &self,
-  ) -> bool {
-    self.occurrences().iter().any(|site| {
-      site.kind != OccurrenceKind::Command
-        || crate::interface::application::engine::analysis::invariant_command(
-          &site.name,
-        )
-        .is_none()
-    }) || self.has_body_candidates()
-      || !self.references().is_empty()
-      || self.argument_roles().iter().any(|role| {
-        !matches!(
-          role.kind,
-          None
-            | Some(crate::interface::application::engine::ArgumentKind::Number)
-        )
-      })
+    self.occurrences().iter().any(body_candidate)
   }
 
   pub(in crate::interface::application::engine) fn command_at(
@@ -172,35 +162,32 @@ impl Document {
     &self,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
-    if self
-      .symbols()
-      .iter()
-      .any(|symbol| symbol.kind == SymbolKind::Function)
-    {
-      self.deferred(cancelled)?;
-    }
-    Ok(())
+    self.deferred_names(cancelled).map(drop)
   }
 
+  /// The commands that may run shell bodies, unless a function shadows them.
   pub(super) fn body_candidates(
     &self,
-  ) -> impl Iterator<
-    Item = (
-      &Occurrence,
-      crate::interface::application::engine::analysis::UnattemptedCommand,
-    ),
+    cancelled: &AtomicBool,
+  ) -> Result<
+    impl Iterator<
+      Item = (
+        &Occurrence,
+        crate::interface::application::engine::analysis::UnattemptedCommand,
+      ),
+    >,
+    Error,
   > {
-    self
-      .occurrences()
-      .iter()
-      .filter(|site| {
-        site.kind == OccurrenceKind::Command
-          && (site.name.can_equal(b"trap") || site.name.can_equal(b"command"))
-      })
-      .filter_map(|site| {
-        let command = if let Some(deferred) = self.deferred.get() {
-          deferred.commands.get(&site.id)?.clone()
-        } else {
+    let deferred = self.deferred_names(cancelled)?;
+    Ok(
+      self
+        .occurrences()
+        .iter()
+        .filter(|site| body_candidate(site))
+        .filter_map(move |site| {
+          let command = if let Some(deferred) = deferred {
+            deferred.commands.get(&site.id)?.clone()
+          } else {
           let node = self.command_at(&site.location)?;
           crate::interface::application::engine::analysis::unattempted_command(
             self.snapshot(),
@@ -209,24 +196,8 @@ impl Document {
           )
         };
         Some((site, command))
-      })
-  }
-
-  pub(in crate::interface::application::engine) fn deferred_sources(
-    &self,
-  ) -> impl Iterator<Item = (&SourceReference, SourceInput)> {
-    self
-      .references()
-      .iter()
-      .filter(|reference| {
-        matches!(reference.value, Value::Literal(_))
-          || reference.annotation.is_some()
-      })
-      .filter_map(|reference| {
-        let node = self.command_at(&reference.command)?;
-        let input = deferred_source_input(node, self.source.as_bytes())?;
-        Some((reference, input))
-      })
+      }),
+    )
   }
 
   #[must_use]
@@ -309,7 +280,7 @@ impl Document {
 }
 
 #[derive(Debug, Default)]
-pub(in crate::interface::application::engine) struct Facts {
+struct Facts {
   pub syntax_errors: bool,
   pub contexts: Vec<Context>,
   pub occurrences: Vec<Occurrence>,
@@ -326,7 +297,7 @@ struct State {
   inert: bool,
 }
 
-pub(in crate::interface::application::engine) fn extract(
+fn extract(
   snapshot: Snapshot,
   source: &[u8],
   tree: &Tree,
@@ -386,12 +357,36 @@ pub(in crate::interface::application::engine) fn extract(
   Ok(facts)
 }
 
+/// The word that names the command of a simple command.
+/// Whether the command at `site` may be `trap` or `command`, whose operands
+/// may be shell bodies.
+fn body_candidate(site: &Occurrence) -> bool {
+  site.kind == OccurrenceKind::Command
+    && (site.name.can_equal(b"trap") || site.name.can_equal(b"command"))
+}
+
+pub(in crate::interface::application::engine) fn command_word(
+  node: Node<'_>,
+) -> Option<Node<'_>> {
+  node
+    .child_by_field_name("name")
+    .or_else(|| node.child_by_field_name("word"))
+}
+
 pub(in crate::interface::application::engine) fn damaged(
   node: Node<'_>,
 ) -> bool {
   node.is_error()
     || node.is_missing()
     || matches!(node.kind(), "syntax_issue" | "unowned_issue")
+}
+
+/// Whether a node of `kind` runs in a subshell environment.
+pub(in crate::interface::application::engine) fn subshell(kind: &str) -> bool {
+  matches!(
+    kind,
+    "subshell" | "command_substitution" | "backquote_substitution"
+  )
 }
 
 pub(in crate::interface::application::engine) fn asynchronous(
@@ -493,10 +488,7 @@ impl Facts {
     if node.kind() != "simple_command" {
       return;
     }
-    let Some(command) = node
-      .child_by_field_name("name")
-      .or_else(|| node.child_by_field_name("word"))
-    else {
+    let Some(command) = command_word(node) else {
       return;
     };
     if state.transformed && word::transformed(command, source) {
@@ -706,7 +698,7 @@ fn arithmetic_access(mut node: Node<'_>, source: &[u8]) -> Access {
   Access::Read
 }
 
-pub(in crate::interface::application::engine) fn classify(
+fn classify(
   snapshot: Snapshot,
   source: &[u8],
   tree: &Tree,
@@ -766,7 +758,7 @@ pub(in crate::interface::application::engine) fn classify(
           snapshot,
           bytes: start..end,
         },
-        capture: query.capture_names()[capture as usize].into(),
+        capture: query.capture_names()[capture as usize],
       })
       .collect(),
   )

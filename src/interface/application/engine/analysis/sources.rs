@@ -1,8 +1,9 @@
-use super::execution::{Environment, Transfer};
+use super::command::operand_index;
+use super::execution::Environment;
 use super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
-  self, Alternative, DependencyState, Error, ExecutionContextId, ExecutionKind,
-  ReferenceId, ResolutionIssue, Snapshot, Value, ValueIssue, check_cancelled,
+  self, DependencyState, Error, ExecutionContextId, ExecutionKind, ReferenceId,
+  ResolutionIssue, Snapshot, Value, ValueIssue, check_cancelled,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -30,7 +31,10 @@ pub struct SourceAnnotation {
 }
 
 impl SourceInput {
-  pub(crate) fn join(&mut self, other: &Self) {
+  pub(in crate::interface::application::engine) fn join(
+    &mut self,
+    other: &Self,
+  ) {
     self.operand.join(&other.operand);
     join_condition(&mut self.cwd, other.cwd.as_ref());
     join_condition(&mut self.search_path, other.search_path.as_ref());
@@ -39,7 +43,7 @@ impl SourceInput {
     }
   }
 
-  pub(crate) fn needs_annotation(&self) -> bool {
+  pub(in crate::interface::application) fn needs_annotation(&self) -> bool {
     !matches!(self.operand, Value::Literal(_))
       || self
         .cwd
@@ -51,7 +55,7 @@ impl SourceInput {
         .is_some_and(|value| !matches!(value, Value::Literal(_)))
   }
 
-  pub(crate) fn normalized(mut self) -> Self {
+  fn normalized(mut self) -> Self {
     if let Value::Literal(value) = &self.operand {
       let absolute_search = !value.contains(&b'/')
         && matches!(&self.search_path, Some(Value::Literal(path)) if path.split(|byte| *byte == b':').all(|entry| entry.starts_with(b"/")));
@@ -99,12 +103,7 @@ impl SourceTracking {
 
 impl<'a> Resolver<'a> {
   pub(super) fn non_source(&mut self, node: Node<'_>, frame: Frame) {
-    if let Some(reference) = self
-      .index
-      .sources
-      .get(&(frame.snapshot, node.start_byte(), node.end_byte()))
-      .copied()
-    {
+    if let Some(reference) = self.index.source(frame.snapshot, node) {
       self.sources.non_sources.insert((reference, frame.context));
     }
   }
@@ -120,14 +119,12 @@ impl<'a> Resolver<'a> {
       if !used.contains(&key.0) {
         continue;
       }
-      if self.inputs.is_some() {
-        self.sources.states.insert(
-          key.0,
-          DependencyState::Unresolved(
-            "Source command differs between execution contexts".into(),
-          ),
-        );
-      }
+      self.sources.states.insert(
+        key.0,
+        DependencyState::Unresolved(
+          "Source command differs between execution contexts".into(),
+        ),
+      );
       let input = SourceInput {
         operand: Value::Unknown(ValueIssue::Dynamic),
         cwd: None,
@@ -150,11 +147,7 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let reference = self
-      .index
-      .sources
-      .get(&(frame.snapshot, node.start_byte(), node.end_byte()))
-      .copied();
+    let reference = self.index.source(frame.snapshot, node);
     let input = reference.map(|id| {
       let mut input = source_input(args, &env);
       if source_operand(args).is_some() && !node.has_error() {
@@ -183,26 +176,15 @@ impl<'a> Resolver<'a> {
         .and_modify(|old| old.join(input))
         .or_insert_with(|| input.clone());
     }
-    let target = if self.inputs.is_some() {
-      match (reference, input.as_ref()) {
-        (Some(id), Some(input)) => match self.load_source(id, input) {
-          Ok(target) => target.map(|target| (id, target)),
-          Err(error) => {
-            self.error = Some(error);
-            None
-          }
-        },
-        _ => None,
-      }
-    } else {
-      reference.and_then(|id| match self.workspace.reference_state(id) {
-        Some(DependencyState::Resolved(target))
-          if self.source_matches(id, input.as_ref()) =>
-        {
-          Some((id, *target))
+    let target = match (reference, input.as_ref()) {
+      (Some(id), Some(input)) => match self.load_source(id, input) {
+        Ok(target) => target.map(|target| (id, target)),
+        Err(error) => {
+          self.error = Some(error);
+          None
         }
-        _ => None,
-      })
+      },
+      _ => None,
     };
     let Some((reference, target)) = target else {
       return Task::Done(self.opaque(
@@ -210,6 +192,13 @@ impl<'a> Resolver<'a> {
         env,
         frame,
         ResolutionIssue::UnresolvedSource,
+        input.as_ref().and_then(|input| {
+          std::iter::once(&input.operand)
+            .chain(input.cwd.as_ref())
+            .chain(input.search_path.as_ref())
+            .filter_map(Value::issue)
+            .reduce(ValueIssue::combine)
+        }),
       ));
     };
     if self.sources.active.contains(&target) {
@@ -218,6 +207,7 @@ impl<'a> Resolver<'a> {
         env,
         frame,
         ResolutionIssue::Recursion,
+        None,
       ));
     }
     let Some(document) = self
@@ -230,25 +220,25 @@ impl<'a> Resolver<'a> {
         env,
         frame,
         ResolutionIssue::UnresolvedSource,
+        None,
       ));
     };
-    let inner = self.execution(
-      node,
-      frame,
-      ExecutionKind::Source(reference),
-      target,
-      false,
-    );
+    let root = document.tree.root_node();
+    let empty =
+      root.child_by_field_name("commands").is_none() && !root.has_error();
+    let inner =
+      self.execution(node, frame, ExecutionKind::Source(reference), target);
     self.sources.active.push(target);
-    Task::eval(document.tree.root_node(), env, inner).then(
-      move |resolver, mut flow| {
-        resolver.sources.active.pop();
-        if let Some(env) = flow.0.remove(&Transfer::Return) {
-          flow.add(Transfer::Next, env);
+    Task::eval(root, env, inner).then(move |resolver, flow| {
+      resolver.sources.active.pop();
+      let mut flow = flow.returned();
+      if empty {
+        for env in flow.environments_mut() {
+          env.set_status(Value::Literal(b"0".to_vec()));
         }
-        Task::Done(flow)
-      },
-    )
+      }
+      Task::Done(flow)
+    })
   }
 
   fn load_source(
@@ -256,11 +246,7 @@ impl<'a> Resolver<'a> {
     id: ReferenceId,
     input: &SourceInput,
   ) -> Result<Option<Snapshot>, Error> {
-    let loaded = self
-      .inputs
-      .as_mut()
-      .expect("input provider")
-      .source(input)?;
+    let loaded = self.inputs.source(input)?;
     let state = match loaded {
       SourceDocument::Resolved(document) => {
         let snapshot = document.snapshot();
@@ -272,7 +258,7 @@ impl<'a> Resolver<'a> {
           self.workspace.workspace.insert_shared(document)?;
           self.register_document(snapshot)?;
         }
-        self.workspace.workspace.index_document(
+        self.workspace.workspace.index(
           snapshot.document,
           self.result.request.limits,
           self.cancelled,
@@ -321,41 +307,38 @@ impl<'a> Resolver<'a> {
       .workspace
       .document(id.snapshot.document)
       .and_then(|document| document.reference(id))
-      .and_then(|reference| reference.annotation.as_ref())
+      .and_then(|reference| reference.annotation.as_deref())
+      .and_then(|path| self.annotation_path(path))
       .map(|path| SourceAnnotation {
-        document: self.workspace.source_snapshot(id.snapshot).document,
-        path: path.clone(),
+        document: self
+          .workspace
+          .workspace
+          .source_snapshot(id.snapshot)
+          .document,
+        path,
       });
   }
 
-  fn source_matches(
-    &self,
-    id: ReferenceId,
-    input: Option<&SourceInput>,
-  ) -> bool {
-    let Some(input) = input else {
-      return false;
-    };
-    if !matches!(input.operand, Value::Literal(_)) && input.annotation.is_none()
-    {
-      return false;
-    }
-    if let Some(expected) = self.result.request.source_inputs.get(&id) {
-      return expected == input;
-    }
-    let Value::Literal(value) = &input.operand else {
-      return false;
-    };
-    let Some(reference) = self
-      .workspace
-      .document(id.snapshot.document)
-      .and_then(|doc| doc.reference(id))
+  /// Replaces a leading `~` or `~/` with the initial HOME, which must be an
+  /// absolute path.
+  fn annotation_path(&self, path: &[u8]) -> Option<Vec<u8>> {
+    let Some(rest) = path
+      .strip_prefix(b"~")
+      .filter(|rest| rest.is_empty() || rest.starts_with(b"/"))
     else {
-      return false;
+      return Some(path.to_vec());
     };
-    match &reference.value {
-      Value::Literal(expected) => expected == value,
-      Value::Unknown(_) | Value::Partial(_) => false,
+    match Environment::new(&self.result.request.initial).parameter(b"HOME") {
+      (Value::Literal(mut home), Some(false)) if home.starts_with(b"/") => {
+        let rest = if home.ends_with(b"/") {
+          rest.strip_prefix(b"/").unwrap_or(rest)
+        } else {
+          rest
+        };
+        home.extend_from_slice(rest);
+        Some(home)
+      }
+      _ => None,
     }
   }
 }
@@ -364,29 +347,46 @@ fn source_input(
   args: &[super::expansion::Argument<'_>],
   env: &Environment,
 ) -> SourceInput {
-  let path = env.variables.get(b"PATH");
-  let unset = path.resolution.candidates.is_empty()
-    && path.resolution.alternatives == [Alternative::Unset].into();
+  let (path, absent) = env.parameter(b"PATH");
+  // XBD 8.3 leaves the search implementation-defined when PATH is unset or
+  // null or a prefix contains `%`.
+  let search_path = match path {
+    Value::Literal(path)
+      if absent != Some(false) || path.is_empty() || path.contains(&b'%') =>
+    {
+      Value::Unknown(ValueIssue::Unspecified)
+    }
+    path => path,
+  };
   SourceInput {
     operand: source_value(args),
     annotation: None,
     cwd: Some(env.cwd.clone()),
-    search_path: Some(if unset {
-      Value::Unknown(ValueIssue::Dynamic)
-    } else {
-      path.value.as_ref().clone()
-    }),
+    search_path: Some(search_path),
   }
   .normalized()
 }
 
-pub(in crate::interface::application::engine) fn deferred_source_input(
-  node: Node<'_>,
-  source: &[u8],
-) -> Option<SourceInput> {
-  let command = node
-    .child_by_field_name("name")
-    .or_else(|| node.child_by_field_name("word"))?;
+/// The source references of `document` whose search inputs are invariant.
+fn deferred_sources(
+  document: &engine::Document,
+) -> impl Iterator<Item = (&engine::SourceReference, SourceInput)> {
+  document
+    .references()
+    .iter()
+    .filter(|reference| {
+      matches!(reference.value, Value::Literal(_))
+        || reference.annotation.is_some()
+    })
+    .filter_map(|reference| {
+      let node = document.command_at(&reference.command)?;
+      let input = deferred_source_input(node, document.source().as_bytes())?;
+      Some((reference, input))
+    })
+}
+
+fn deferred_source_input(node: Node<'_>, source: &[u8]) -> Option<SourceInput> {
+  let command = engine::workspace::parser::command_word(node)?;
   if node.has_error()
     || engine::word::literal_value(command, source)
       != Value::Literal(b".".to_vec())
@@ -428,14 +428,8 @@ fn source_operand<'a, 'b>(
   let operand = args.get(first)?;
   args[..=first]
     .iter()
-    .all(|arg| arg.boundary_known)
+    .all(|arg| arg.boundary.is_ok())
     .then_some(operand)
-}
-
-fn operand_index(args: &[super::expansion::Argument<'_>]) -> usize {
-  usize::from(args.first().is_some_and(|arg| {
-    arg.boundary_known && arg.value == Value::Literal(b"--".to_vec())
-  }))
 }
 
 impl Resolver<'_> {
@@ -472,11 +466,9 @@ impl Resolver<'_> {
       let document = self
         .workspace
         .workspace
-        .documents
-        .get(&snapshot.document)
-        .ok_or(Error::UnknownDocument(snapshot.document))?
-        .clone();
-      for (reference, mut input) in document.deferred_sources() {
+        .shared_document(snapshot.document)
+        .ok_or(Error::UnknownDocument(snapshot.document))?;
+      for (reference, mut input) in deferred_sources(&document) {
         if !observed.insert(reference.id) {
           continue;
         }
@@ -490,22 +482,7 @@ impl Resolver<'_> {
           .result
           .source_inputs
           .insert((reference.id, None), input.clone());
-        let target = if self.inputs.is_some() {
-          self.load_source(reference.id, &input)?
-        } else {
-          self
-            .workspace
-            .reference_state(reference.id)
-            .and_then(|state| match state {
-              DependencyState::Resolved(target)
-                if self.result.request.source_inputs.get(&reference.id)
-                  == Some(&input) =>
-              {
-                Some(*target)
-              }
-              _ => None,
-            })
-        };
+        let target = self.load_source(reference.id, &input)?;
         if let Some(target) = target {
           if visited.contains(&target) {
             continue;
@@ -535,20 +512,8 @@ impl Resolver<'_> {
   }
 
   pub(super) fn commit_sources(&mut self) -> Result<(), Error> {
-    if self.inputs.is_some() {
-      self.result.request.source_inputs.clear();
-      for ((id, _), input) in &self.result.source_inputs {
-        self
-          .result
-          .request
-          .source_inputs
-          .entry(*id)
-          .and_modify(|old| old.join(input))
-          .or_insert_with(|| input.clone());
-      }
-      for (id, state) in &self.sources.states {
-        self.workspace.workspace.set_reference(*id, state.clone())?;
-      }
+    for (id, state) in &self.sources.states {
+      self.workspace.workspace.set_reference(*id, state.clone())?;
     }
     Ok(())
   }

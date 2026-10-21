@@ -1,28 +1,28 @@
-use std::collections::BTreeSet;
+use imbl::OrdSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
-use super::super::execution::Environment;
-use super::super::execution::children;
+use super::super::execution::{
+  CommandFailure, Environment, Transfer, children,
+};
 use super::super::{Frame, Resolver, Task};
 use super::Expansion;
 use crate::interface::application::engine::word::{self, Word};
 use crate::interface::application::engine::{
-  Access, DerivedOrigin, ExecutionKind, OriginPart, ResolutionIssue, Value,
-  ValueIssue,
+  Access, DerivedOrigin, EffectTarget, ExecutionKind, OriginPart,
+  ResolutionIssue, Snapshot, Value, ValueIssue,
 };
 
 type Number = Result<i64, ValueIssue>;
 
-fn integer(value: &Value) -> Number {
+pub(super) fn integer(value: &Value) -> Number {
   let Value::Literal(bytes) = value else {
     let Some(issue) = value.issue() else {
       unreachable!()
     };
     return Err(issue);
   };
-  let text = std::str::from_utf8(bytes)
-    .map_err(|_| ValueIssue::Arithmetic)?
-    .trim();
+  let text = std::str::from_utf8(bytes).map_err(|_| ValueIssue::Arithmetic)?;
   if text.is_empty() {
     return Ok(0);
   }
@@ -40,13 +40,16 @@ fn integer(value: &Value) -> Number {
   } else {
     (10, text)
   };
+  if !digits.chars().all(|digit| digit.is_digit(radix)) {
+    return Err(ValueIssue::Arithmetic);
+  }
   let n =
     i128::from_str_radix(digits, radix).map_err(|_| ValueIssue::Arithmetic)?;
   let n = if negative { -n } else { n };
   i64::try_from(n).map_err(|_| ValueIssue::Arithmetic)
 }
 
-fn value(number: Number) -> Value {
+pub(super) fn value(number: Number) -> Value {
   let number = number.and_then(|n| {
     std::os::raw::c_long::try_from(n)
       .map(|_| n)
@@ -57,15 +60,23 @@ fn value(number: Number) -> Value {
   })
 }
 
-fn result<'a>(number: Number, env: Environment) -> Task<'a> {
+fn result<'a>(number: Number, mut env: Environment) -> Task<'a> {
+  let value = value(number);
+  if let Some(issue) = value.issue() {
+    env.failure.uncertain(issue);
+  }
   Task::expanded(Expansion {
-    word: Word::value(value(number), false),
+    word: Word::value(value, false),
     env,
   })
 }
 
-fn binary(operator: &[u8], left: Number, right: Number) -> Number {
-  let (a, b) = (left?, right?);
+pub(super) fn binary(operator: &[u8], left: Number, right: Number) -> Number {
+  let (a, b) = match (left, right) {
+    (Ok(a), Ok(b)) => (a, b),
+    (Err(left), Err(right)) => return Err(left.combine(right)),
+    (Err(issue), Ok(_)) | (Ok(_), Err(issue)) => return Err(issue),
+  };
   match operator {
     b"+" => a.checked_add(b),
     b"-" => a.checked_sub(b),
@@ -95,6 +106,66 @@ fn binary(operator: &[u8], left: Number, right: Number) -> Number {
   .ok_or(ValueIssue::Arithmetic)
 }
 
+pub(super) fn unary(operator: &[u8], operand: Number) -> Number {
+  operand.and_then(|n| {
+    match operator {
+      b"+" => Some(n),
+      b"-" => n.checked_neg(),
+      b"!" => Some(i64::from(n == 0)),
+      b"~" => Some(!n),
+      _ => None,
+    }
+    .ok_or(ValueIssue::Arithmetic)
+  })
+}
+
+/// The variables that an arithmetic node and its descendants read and write.
+#[derive(Clone, Default)]
+struct VariableAccess {
+  reads: OrdSet<Vec<u8>>,
+  writes: OrdSet<Vec<u8>>,
+}
+
+impl VariableAccess {
+  fn join(&mut self, other: &Self) {
+    union(&mut self.reads, &other.reads);
+    union(&mut self.writes, &other.writes);
+  }
+
+  /// Whether evaluating `self` and `other` unsequenced may decide a value
+  /// (C17 6.5p2).
+  fn conflicts(&self, other: &Self) -> bool {
+    intersects(&self.writes, &other.reads)
+      || intersects(&other.writes, &self.reads)
+      || intersects(&self.writes, &other.writes)
+  }
+}
+
+fn union(into: &mut OrdSet<Vec<u8>>, other: &OrdSet<Vec<u8>>) {
+  if into.len() < other.len() {
+    let smaller = std::mem::replace(into, other.clone());
+    into.extend(smaller);
+  } else {
+    into.extend(other.iter().cloned());
+  }
+}
+
+fn intersects(left: &OrdSet<Vec<u8>>, right: &OrdSet<Vec<u8>>) -> bool {
+  let (smaller, larger) = if left.len() <= right.len() {
+    (left, right)
+  } else {
+    (right, left)
+  };
+  smaller.iter().any(|name| larger.contains(name))
+}
+
+/// The variable access of each arithmetic node, computed once per node so
+/// that nested operators do not walk their operands again.
+#[derive(Default)]
+pub(in crate::interface::application::engine::analysis) struct ArithmeticAccess(
+  BTreeMap<(Snapshot, usize), VariableAccess>,
+);
+
 impl<'a> Resolver<'a> {
   pub(in crate::interface::application::engine::analysis) fn arithmetic(
     &mut self,
@@ -103,12 +174,7 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     if node.kind() == "arithmetic_expansion" {
-      let source = self
-        .workspace
-        .document(frame.snapshot.document)
-        .expect("snapshot")
-        .source
-        .as_bytes();
+      let source = self.workspace.source(frame.snapshot.document);
       if let Some(expression) = node.child_by_field_name("expression") {
         let bytes = word::lexical(expression, source);
         if bytes.iter().all(u8::is_ascii_digit) {
@@ -119,12 +185,7 @@ impl<'a> Resolver<'a> {
         return self.expanded_arithmetic(node, env, frame);
       }
     }
-    let source = self
-      .workspace
-      .document(frame.snapshot.document)
-      .expect("snapshot")
-      .source
-      .as_bytes();
+    let source = self.workspace.source(frame.snapshot.document);
     match node.kind() {
       "arithmetic_expansion" | "parenthesized_arithmetic" => {
         node.child_by_field_name("expression").map_or_else(
@@ -154,16 +215,7 @@ impl<'a> Resolver<'a> {
           return result(Err(ValueIssue::Recovery), env);
         };
         Task::arithmetic(operand, env, frame).then_word(move |_, expansion| {
-          let number = integer(&expansion.word.scalar()).and_then(|n| {
-            match operator.as_slice() {
-              b"+" => Some(n),
-              b"-" => n.checked_neg(),
-              b"!" => Some(i64::from(n == 0)),
-              b"~" => Some(!n),
-              _ => None,
-            }
-            .ok_or(ValueIssue::Arithmetic)
-          });
+          let number = unary(&operator, integer(&expansion.word.scalar()));
           result(number, expansion.env)
         })
       }
@@ -181,14 +233,40 @@ impl<'a> Resolver<'a> {
           .then(move |_, mut flow| {
             result(
               Err(ValueIssue::UnsupportedExpansion),
-              flow
-                .0
-                .remove(&super::super::execution::Transfer::Next)
-                .unwrap_or(before),
+              flow.take(Transfer::Next).unwrap_or(before),
             )
           })
       }
     }
+  }
+
+  /// Evaluates an arithmetic expression that is not calculated statically;
+  /// it may write any variable.
+  pub(in crate::interface::application::engine::analysis) fn runtime_arithmetic(
+    &mut self,
+    node: Node<'a>,
+    mut env: Environment,
+    frame: Frame,
+  ) -> Task<'a> {
+    self.gap(node, frame, ResolutionIssue::UnknownEffect);
+    let previous_order = env.order.clone();
+    env.order.insert(EffectTarget::Variables);
+    Task::sequence(children(node), env, frame).then(
+      move |resolver, mut flow| {
+        for state in flow.environments_mut() {
+          state.order.clone_from(&previous_order);
+          resolver.invalidate(
+            node,
+            state,
+            frame,
+            ResolutionIssue::UnknownEffect,
+            ValueIssue::Dynamic,
+            [EffectTarget::Variables],
+          );
+        }
+        Task::Done(flow)
+      },
+    )
   }
 
   fn calculate_binary(
@@ -204,25 +282,11 @@ impl<'a> Resolver<'a> {
     ) else {
       return result(Err(ValueIssue::Recovery), env);
     };
-    let source = self
-      .workspace
-      .document(frame.snapshot.document)
-      .expect("snapshot")
-      .source
-      .as_bytes();
+    let source = self.workspace.source(frame.snapshot.document);
     let op = word::lexical(operator, source);
     let short = matches!(op.as_slice(), b"&&" | b"||");
     let conflict = !short && self.arithmetic_conflict(left, right, frame);
-    let previous_order = env.order.clone();
-    if conflict {
-      env.order.extend(
-        self
-          .arithmetic_names(node, frame)
-          .1
-          .into_iter()
-          .map(crate::interface::application::engine::EffectTarget::Variable),
-      );
-    }
+    let order = conflict.then(|| self.unordered(node, &mut env, frame));
     Task::arithmetic(left, env, frame).then_word(move |_, left| {
       let a = integer(&left.word.scalar());
       let skip =
@@ -233,20 +297,18 @@ impl<'a> Resolver<'a> {
       let before = left.env.clone();
       Task::arithmetic(right, left.env, frame).then_word(
         move |resolver, mut right| {
-          let mut number = binary(&op, a, integer(&right.word.scalar()));
+          let b = integer(&right.word.scalar());
+          if !conflict && matches!(op.as_slice(), b"/" | b"%") && b == Ok(0) {
+            right.env.failure = CommandFailure::Definite;
+          }
+          let mut number = binary(&op, a, b);
           if short && a.is_err() {
             right.env.join(&before);
           }
-          if conflict {
-            for name in resolver.arithmetic_names(node, frame).1 {
-              right.env.alternatives.forget(&name);
-              if let Some(binding) = right.env.variables.values.get_mut(&name) {
-                binding.taint(ResolutionIssue::EvaluationOrder);
-              }
-            }
+          if let Some(order) = order {
+            resolver.ordered(node, &mut right.env, frame, order);
             number = Err(ValueIssue::Unspecified);
           }
-          right.env.order = previous_order;
           result(number, right.env)
         },
       )
@@ -272,30 +334,22 @@ impl<'a> Resolver<'a> {
       };
       left = inner;
     }
-    let source = self
-      .workspace
-      .document(frame.snapshot.document)
-      .expect("snapshot")
-      .source
-      .as_bytes();
+    let source = self.workspace.source(frame.snapshot.document);
     let op = word::lexical(operator, source);
     let id = self.site(left, frame);
-    let conflict = op != b"=" && id.and_then(|id| self.workspace.occurrence(id)).is_some_and(|site| {
-      matches!(&site.name, Value::Literal(name) if self.arithmetic_names(right, frame).1.contains(name))
+    let name =
+      id.and_then(|id| self.workspace.occurrence(id))
+        .and_then(|site| match &site.name {
+          Value::Literal(name) => Some(name.clone()),
+          Value::Partial(_) | Value::Unknown(_) => None,
+        });
+    let conflict = name.as_ref().is_some_and(|name| {
+      self.variable_access(right, frame).writes.contains(name)
     });
-    let previous_order = env.order.clone();
-    if conflict {
-      env.order.extend(
-        self
-          .arithmetic_names(node, frame)
-          .1
-          .into_iter()
-          .map(crate::interface::application::engine::EffectTarget::Variable),
-      );
-    }
-    if conflict {
+    let order = conflict.then(|| {
       self.gap(node, frame, ResolutionIssue::EvaluationOrder);
-    }
+      self.unordered(node, &mut env, frame)
+    });
     let old = if op == b"=" {
       Ok(0)
     } else {
@@ -307,8 +361,15 @@ impl<'a> Resolver<'a> {
     };
     Task::arithmetic(right, env, frame).then_word(move |resolver, mut right| {
       let rhs = integer(&right.word.scalar());
-      let readonly = resolver.site(left, frame).and_then(|id| resolver.workspace.occurrence(id)).is_some_and(|site| matches!(&site.name, Value::Literal(name) if right.env.readonly(name).is_some()));
-      let number = if readonly { Err(ValueIssue::Dynamic) } else if conflict {
+      if !conflict && matches!(op.as_slice(), b"/=" | b"%=") && rhs == Ok(0) {
+        right.env.failure = CommandFailure::Definite;
+      }
+      let readonly = name
+        .as_ref()
+        .is_some_and(|name| right.env.readonly(name).is_some());
+      let number = if readonly {
+        Err(ValueIssue::Dynamic)
+      } else if conflict {
         Err(ValueIssue::Unspecified)
       } else if op == b"=" {
         rhs
@@ -316,12 +377,8 @@ impl<'a> Resolver<'a> {
         binary(&op[..op.len().saturating_sub(1)], old, rhs)
       };
       resolver.write(left, &mut right.env, frame, false, value(number));
-      right.env.order = previous_order;
-      if conflict {
-        for name in resolver.arithmetic_names(node, frame).1 {
-          right.env.alternatives.forget(&name);
-          if let Some(binding) = right.env.variables.values.get_mut(&name) { binding.taint(ResolutionIssue::EvaluationOrder); }
-        }
+      if let Some(order) = order {
+        resolver.ordered(node, &mut right.env, frame, order);
       }
       result(number, right.env)
     })
@@ -340,20 +397,23 @@ impl<'a> Resolver<'a> {
       return result(Err(ValueIssue::Recovery), env);
     };
     Task::arithmetic(condition, env, frame).then_word(move |_, condition| {
-      if let Ok(n) = integer(&condition.word.scalar()) {
-        return Task::arithmetic(
-          if n == 0 { no } else { yes },
-          condition.env,
-          frame,
-        );
-      }
+      let cause = match integer(&condition.word.scalar()) {
+        Ok(n) => {
+          return Task::arithmetic(
+            if n == 0 { no } else { yes },
+            condition.env,
+            frame,
+          );
+        }
+        Err(cause) => cause,
+      };
       let before = condition.env.clone();
       Task::arithmetic(yes, condition.env, frame).then_word(
         move |_, mut yes| {
           Task::arithmetic(no, before, frame).then_word(move |_, no| {
             yes.env.join(&no.env);
             let mut v = yes.word.scalar();
-            v.join(&no.word.scalar());
+            v.join_choice(&no.word.scalar(), Some(cause));
             Task::expanded(Expansion {
               word: Word::value(v, false),
               env: yes.env,
@@ -370,40 +430,86 @@ impl<'a> Resolver<'a> {
     right: Node<'_>,
     frame: Frame,
   ) -> bool {
-    let (lr, lw) = self.arithmetic_names(left, frame);
-    let (rr, rw) = self.arithmetic_names(right, frame);
-    let conflict =
-      !lw.is_disjoint(&rr) || !rw.is_disjoint(&lr) || !lw.is_disjoint(&rw);
+    let conflict = self
+      .variable_access(left, frame)
+      .conflicts(&self.variable_access(right, frame));
     if conflict {
       self.gap(left, frame, ResolutionIssue::EvaluationOrder);
     }
     conflict
   }
 
-  fn arithmetic_names(
-    &self,
+  /// Lets the variables that `node` writes be written in unspecified order,
+  /// returning the order to restore afterwards.
+  fn unordered(
+    &mut self,
+    node: Node<'_>,
+    env: &mut Environment,
+    frame: Frame,
+  ) -> BTreeSet<EffectTarget> {
+    let order = env.order.clone();
+    let writes = self.variable_access(node, frame).writes;
+    env
+      .order
+      .extend(writes.into_iter().map(EffectTarget::Variable));
+    order
+  }
+
+  /// Restores `order` and makes the variables that `node` wrote in
+  /// unspecified order unknown.
+  fn ordered(
+    &mut self,
+    node: Node<'_>,
+    env: &mut Environment,
+    frame: Frame,
+    order: BTreeSet<EffectTarget>,
+  ) {
+    env.order = order;
+    for name in self.variable_access(node, frame).writes {
+      env.invalidate(
+        EffectTarget::Variable(name),
+        ResolutionIssue::EvaluationOrder,
+        ValueIssue::Dynamic,
+      );
+    }
+  }
+
+  fn variable_access(
+    &mut self,
     node: Node<'_>,
     frame: Frame,
-  ) -> (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>) {
-    let mut reads = BTreeSet::new();
-    let mut writes = BTreeSet::new();
-    let mut nodes = vec![node];
-    while let Some(node) = nodes.pop() {
+  ) -> VariableAccess {
+    let key = |node: Node<'_>| (frame.snapshot, node.id());
+    let mut pending = vec![(node, false)];
+    while let Some((current, expanded)) = pending.pop() {
+      if self.arithmetic.0.contains_key(&key(current)) {
+        continue;
+      }
+      if !expanded {
+        pending.push((current, true));
+        pending
+          .extend(children(current).into_iter().map(|child| (child, false)));
+        continue;
+      }
+      let mut access = VariableAccess::default();
+      for child in children(current) {
+        access.join(&self.arithmetic.0[&key(child)]);
+      }
       if let Some(site) = self
-        .site(node, frame)
+        .site(current, frame)
         .and_then(|id| self.workspace.occurrence(id))
         && let Value::Literal(name) = &site.name
       {
         if !matches!(site.access, Access::Write | Access::Definition) {
-          reads.insert(name.clone());
+          access.reads.insert(name.clone());
         }
         if !matches!(site.access, Access::Read) {
-          writes.insert(name.clone());
+          access.writes.insert(name.clone());
         }
       }
-      nodes.extend(children(node));
+      self.arithmetic.0.insert(key(current), access);
     }
-    (reads, writes)
+    self.arithmetic.0[&key(node)].clone()
   }
 }
 
@@ -417,32 +523,6 @@ struct ArithmeticSource<'a> {
 }
 
 impl<'a> Resolver<'a> {
-  fn origin(
-    &self,
-    node: Node<'a>,
-    frame: Frame,
-    parts: Vec<OriginPart>,
-  ) -> Option<DerivedOrigin> {
-    let mut parent = Some(node);
-    while let Some(current) = parent {
-      let site = self.site(current, frame).or_else(|| {
-        current
-          .child_by_field_name("name")
-          .or_else(|| current.child_by_field_name("word"))
-          .and_then(|name| self.site(name, frame))
-      });
-      if let Some(registration) = site {
-        return Some(DerivedOrigin {
-          registration,
-          argument: frame.location(node),
-          parts,
-        });
-      }
-      parent = current.parent();
-    }
-    None
-  }
-
   fn expanded_arithmetic(
     &mut self,
     node: Node<'a>,
@@ -491,7 +571,7 @@ impl<'a> Resolver<'a> {
     if let Some(expansion) = input.remaining.next() {
       self.arithmetic_literal(&mut input, expansion.start_byte(), frame);
       input.offset = expansion.end_byte();
-      return Task::expand(expansion, env, frame).then_word(
+      return Task::expand(expansion, false, env, frame).then_word(
         move |resolver, result| {
           match result.word.scalar() {
             Value::Literal(bytes) if input.issue.is_none() => {
@@ -529,16 +609,20 @@ impl<'a> Resolver<'a> {
       return self.arithmetic_unknown(node, env, frame, issue);
     }
     if !arithmetic_text(&input.body[5..]) {
+      let mut env = env;
+      if !input.body[5..].iter().all(u8::is_ascii_whitespace) {
+        env.failure = CommandFailure::Definite;
+      }
       return self.arithmetic_unknown(node, env, frame, ValueIssue::Arithmetic);
     }
     let offset = input.body.len();
     input.body.extend(b"))");
     input.parts.push(OriginPart::new(offset..offset + 2, None));
-    let Some(origin) = self.origin(node, frame, input.parts) else {
-      return self.arithmetic_unknown(node, env, frame, ValueIssue::Dynamic);
+    let origin = DerivedOrigin {
+      argument: frame.location(node),
+      parts: input.parts,
     };
-    let key = self.derive_body(origin, &input.body);
-    let Some(snapshot) = self.workspace.derived_keys.get(&key).copied() else {
+    let Some(snapshot) = self.derive_body(origin, &input.body) else {
       return self.arithmetic_unknown(node, env, frame, ValueIssue::Dynamic);
     };
     let document = self
@@ -546,6 +630,8 @@ impl<'a> Resolver<'a> {
       .document(snapshot.document)
       .expect("derived document");
     if document.has_syntax_errors() {
+      let mut env = env;
+      env.failure = CommandFailure::Definite;
       return self.arithmetic_unknown(node, env, frame, ValueIssue::Arithmetic);
     }
     let mut nodes = vec![document.tree.root_node()];
@@ -556,12 +642,13 @@ impl<'a> Resolver<'a> {
           frame,
           ExecutionKind::Arithmetic(snapshot),
           snapshot,
-          false,
         );
         return Task::arithmetic(arithmetic, env, inner);
       }
       nodes.extend(children(arithmetic));
     }
+    let mut env = env;
+    env.failure = CommandFailure::Definite;
     self.arithmetic_unknown(node, env, frame, ValueIssue::Arithmetic)
   }
 
@@ -571,12 +658,7 @@ impl<'a> Resolver<'a> {
     end: usize,
     frame: Frame,
   ) {
-    let source = self
-      .workspace
-      .document(frame.snapshot.document)
-      .expect("snapshot")
-      .source
-      .as_bytes();
+    let source = self.workspace.source(frame.snapshot.document);
     let mut offset = input.offset;
     while offset < end && input.issue.is_none() {
       if input.body.len() >= self.result.request.limits.value_bytes {
@@ -605,6 +687,7 @@ impl<'a> Resolver<'a> {
     frame: Frame,
     issue: ValueIssue,
   ) -> Task<'a> {
+    env.failure.uncertain(issue);
     self.invalidate(
       node,
       &mut env,
@@ -614,7 +697,8 @@ impl<'a> Resolver<'a> {
       } else {
         ResolutionIssue::UnknownEffect
       },
-      [crate::interface::application::engine::EffectTarget::Variables],
+      issue,
+      [EffectTarget::Variables],
     );
     Task::expanded(Expansion {
       word: Word::unknown(issue),

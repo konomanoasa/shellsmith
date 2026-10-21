@@ -1,9 +1,11 @@
 mod alternatives;
 mod environment;
 mod flow;
+mod values;
 
-pub(super) use alternatives::AlternativeStates;
 pub(super) use environment::{
-  Binding, Environment, Flow, Names, Transfer, alternative, definition,
+  Binding, CommandFailure, Environment, Flow, Names, Positionals, Transfer,
+  alternative, definition,
 };
 pub(super) use flow::{Task, children};
+pub(super) use values::ValueId;

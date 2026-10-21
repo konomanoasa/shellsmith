@@ -76,7 +76,6 @@ impl OriginPart {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedOrigin {
-  pub registration: OccurrenceId,
   pub argument: Location,
   pub parts: Vec<OriginPart>,
 }
@@ -225,9 +224,9 @@ struct OriginKey {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(in crate::interface::application::engine) struct DerivedSite {
-  root: OccurrenceId,
+  root: Snapshot,
   program: Option<Arc<[u8]>>,
-  occurrence: usize,
+  range: (usize, usize),
   argument: (usize, usize),
 }
 
@@ -239,13 +238,13 @@ pub(in crate::interface::application::engine) struct DerivedKey {
 }
 
 impl DerivedKey {
-  pub fn new(
+  fn new(
     mut origin: DerivedOrigin,
     body: &[u8],
     units: &std::collections::BTreeMap<DocumentId, DerivedUnit>,
   ) -> (Self, DerivedOrigin) {
-    let parent = units.get(&origin.registration.snapshot.document);
-    let occurrence = origin.registration.index;
+    let parent = units.get(&origin.argument.snapshot.document);
+    let range = (origin.argument.bytes.start, origin.argument.bytes.end);
     if let Some(unit) = parent {
       let argument = unit.origin.project(origin.argument.bytes.clone());
       origin.parts = unit.origin.compose(&origin.parts);
@@ -257,13 +256,12 @@ impl DerivedKey {
           })
         })
         .unwrap_or_else(|| unit.origin.argument.clone());
-      origin.registration = unit.key.site.root;
     }
     let key = Self {
       site: DerivedSite {
-        root: origin.registration,
+        root: origin.argument.snapshot,
         program: parent.map(|unit| unit.key.body.clone()),
-        occurrence,
+        range,
         argument: (origin.argument.bytes.start, origin.argument.bytes.end),
       },
       body: body.into(),
@@ -291,12 +289,6 @@ impl DerivedKey {
 }
 
 #[derive(Clone, Debug)]
-pub(in crate::interface::application::engine) struct DerivedCandidate {
-  pub key: DerivedKey,
-  pub origin: DerivedOrigin,
-}
-
-#[derive(Clone, Debug)]
 pub(in crate::interface::application::engine) struct DerivedUnit {
   pub key: DerivedKey,
   pub origin: DerivedOrigin,
@@ -305,7 +297,7 @@ pub(in crate::interface::application::engine) struct DerivedUnit {
 
 #[derive(Clone, Debug, Default)]
 pub(in crate::interface::application::engine) struct DerivedDocuments {
-  pub candidates: BTreeMap<DerivedKey, DerivedCandidate>,
+  pub candidates: BTreeMap<DerivedKey, DerivedOrigin>,
   pub bodies: BTreeMap<OccurrenceId, DeferredBody>,
 }
 
@@ -362,21 +354,36 @@ impl DerivedDocuments {
     incomplete
   }
 
-  pub fn materialize(
+  /// The candidates with the snapshots of their documents in `workspace`.
+  pub(in crate::interface::application::engine) fn materialized<'a>(
+    &'a self,
+    workspace: &'a Workspace,
+  ) -> impl Iterator<Item = (&'a DerivedKey, Snapshot)> + 'a {
+    self.candidates.keys().filter_map(|key| {
+      workspace
+        .derived_keys
+        .get(key)
+        .map(|snapshot| (key, *snapshot))
+    })
+  }
+
+  /// Materializes the derived document whose text is `body` at `origin`.
+  pub fn derive(
     &mut self,
     workspace: &mut Workspace,
-    candidate: DerivedCandidate,
+    origin: DerivedOrigin,
+    body: &[u8],
     cancelled: &AtomicBool,
   ) -> Result<Snapshot, Error> {
-    let key = candidate.key.clone();
+    let (key, origin) = DerivedKey::new(origin, body, &workspace.derived);
     if !workspace.derived_keys.contains_key(&key) {
-      workspace.add_derived(candidate.clone(), cancelled)?;
+      workspace.add_derived(key.clone(), origin.clone(), cancelled)?;
     }
     let (key, snapshot) = workspace
       .derived_keys
       .get_key_value(&key)
       .expect("derived document");
-    self.candidates.entry(key.clone()).or_insert(candidate);
+    self.candidates.entry(key.clone()).or_insert(origin);
     Ok(*snapshot)
   }
 
@@ -409,12 +416,7 @@ impl DerivedDocuments {
       return Ok(None);
     }
     let argument = origin.argument.clone();
-    let (key, origin) = DerivedKey::new(origin, &value, &workspace.derived);
-    let snapshot = self.materialize(
-      workspace,
-      DerivedCandidate { key, origin },
-      cancelled,
-    )?;
+    let snapshot = self.derive(workspace, origin, &value, cancelled)?;
     self
       .bodies
       .get_mut(&registration)
@@ -443,11 +445,7 @@ impl DerivedDocuments {
         .get(&snapshot.document)
         .ok_or(Error::UnknownDocument(snapshot.document))?
         .clone();
-      document.prepare_deferred(cancelled)?;
-      if !document.has_body_candidates() {
-        continue;
-      }
-      for (site, command) in document.body_candidates() {
+      for (site, command) in document.body_candidates(cancelled)? {
         check_cancelled(cancelled)?;
         let registration = &site.id;
         if self.bodies.contains_key(registration)
@@ -471,7 +469,6 @@ impl DerivedDocuments {
         );
         for ((start, end), (value, parts)) in &command.bodies {
           let origin = DerivedOrigin {
-            registration: *registration,
             argument: Location {
               snapshot,
               bytes: *start..*end,
@@ -492,19 +489,25 @@ impl DerivedDocuments {
   }
 }
 
+/// Identifies the definitions that symbol listings present as one entry: the
+/// same name and kind defined at the same location.
+pub(super) fn listing_key<'a>(
+  symbol: &'a Symbol,
+  location: &Location,
+) -> (&'a [u8], Snapshot, usize, usize, engine::SymbolKind) {
+  (
+    symbol.name.as_slice(),
+    location.snapshot,
+    location.bytes.start,
+    location.bytes.end,
+    symbol.kind,
+  )
+}
+
 pub(in crate::interface::application::engine) const fn reserved(
   id: DocumentId,
 ) -> bool {
   id.0 & (1 << 63) != 0
-}
-
-pub(in crate::interface::application::engine) fn owner(
-  units: &std::collections::BTreeMap<DocumentId, DerivedUnit>,
-  snapshot: Snapshot,
-) -> Snapshot {
-  units
-    .get(&snapshot.document)
-    .map_or(snapshot, |unit| unit.origin.argument.snapshot)
 }
 
 impl Workspace {
@@ -513,16 +516,12 @@ impl Workspace {
     id: DocumentId,
   ) -> Result<Vec<engine::SemanticSpan>, Error> {
     let document = self.document(id).ok_or(Error::UnknownDocument(id))?;
-    document.prepare_deferred(&AtomicBool::new(false))?;
     let mut spans = document.semantic_spans(self.analysis());
     for group in self.projections(document.snapshot(), self.analysis()) {
       if !group.complete {
         continue;
       }
-      let mut projected: BTreeMap<
-        _,
-        engine::analysis::semantic::ProjectedSpan,
-      > = BTreeMap::new();
+      let mut projected: BTreeMap<_, ProjectedSpan> = BTreeMap::new();
       for unit in &group.documents {
         for mut span in unit.document.semantic_spans(self.analysis()) {
           let Some(locations) = self.project_locations(&span.location) else {
@@ -540,7 +539,7 @@ impl Workspace {
                 old.join(&span, unit.document.snapshot().document);
               })
               .or_insert_with(|| {
-                engine::analysis::semantic::ProjectedSpan::new(
+                ProjectedSpan::new(
                   span.clone(),
                   unit.document.snapshot().document,
                 )
@@ -574,6 +573,19 @@ impl Workspace {
     limits: engine::AnalysisLimits,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
+    self.index(id, limits, cancelled)?;
+    self.prune_unused_derived();
+    Ok(())
+  }
+
+  /// Indexes `id` and keeps unretained derived documents, which an analysis
+  /// in progress may still use.
+  pub(in crate::interface::application::engine) fn index(
+    &mut self,
+    id: DocumentId,
+    limits: engine::AnalysisLimits,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
     if self
       .indexed
@@ -584,9 +596,7 @@ impl Workspace {
     }
     let document = self.document(id).ok_or(Error::UnknownDocument(id))?;
     let snapshot = document.snapshot();
-    if limits.value_bytes == 0 {
-      return Err(Error::InvalidAnalysis("Value size must be positive".into()));
-    }
+    limits.validate()?;
     document.prepare_deferred(cancelled)?;
     if !document.has_body_candidates() {
       self.indexed.insert(
@@ -607,7 +617,6 @@ impl Workspace {
     staged
       .indexed
       .insert(id, (limits.value_bytes, Arc::new(derived)));
-    staged.prune_unused_derived();
     check_cancelled(cancelled)?;
     *self = staged;
     Ok(())
@@ -615,7 +624,8 @@ impl Workspace {
 
   pub(in crate::interface::application::engine) fn add_derived(
     &mut self,
-    mut candidate: DerivedCandidate,
+    mut key: DerivedKey,
+    origin: DerivedOrigin,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     if self.next_derived >= 1 << 63 {
@@ -629,26 +639,25 @@ impl Workspace {
       document: id,
       revision: Revision(1),
     };
-    let document = if let Some((body, program)) =
-      self.programs.get_key_value(&candidate.key.body)
-    {
-      candidate.key.body = body.clone();
-      program.instantiate(snapshot, cancelled)?
-    } else {
-      Document::parse(snapshot, &candidate.key.body, cancelled)?
-    };
-    self.insert_document(document)?;
-    let document = self.documents[&id].clone();
+    let document = Arc::new(
+      if let Some((body, program)) = self.programs.get_key_value(&key.body) {
+        key.body = body.clone();
+        program.instantiate(snapshot, cancelled)?
+      } else {
+        Document::parse(snapshot, &key.body, cancelled)?
+      },
+    );
+    self.insert_arc(document.clone())?;
     self
       .programs
-      .entry(candidate.key.body.clone())
+      .entry(key.body.clone())
       .or_insert_with(|| document.clone());
-    self.derived_keys.insert(candidate.key.clone(), snapshot);
+    self.derived_keys.insert(key.clone(), snapshot);
     self.derived.insert(
       id,
       DerivedUnit {
-        key: candidate.key,
-        origin: candidate.origin,
+        key,
+        origin,
         document,
       },
     );
@@ -658,21 +667,17 @@ impl Workspace {
   pub(super) fn prune_derived(
     &mut self,
     entry: DocumentId,
-    candidates: &BTreeMap<DerivedKey, DerivedCandidate>,
-  ) -> bool {
-    self.derived_entries.insert(
-      entry,
-      candidates
-        .keys()
-        .filter_map(|key| {
-          self.derived_keys.get(key).map(|snapshot| snapshot.document)
-        })
-        .collect(),
-    );
-    self.prune_unused_derived()
+    derived: &DerivedDocuments,
+  ) {
+    let documents = derived
+      .materialized(self)
+      .map(|(_, snapshot)| snapshot.document)
+      .collect();
+    self.derived_entries.insert(entry, documents);
+    self.prune_unused_derived();
   }
 
-  pub(super) fn prune_unused_derived(&mut self) -> bool {
+  pub(super) fn prune_unused_derived(&mut self) {
     let retained: BTreeSet<_> = self
       .derived_entries
       .values()
@@ -682,10 +687,8 @@ impl Workspace {
         self
           .indexed
           .values()
-          .flat_map(|(_, derived)| derived.candidates.keys())
-          .filter_map(|key| {
-            self.derived_keys.get(key).map(|snapshot| snapshot.document)
-          }),
+          .flat_map(|(_, derived)| derived.materialized(self))
+          .map(|(_, snapshot)| snapshot.document),
       )
       .collect();
     let removed: Vec<_> = self
@@ -700,7 +703,6 @@ impl Workspace {
     if !removed.is_empty() {
       self.changed();
     }
-    !removed.is_empty()
   }
 
   #[must_use]
@@ -713,7 +715,10 @@ impl Workspace {
 
   #[must_use]
   pub fn source_snapshot(&self, snapshot: Snapshot) -> Snapshot {
-    owner(&self.derived, snapshot)
+    self
+      .derived
+      .get(&snapshot.document)
+      .map_or(snapshot, |unit| unit.origin.argument.snapshot)
   }
 
   #[must_use]
@@ -748,6 +753,13 @@ impl Workspace {
     })
   }
 
+  /// The navigation location of the definition of `symbol`.
+  #[must_use]
+  pub fn definition_location(&self, symbol: &Symbol) -> Option<Location> {
+    let site = self.occurrence(symbol.definition)?;
+    self.navigation_location(&site.location)
+  }
+
   pub fn projected_symbols(
     &self,
     id: DocumentId,
@@ -768,13 +780,7 @@ impl Workspace {
     self
       .symbol_locations(query)
       .filter(move |(symbol, location)| {
-        seen.insert((
-          symbol.kind,
-          symbol.name.as_slice(),
-          location.snapshot,
-          location.bytes.start,
-          location.bytes.end,
-        ))
+        seen.insert(listing_key(symbol, location))
       })
   }
 
@@ -796,20 +802,11 @@ impl Workspace {
         > = BTreeMap::new();
         for unit in &group.documents {
           for symbol in unit.document.symbols() {
-            let Some(location) = self
-              .occurrence(symbol.definition)
-              .and_then(|site| self.navigation_location(&site.location))
-            else {
+            let Some(location) = self.definition_location(symbol) else {
               continue;
             };
-            let key = (
-              symbol.kind,
-              symbol.name.as_slice(),
-              location.snapshot,
-              location.bytes.start,
-              location.bytes.end,
-            );
-            let (symbols, documents) = matches.entry(key).or_default();
+            let (symbols, documents) =
+              matches.entry(listing_key(symbol, &location)).or_default();
             symbols.insert(symbol.id);
             documents.insert(symbol.id.snapshot.document);
           }
@@ -828,9 +825,7 @@ impl Workspace {
       {
         return None;
       }
-      let site = self.occurrence(symbol.definition)?;
-      let location = self.navigation_location(&site.location)?;
-      Some((symbol, location))
+      Some((symbol, self.definition_location(symbol)?))
     })
   }
 }
@@ -856,13 +851,11 @@ impl Workspace {
         .or_insert_with(|| input.clone());
     }
     let mut variants: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-    for key in analysis.derived.candidates.keys() {
-      if let Some(snapshot) = self.derived_keys.get(key) {
-        variants
-          .entry(key.site.clone())
-          .or_default()
-          .insert(snapshot.document);
-      }
+    for (key, snapshot) in analysis.derived.materialized(self) {
+      variants
+        .entry(key.site.clone())
+        .or_default()
+        .insert(snapshot.document);
     }
     let mut projected: BTreeMap<_, (Option<Snapshot>, BTreeSet<_>)> =
       BTreeMap::new();
@@ -880,8 +873,6 @@ impl Workspace {
         Some(DependencyState::Resolved(target))
           if (matches!(input.operand, Value::Literal(_))
             || input.annotation.is_some())
-            && analysis.request().source_inputs.get(&reference)
-              == Some(&input)
             && self
               .document(target.document)
               .is_some_and(|doc| doc.snapshot() == *target) =>
@@ -941,15 +932,8 @@ impl Workspace {
     snapshot: Snapshot,
     offset: usize,
   ) -> Result<Option<engine::Resolution>, Error> {
-    let document = self
-      .document(snapshot.document)
-      .ok_or(Error::UnknownDocument(snapshot.document))?;
-    if document.snapshot() != snapshot {
-      return Err(Error::StaleSnapshot(snapshot));
-    }
-    if offset > document.source().len()
-      || !document.source().is_char_boundary(offset)
-    {
+    let document = self.check_current(snapshot)?;
+    if !document.source().is_char_boundary(offset) {
       return Err(Error::InvalidPosition);
     }
     if let Some(resolution) = self.projected_resolution_at(snapshot, offset) {
@@ -1033,7 +1017,7 @@ impl Workspace {
         .derived
         .candidates
         .values()
-        .any(|candidate| candidate.origin.argument.snapshot == snapshot)
+        .any(|origin| origin.argument.snapshot == snapshot)
     });
     let derived = analysis.map(|analysis| &analysis.derived).or_else(|| {
       self
@@ -1061,10 +1045,8 @@ impl Workspace {
       })
       .collect();
     for unit in derived
-      .candidates
-      .keys()
-      .filter_map(|key| self.derived_keys.get(key))
-      .filter_map(|snapshot| self.derived.get(&snapshot.document))
+      .materialized(self)
+      .filter_map(|(_, snapshot)| self.derived.get(&snapshot.document))
       .filter(|unit| {
         self.source_snapshot(unit.document.snapshot()) == snapshot
           && !arguments.contains(&unit.document.snapshot())
@@ -1097,9 +1079,6 @@ impl Workspace {
     for ((start, end), projected) in
       self.projected_resolutions(snapshot, Some(offset))
     {
-      if !(start..end).contains(&offset) {
-        continue;
-      }
       let width = end - start;
       match &mut selected {
         Some((previous, _)) if *previous < width => {}
@@ -1161,6 +1140,44 @@ impl Workspace {
 struct ProjectedDocuments<'a> {
   documents: Vec<&'a DerivedUnit>,
   complete: bool,
+}
+
+struct ProjectedSpan {
+  span: engine::SemanticSpan,
+  documents: BTreeSet<DocumentId>,
+  compatible: bool,
+}
+
+impl ProjectedSpan {
+  fn new(span: engine::SemanticSpan, document: DocumentId) -> Self {
+    Self {
+      span,
+      documents: BTreeSet::from([document]),
+      compatible: true,
+    }
+  }
+
+  fn join(&mut self, other: &engine::SemanticSpan, document: DocumentId) {
+    self.documents.insert(document);
+    if self.span.kind != other.kind {
+      if matches!(
+        self.span.kind,
+        engine::SemanticKind::Function | engine::SemanticKind::Command
+      ) && matches!(
+        other.kind,
+        engine::SemanticKind::Function | engine::SemanticKind::Command
+      ) {
+        self.span.kind = engine::SemanticKind::Command;
+      } else {
+        self.compatible = false;
+      }
+    }
+    self
+      .span
+      .modifiers
+      .retain(|modifier| other.modifiers.contains(modifier));
+    self.span.readonly = self.span.readonly.join(other.readonly);
+  }
 }
 
 pub(super) struct ProjectedResolution {

@@ -15,7 +15,7 @@ pub(in crate::interface::application::engine) fn literal(
   source: &[u8],
 ) -> Word {
   let mut word = Word::default();
-  for part in Parts::new(node, source) {
+  for part in Parts::new(node, false, source) {
     match part {
       Part::Fragment(fragment) => word.append(fragment, usize::MAX),
       Part::Expansion(_, _) => word.fail(ValueIssue::Dynamic),
@@ -25,27 +25,19 @@ pub(in crate::interface::application::engine) fn literal(
   word
 }
 
+/// The value of a word without expansions, which fields never split.
 pub(in crate::interface::application::engine) fn literal_value(
   node: Node<'_>,
   source: &[u8],
 ) -> Value {
-  match literal(node, source).fields(
-    WordContext::Argument,
-    &Value::Literal(b" \t\n".to_vec()),
-    false,
-  ) {
-    Ok(fields) if fields.len() == 1 => {
-      let field = &fields[0];
-      match Pattern::compile(&field.bytes, &field.quoted, true, true) {
-        Ok(pattern) if pattern.is_literal() => {
-          Value::Literal(field.bytes.clone())
-        }
-        _ => Value::Unknown(ValueIssue::PathnameExpansion),
-      }
-    }
-    Ok(fields) if fields.is_empty() => Value::Literal(Vec::new()),
-    Ok(_) => Value::Unknown(ValueIssue::FieldSplitting),
-    Err(issue) => Value::Unknown(issue),
+  let word = literal(node, source);
+  if let Some(issue) = word.issue {
+    return Value::Unknown(issue);
+  }
+  let field = word.joined();
+  match Pattern::compile(&field.bytes, &field.quoted, true, true) {
+    Ok(pattern) if pattern.is_literal() => Value::Literal(field.bytes),
+    _ => Value::Unknown(ValueIssue::PathnameExpansion),
   }
 }
 
@@ -53,16 +45,57 @@ pub(in crate::interface::application::engine) fn has_guaranteed_field(
   node: Node<'_>,
   source: &[u8],
 ) -> bool {
-  Parts::new(node, source).any(|part| match part {
+  Parts::new(node, false, source).any(|part| match part {
     Part::Fragment(fragment) => fragment.quoted || !fragment.bytes.is_empty(),
-    Part::Expansion(node, true) => {
-      node.child_by_field_name("operator").is_none()
-        && node
-          .child_by_field_name("parameter")
-          .is_none_or(|parameter| lexical(parameter, source) != b"@")
-    }
+    Part::Expansion(node, true) => single_field_expansion(node, source),
     _ => false,
   })
+}
+
+/// Whether a quoted expansion forms exactly one field.
+fn single_field_expansion(node: Node<'_>, source: &[u8]) -> bool {
+  node.child_by_field_name("operator").is_none()
+    && node
+      .child_by_field_name("parameter")
+      .is_none_or(|parameter| lexical(parameter, source) != b"@")
+}
+
+/// The field that `node` forms when its expansions are unknown, and whether
+/// its syntax makes this the only field for any expansion values, IFS and
+/// directory contents.
+pub(in crate::interface::application::engine) fn syntax_field(
+  node: Node<'_>,
+  source: &[u8],
+) -> (Option<Field>, bool) {
+  let mut partial = Word::default();
+  for part in Parts::new(node, false, source) {
+    match part {
+      Part::Fragment(fragment) => partial.append(fragment, usize::MAX),
+      Part::Invalid(issue) => partial.fail(issue),
+      Part::Expansion(expansion, quoted) => {
+        partial.extend(
+          Word::value(Value::Unknown(ValueIssue::Dynamic), quoted),
+          usize::MAX,
+        );
+        partial.unknown_fields |=
+          !(quoted && single_field_expansion(expansion, source));
+      }
+    }
+  }
+  let field = partial
+    .fields(
+      WordContext::Argument,
+      &Value::Unknown(ValueIssue::Dynamic),
+      false,
+    )
+    .ok()
+    .and_then(|mut fields| (fields.len() == 1).then(|| fields.remove(0)));
+  let single = !partial.unknown_fields
+    && field.as_ref().is_some_and(|field| {
+      Pattern::compile(&field.bytes, &field.quoted, true, true)
+        .is_ok_and(|pattern| pattern.is_literal())
+    });
+  (field, single)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +242,21 @@ impl Word {
     }
   }
 
+  /// Whether an unquoted backslash directly precedes quoted text, even an
+  /// empty one, which leaves its pattern meaning unspecified.
+  pub fn backslash_before_quote(&self) -> bool {
+    let mut backslash = false;
+    for fragment in &self.fragments {
+      if fragment.quoted && backslash {
+        return true;
+      }
+      if !fragment.bytes.is_empty() {
+        backslash = !fragment.quoted && fragment.bytes.ends_with(b"\\");
+      }
+    }
+    false
+  }
+
   pub fn fail(&mut self, issue: ValueIssue) {
     self.issue = Some(self.issue.map_or(issue, |old| old.combine(issue)));
   }
@@ -244,10 +292,18 @@ impl Word {
       .extend(other.breaks.iter().map(|(index, separator)| {
         (self.fragments.len() + index, separator.clone())
       }));
-    self.assignment_issue = self.assignment_issue.or(other.assignment_issue);
+    self.assignment_issue = self
+      .assignment_issue
+      .into_iter()
+      .chain(other.assignment_issue)
+      .reduce(ValueIssue::combine);
     self.unknown_fields |= other.unknown_fields;
     self.ambiguous_empty |= other.ambiguous_empty;
-    self.field_issue = self.field_issue.or(other.field_issue);
+    self.field_issue = self
+      .field_issue
+      .into_iter()
+      .chain(other.field_issue)
+      .reduce(ValueIssue::combine);
     if let Some(issue) = other.issue {
       self.fail(issue);
     }
@@ -256,15 +312,48 @@ impl Word {
     }
   }
 
-  pub fn scalar(&self) -> Value {
-    if let Some(issue) = self
+  fn scalar_issue(&self) -> Option<ValueIssue> {
+    self
       .issue
       .into_iter()
       .chain(self.assignment_issue)
       .reduce(ValueIssue::combine)
-    {
-      return Value::Unknown(issue);
+      .map(|issue| self.value_issue(issue))
+  }
+
+  pub fn boundary_issue(&self) -> Option<ValueIssue> {
+    self
+      .issue
+      .into_iter()
+      .chain(self.field_issue)
+      .chain(
+        self
+          .unknown
+          .iter()
+          .filter(|(index, _)| !self.fragments[**index].quoted)
+          .filter_map(|(_, value)| value.issue()),
+      )
+      .reduce(ValueIssue::combine)
+  }
+
+  fn value_issue(&self, issue: ValueIssue) -> ValueIssue {
+    self
+      .unknown
+      .values()
+      .filter_map(Value::issue)
+      .fold(issue, ValueIssue::combine)
+  }
+
+  pub fn scalar(&self) -> Value {
+    match self.scalar_issue() {
+      Some(issue) => Value::Unknown(issue),
+      None => self.joined().value(),
     }
+  }
+
+  /// The single field that the word forms where fields are not split; the
+  /// fields of an unquoted `$*` keep their unquoted separator.
+  fn joined(&self) -> Field {
     let mut field = Field::default();
     let mut breaks = self.breaks.iter().peekable();
     for (i, part) in self.fragments.iter().enumerate() {
@@ -274,7 +363,7 @@ impl Word {
             &Fragment {
               bytes: separator.clone(),
               source: None,
-              quoted: true,
+              quoted: false,
               split: false,
             },
             0..separator.len(),
@@ -286,7 +375,7 @@ impl Word {
       }
       field.push(part, 0..part.bytes.len());
     }
-    field.value()
+    field
   }
 
   pub fn fields(
@@ -296,39 +385,16 @@ impl Word {
     utf8: bool,
   ) -> Result<Vec<Field>, ValueIssue> {
     if let Some(issue) = self.issue {
-      return Err(issue);
+      return Err(self.value_issue(issue));
     }
-    let mut field = Field::default();
     if context == WordContext::Assignment {
       if let Some(issue) = self.assignment_issue {
         return Err(issue);
       }
-      if self.breaks.is_empty() {
-        for (index, part) in self.fragments.iter().enumerate() {
-          if let Some(value) = self.unknown.get(&index) {
-            field.mark_unknown(value);
-          }
-          field.push(part, 0..part.bytes.len());
-        }
-      } else {
-        let Value::Literal(bytes) = self.scalar() else {
-          return Err(ValueIssue::Unspecified);
-        };
-        let len = bytes.len();
-        field.push(
-          &Fragment {
-            bytes,
-            source: None,
-            quoted: true,
-            split: false,
-          },
-          0..len,
-        );
-      }
-      return Ok(vec![field]);
+      return Ok(vec![self.joined()]);
     }
     if let Some(issue) = self.field_issue {
-      return Err(issue);
+      return Err(self.value_issue(issue));
     }
     if self.ambiguous_empty
       && self.fragments.iter().all(|part| part.bytes.is_empty())
@@ -352,7 +418,11 @@ impl Word {
           .collect(),
         ..Self::default()
       };
-      fields.extend(part.split(ifs, utf8, usize::MAX)?);
+      fields.extend(
+        part
+          .split(ifs, utf8, usize::MAX)
+          .map_err(|issue| self.value_issue(issue))?,
+      );
       start = end;
     }
     Ok(fields)
@@ -364,6 +434,9 @@ impl Word {
     utf8: bool,
     maximum: usize,
   ) -> Result<Vec<Field>, ValueIssue> {
+    if let Some(issue) = self.issue {
+      return Err(issue);
+    }
     let mut field = Field::default();
     let needs_split = self
       .fragments
@@ -371,22 +444,16 @@ impl Word {
       .any(|part| part.split && !part.quoted && !part.bytes.is_empty());
     let separators = if needs_split {
       let Value::Literal(bytes) = ifs else {
-        return Err(ValueIssue::FieldSplitting);
+        return Err(ifs.issue().expect("unknown IFS"));
       };
       if bytes.iter().any(|byte| b"\r\x0b\x0c".contains(byte)) {
         return Err(ValueIssue::FieldSplitting);
       }
-      if bytes.is_ascii() {
-        bytes.iter().map(|byte| vec![*byte]).collect::<Vec<_>>()
-      } else if utf8 {
-        characters(bytes, true)
-          .map_err(|_| ValueIssue::FieldSplitting)?
-          .iter()
-          .map(|c| c.to_string().into_bytes())
-          .collect()
-      } else {
-        return Err(ValueIssue::FieldSplitting);
-      }
+      characters(bytes, utf8)
+        .map_err(|_| ValueIssue::FieldSplitting)?
+        .iter()
+        .map(|c| c.to_string().into_bytes())
+        .collect::<Vec<_>>()
     } else {
       Vec::new()
     };
@@ -403,7 +470,7 @@ impl Word {
       }
       if let Some(value) = self.unknown.get(&index) {
         if !part.quoted {
-          return Err(value.issue().expect("unknown field"));
+          return Err(self.value_issue(value.issue().expect("unknown field")));
         }
         field.mark_unknown(value);
       }
@@ -535,9 +602,9 @@ pub(in crate::interface::application::engine) struct Parts<'a, 's> {
   ready: Vec<Fragment>,
 }
 impl<'a, 's> Parts<'a, 's> {
-  pub fn new(node: Node<'a>, source: &'s [u8]) -> Self {
+  pub fn new(node: Node<'a>, quoted: bool, source: &'s [u8]) -> Self {
     Self {
-      pending: vec![Piece::Node(node, false)],
+      pending: vec![Piece::Node(node, quoted)],
       strip_tabs: false,
       source,
       ready: Vec::new(),
@@ -589,6 +656,21 @@ impl<'a, 's> Parts<'a, 's> {
     }
   }
 }
+/// Removes the tabs that begin each line of a `<<-` here-document body, where
+/// `start` tells whether `bytes` begins a line.
+pub(in crate::interface::application::engine) fn strip_leading_tabs(
+  bytes: &mut Vec<u8>,
+  mut start: bool,
+) {
+  bytes.retain(|byte| {
+    if start && *byte == b'\t' {
+      return false;
+    }
+    start = *byte == b'\n';
+    true
+  });
+}
+
 impl Parts<'_, '_> {
   pub fn strip_tabs(mut self, strip: bool) -> Self {
     self.strip_tabs = strip;
@@ -604,14 +686,10 @@ impl Parts<'_, '_> {
       while preceding > 0 && self.source[preceding - 1] == b'\t' {
         preceding -= 1;
       }
-      let mut start = preceding == 0 || self.source[preceding - 1] == b'\n';
-      fragment.bytes.retain(|byte| {
-        if start && *byte == b'\t' {
-          return false;
-        }
-        start = *byte == b'\n';
-        true
-      });
+      strip_leading_tabs(
+        &mut fragment.bytes,
+        preceding == 0 || self.source[preceding - 1] == b'\n',
+      );
       if fragment.bytes.len() != range.len() {
         fragment.source = None;
       }
@@ -747,7 +825,7 @@ impl<'a> Iterator for Parts<'a, '_> {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Pattern {
+pub(in crate::interface::application) struct Pattern {
   atoms: Vec<Atom>,
   unclosed_bracket: bool,
 }
@@ -767,16 +845,18 @@ enum Item {
   Class(String),
 }
 
-pub(crate) fn characters(
-  bytes: &[u8],
-  utf8: bool,
-) -> Result<Vec<char>, ValueIssue> {
+fn text(bytes: &[u8], utf8: bool) -> Result<&str, ValueIssue> {
   if !utf8 && !bytes.is_ascii() {
     return Err(ValueIssue::Locale);
   }
-  std::str::from_utf8(bytes)
-    .map(|s| s.chars().collect())
-    .map_err(|_| ValueIssue::Locale)
+  std::str::from_utf8(bytes).map_err(|_| ValueIssue::Locale)
+}
+
+pub(in crate::interface::application) fn characters(
+  bytes: &[u8],
+  utf8: bool,
+) -> Result<Vec<char>, ValueIssue> {
+  text(bytes, utf8).map(|text| text.chars().collect())
 }
 
 impl Pattern {
@@ -785,31 +865,26 @@ impl Pattern {
     utf8: bool,
     portable_collation: bool,
   ) -> Result<Self, ValueIssue> {
-    if let Some(issue) = word.scalar().issue() {
+    if let Some(issue) = word.scalar_issue() {
       return Err(issue);
     }
-    let bytes = word
-      .fragments
-      .iter()
-      .flat_map(|p| p.bytes.iter().copied())
-      .collect::<Vec<_>>();
-    let quoted = word
-      .fragments
-      .iter()
-      .flat_map(|p| std::iter::repeat_n(p.quoted, p.bytes.len()))
-      .collect::<Vec<_>>();
-    Self::compile(&bytes, &quoted, utf8, portable_collation)
+    let field = word.joined();
+    if let Some(issue) = field.constraint.as_ref().and_then(Value::issue) {
+      return Err(issue);
+    }
+    if word.backslash_before_quote() {
+      return Err(ValueIssue::Unspecified);
+    }
+    Self::compile(&field.bytes, &field.quoted, utf8, portable_collation)
   }
 
-  pub(crate) fn compile(
+  pub(in crate::interface::application) fn compile(
     bytes: &[u8],
     quoted: &[bool],
     utf8: bool,
     portable_collation: bool,
   ) -> Result<Self, ValueIssue> {
-    characters(bytes, utf8)?;
-    let text = std::str::from_utf8(bytes).map_err(|_| ValueIssue::Locale)?;
-    let chars = text
+    let chars = text(bytes, utf8)?
       .char_indices()
       .map(|(i, c)| (c, quoted.get(i).copied().unwrap_or(false)))
       .collect::<Vec<_>>();
@@ -830,13 +905,28 @@ impl Pattern {
         }
         '?' => atoms.push(Atom::Any),
         '[' => {
-          if let Some((atom, end)) = bracket(&chars, i, portable_collation)? {
+          let bracket = bracket(&chars, i, portable_collation)?;
+          let end = bracket.as_ref().map_or(chars.len(), |(_, end)| *end);
+          if chars[i..end].contains(&('\\', false))
+            || (bracket.is_some() && chars.get(i) == Some(&('^', false)))
+          {
+            return Err(ValueIssue::Unspecified);
+          }
+          if let Some((atom, end)) = bracket {
             atoms.push(atom);
             i = end;
           } else {
             unclosed_bracket = true;
             atoms.push(Atom::Literal('['));
           }
+        }
+        // Unquoted backslashes come from expansions and escape the next character.
+        '\\' => {
+          let Some(&(next, false)) = chars.get(i) else {
+            return Err(ValueIssue::Unspecified);
+          };
+          atoms.push(Atom::Literal(next));
+          i += 1;
         }
         _ => atoms.push(Atom::Literal(c)),
       }
@@ -847,50 +937,77 @@ impl Pattern {
     })
   }
 
-  pub(crate) fn is_literal(&self) -> bool {
+  pub(in crate::interface::application::engine) fn is_literal(&self) -> bool {
     self.atoms.iter().all(|a| matches!(a, Atom::Literal(_)))
   }
-  pub(crate) fn ambiguous_glob(&self, cancelled: &AtomicBool) -> bool {
+
+  pub(in crate::interface::application) fn literal(&self) -> Option<Vec<u8>> {
+    self
+      .atoms
+      .iter()
+      .map(|atom| match atom {
+        Atom::Literal(c) => Some(*c),
+        _ => None,
+      })
+      .collect::<Option<String>>()
+      .map(String::into_bytes)
+  }
+
+  pub(in crate::interface::application) fn ambiguous_glob(
+    &self,
+    cancelled: &AtomicBool,
+  ) -> bool {
     !self.is_literal()
       && (self.unclosed_bracket
-        || (self.starts_dot()
-          && (self.matches(&['.'], cancelled)
-            || self.matches(&['.', '.'], cancelled))))
+        || [['.'].as_slice(), &['.', '.']].into_iter().any(|entry| {
+          (self.starts_dot() && self.matches(entry, cancelled))
+            || self.ambiguous_dot(entry, cancelled)
+        }))
   }
 
-  pub(crate) fn ambiguous_dot(&self) -> bool {
-    matches!(self.atoms.first(), Some(Atom::Class { negated: false, items }) if items.contains(&Item::Character('.')))
+  /// Whether `text` can match only by a bracket expression matching its
+  /// leading period, which POSIX leaves unspecified.
+  pub(in crate::interface::application) fn ambiguous_dot(
+    &self,
+    text: &[char],
+    cancelled: &AtomicBool,
+  ) -> bool {
+    let start = usize::from(self.atoms.first() == Some(&Atom::Star));
+    matches!(self.atoms.get(start), Some(Atom::Class { negated: false, items }) if items.contains(&Item::Character('.')))
+      && Self::prefixes(&self.atoms[start..], text, false, cancelled)
+        .last()
+        .copied()
+        .unwrap_or(false)
   }
 
-  pub(crate) fn starts_dot(&self) -> bool {
+  pub(in crate::interface::application) fn starts_dot(&self) -> bool {
     self.atoms.first() == Some(&Atom::Literal('.'))
   }
 
-  pub(crate) fn matches(&self, text: &[char], cancelled: &AtomicBool) -> bool {
-    self
-      .prefixes(text, false, cancelled)
+  pub(in crate::interface::application) fn matches(
+    &self,
+    text: &[char],
+    cancelled: &AtomicBool,
+  ) -> bool {
+    Self::prefixes(&self.atoms, text, false, cancelled)
       .last()
       .copied()
       .unwrap_or(false)
   }
 
   fn prefixes(
-    &self,
+    atoms: &[Atom],
     text: &[char],
     reversed: bool,
     cancelled: &AtomicBool,
   ) -> Vec<bool> {
     let mut old = vec![false; text.len() + 1];
     old[0] = true;
-    for i in 0..self.atoms.len() {
+    for i in 0..atoms.len() {
       if cancelled.load(Ordering::Relaxed) {
         return vec![];
       }
-      let atom = &self.atoms[if reversed {
-        self.atoms.len() - 1 - i
-      } else {
-        i
-      }];
+      let atom = &atoms[if reversed { atoms.len() - 1 - i } else { i }];
       let mut next = vec![false; text.len() + 1];
       if *atom == Atom::Star {
         next[0] = old[0];
@@ -908,7 +1025,7 @@ impl Pattern {
     old
   }
 
-  pub(crate) fn remove(
+  pub(in crate::interface::application::engine) fn remove(
     &self,
     value: &Value,
     suffix: bool,
@@ -926,7 +1043,7 @@ impl Pattern {
       Ok(chars) => chars,
       Err(issue) => return Value::Unknown(issue),
     };
-    let matches = self.prefixes(&chars, suffix, cancelled);
+    let matches = Self::prefixes(&self.atoms, &chars, suffix, cancelled);
     let count = if longest {
       matches.iter().rposition(|matched| *matched)
     } else {
@@ -995,7 +1112,7 @@ fn bracket(
     if c == ']' && !quoted && i > first {
       return Ok(Some((Atom::Class { negated, items }, i + 1)));
     }
-    let (item, next) = if c == '['
+    let (item, next, equivalence) = if c == '['
       && !quoted
       && chars
         .get(i + 1)
@@ -1036,9 +1153,9 @@ fn bracket(
       } else {
         return Err(ValueIssue::Locale);
       };
-      (item, end + 2)
+      (item, end + 2, delimiter == '=')
     } else {
-      (Item::Character(c), i + 1)
+      (Item::Character(c), i + 1, false)
     };
     if chars.get(next) == Some(&('-', false))
       && chars.get(next + 1).is_some_and(|p| *p != (']', false))
@@ -1046,7 +1163,7 @@ fn bracket(
       if !portable {
         return Err(ValueIssue::Locale);
       }
-      let Item::Character(from) = item else {
+      let (Item::Character(from), false) = (item, equivalence) else {
         return Err(ValueIssue::Unspecified);
       };
       let to = chars[next + 1].0;

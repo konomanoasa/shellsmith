@@ -1,12 +1,31 @@
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use shellsmith::interface::application::engine::{
-  AnalysisRequest, DependencyState, Document, DocumentId, InitialEnvironment,
-  Revision, Snapshot, Workspace,
+  AnalysisInputs, AnalysisRequest, DependencyState, Document, DocumentId,
+  Error, InitialEnvironment, InputQuery, InputResult, Revision, Snapshot,
+  SourceDocument, SourceInput, Value, ValueIssue, Workspace,
 };
+
+#[derive(Default)]
+struct Inputs(BTreeMap<SourceInput, Arc<Document>>);
+
+impl AnalysisInputs for Inputs {
+  fn source(&mut self, input: &SourceInput) -> Result<SourceDocument, Error> {
+    Ok(self.0.get(input).map_or_else(
+      || SourceDocument::Unresolved("No matching source input".into()),
+      |document| SourceDocument::Resolved(document.clone()),
+    ))
+  }
+
+  fn evaluate(&mut self, _: &InputQuery) -> Result<InputResult, Error> {
+    Ok(InputResult::Unknown(ValueIssue::Dynamic))
+  }
+}
 
 fn main() {
   let args: Vec<_> = std::env::args()
@@ -35,6 +54,7 @@ fn main() {
       "calls",
       "documents",
       "values",
+      "arithmetic",
     ] {
       for size in [100, 400] {
         measure(case, size);
@@ -42,6 +62,8 @@ fn main() {
     }
     for size in [16, 64] {
       measure("loop_chain", size);
+      measure("branch_sum", size);
+      measure("branch_concat", size);
     }
   }
 }
@@ -123,10 +145,28 @@ fn fixture(
   case: &str,
   size: usize,
   workspace: &mut Workspace,
+  inputs: &mut Inputs,
   cancelled: &AtomicBool,
 ) -> String {
   let mut source = String::from("x=0\n");
   match case {
+    "branch_sum" | "branch_concat" => {
+      let mut expression = String::new();
+      for index in 0..size {
+        writeln!(source, "if condition; then v{index}=1; else v{index}=2; fi")
+          .unwrap();
+        if case == "branch_sum" {
+          write!(expression, "+v{index}").unwrap();
+        } else {
+          write!(expression, "$v{index}").unwrap();
+        }
+      }
+      if case == "branch_sum" {
+        writeln!(source, "x=$((0{expression}))").unwrap();
+      } else {
+        writeln!(source, "joined=\"{expression}\"; x=${{#joined}}").unwrap();
+      }
+    }
     "independent_arguments" => {
       for index in 0..size {
         writeln!(source, "if condition; then v{index}=1; else v{index}=2; fi")
@@ -169,12 +209,26 @@ fn fixture(
       writeln!(source, "x='{}'", "v".repeat(64 * 1024)).unwrap();
       source.push_str(&": \"$x\"\n".repeat(size));
     }
+    "arithmetic" => {
+      writeln!(source, ": $(({}))", vec!["x"; size].join(" + ")).unwrap();
+    }
     "documents" => {
       for id in 2..=u64::try_from(size + 1).unwrap() {
-        writeln!(source, ". lib{id}").unwrap();
-        workspace
-          .update(snapshot(id, 1), b": \"$x\"; x=1\n", cancelled)
-          .unwrap();
+        writeln!(source, ". /lib{id}").unwrap();
+        let document = Arc::new(
+          Document::parse(snapshot(id, 1), b": \"$x\"; x=1\n", cancelled)
+            .unwrap(),
+        );
+        workspace.insert_shared(document.clone()).unwrap();
+        inputs.0.insert(
+          SourceInput {
+            operand: Value::Literal(format!("/lib{id}").into_bytes()),
+            cwd: None,
+            search_path: None,
+            annotation: None,
+          },
+          document,
+        );
       }
     }
     _ => panic!("unknown fixture: {case}"),
@@ -186,33 +240,15 @@ fn fixture(
 fn measure(case: &str, size: usize) {
   let cancelled = AtomicBool::new(false);
   let mut workspace = Workspace::default();
-  let source = fixture(case, size, &mut workspace, &cancelled);
+  let mut inputs = Inputs::default();
+  let source = fixture(case, size, &mut workspace, &mut inputs, &cancelled);
   workspace
     .update(snapshot(1, 1), source.as_bytes(), &cancelled)
     .unwrap();
-  let references: Vec<_> = workspace
-    .document(DocumentId(1))
-    .unwrap()
-    .references()
-    .iter()
-    .map(|site| site.id)
-    .collect();
-  for (index, reference) in references.into_iter().enumerate() {
-    workspace
-      .set_reference(
-        reference,
-        DependencyState::Resolved(snapshot(
-          u64::try_from(index + 2).unwrap(),
-          1,
-        )),
-      )
-      .unwrap();
-  }
   let mut request = AnalysisRequest::new(snapshot(1, 1));
   request.initial = InitialEnvironment::empty();
-  workspace.set_analysis_request(request).unwrap();
   let start = Instant::now();
-  let analysis = workspace.analyze(&cancelled).unwrap();
+  let analysis = workspace.analyze(request, &mut inputs, &cancelled).unwrap();
   let elapsed = start.elapsed().as_secs_f64() * 1000.0;
   let edges: usize = analysis
     .uses()

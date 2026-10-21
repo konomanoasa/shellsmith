@@ -17,31 +17,33 @@ name = "shellsmith"
 path = "src/main.rs"
 
 [dependencies]
-async-lsp = { version = "0.2", default-features = false }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-ignore = "0.4"
-imbl = "7.0.0"
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "io-std", "io-util", "sync"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-tower = { version = "0.5", default-features = false }
-typed-arena = "2"
-tree-sitter = "0.27.1"
-tree-sitter-sh = "0.21.0"
-url = "2"
+async-lsp = { version = "=0.2.4", default-features = false }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+ignore = "=0.4.33"
+imbl = "=7.0.2"
+serde_json = "=1.0.154"
+tokio = { version = "=1.54.0", features = ["rt-multi-thread", "io-std", "io-util", "sync"] }
+tokio-util = { version = "=0.7.20", features = ["compat"] }
+tower = { version = "=0.5.3", default-features = false }
+typed-arena = "=2.0.2"
+tree-sitter = "=0.27.1"
+tree-sitter-sh = "=0.21.0"
+url = "=2.5.8"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "=0.2.191"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "time"] }
+tokio = { version = "=1.54.0", features = ["macros", "time"] }
 
 [[bench]]
 name = "engine"
+path = "tests/performance/engine.rs"
 harness = false
 
 [[bench]]
 name = "lsp"
+path = "tests/performance/lsp.rs"
 harness = false
 
 [lints.clippy]

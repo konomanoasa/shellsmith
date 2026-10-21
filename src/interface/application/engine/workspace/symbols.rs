@@ -1,4 +1,6 @@
 use super::Workspace;
+use super::derived::listing_key;
+use super::documents::matches_query;
 use crate::interface::application::engine::{
   Context, ContextId, DocumentId, Location, OccurrenceKind, Snapshot, Symbol,
   SymbolId, SymbolKind,
@@ -40,15 +42,8 @@ impl Workspace {
         document.is_none_or(|id| location.snapshot.document == id)
       })
     {
-      let key = (
-        symbol.name.as_slice(),
-        location.snapshot,
-        location.bytes.start,
-        location.bytes.end,
-        symbol.kind,
-      );
       groups
-        .entry(key)
+        .entry(listing_key(symbol, &location))
         .or_insert_with(|| SymbolGroup {
           symbol,
           location,
@@ -61,14 +56,7 @@ impl Workspace {
     let mut hierarchy = Hierarchy::new(self, &symbols);
     symbols
       .into_iter()
-      .filter(|group| {
-        query.is_empty()
-          || group
-            .symbol
-            .name
-            .windows(query.len())
-            .any(|part| part == query)
-      })
+      .filter(|group| matches_query(&group.symbol.name, query))
       .map(|group| {
         let mut variants = group.variants.into_iter().map(|symbol| {
           let site = self
@@ -80,7 +68,7 @@ impl Workspace {
           } else {
             context
               .and_then(|context| self.navigation_location(&context.location))
-              .filter(|range| contains(range, &group.location))
+              .filter(|range| range.contains(&group.location))
           };
           let enclosing = if symbol.kind == SymbolKind::Function {
             context.and_then(|context| context.parent)
@@ -237,10 +225,4 @@ impl<'a> Hierarchy<'a> {
       |parent| vec![parent],
     )
   }
-}
-
-fn contains(outer: &Location, inner: &Location) -> bool {
-  outer.snapshot == inner.snapshot
-    && outer.bytes.start <= inner.bytes.start
-    && inner.bytes.end <= outer.bytes.end
 }

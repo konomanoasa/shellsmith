@@ -1,18 +1,13 @@
 use crate::interface::application::engine::{
-  self, Error, ReferenceId, Snapshot, SourceDocument, SourceInput, ValueIssue,
+  Error, Snapshot, SourceDocument, SourceInput, ValueIssue,
 };
 use std::collections::BTreeMap;
 
-/// Supplies immutable document snapshots and stable query results for one analysis.
+/// Supplies immutable snapshots and stable results for each complete query during an analysis.
+/// Providers own input acquisition and caching, including unresolved and failed lookups.
 pub trait AnalysisInputs {
-  fn source(
-    &mut self,
-    input: &engine::SourceInput,
-  ) -> Result<SourceDocument, Error>;
-  fn evaluate(
-    &mut self,
-    query: &engine::InputQuery,
-  ) -> Result<engine::InputResult, Error>;
+  fn source(&mut self, input: &SourceInput) -> Result<SourceDocument, Error>;
+  fn evaluate(&mut self, query: &InputQuery) -> Result<InputResult, Error>;
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -42,8 +37,6 @@ pub enum InputResult {
   Unknown(ValueIssue),
 }
 
-pub type EvaluationInputs = BTreeMap<InputQuery, InputResult>;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CharacterEncoding {
   Ascii,
@@ -65,7 +58,6 @@ pub struct InitialEnvironment {
   pub values: BTreeMap<Vec<u8>, Vec<u8>>,
   pub cwd: Option<Vec<u8>>,
   pub positional: Option<Vec<Vec<u8>>>,
-  pub user_homes: BTreeMap<Vec<u8>, Vec<u8>>,
   pub special: BTreeMap<Vec<u8>, Vec<u8>>,
   pub variables: BTreeMap<Vec<u8>, InitialBinding>,
   pub functions: BTreeMap<Vec<u8>, InitialBinding>,
@@ -97,6 +89,17 @@ pub struct AnalysisLimits {
   pub value_bytes: usize,
 }
 
+impl AnalysisLimits {
+  pub(in crate::interface::application::engine) fn validate(
+    self,
+  ) -> Result<(), Error> {
+    if self.value_bytes == 0 {
+      return Err(Error::InvalidAnalysis("Value size must be positive".into()));
+    }
+    Ok(())
+  }
+}
+
 impl Default for AnalysisLimits {
   fn default() -> Self {
     Self {
@@ -110,8 +113,6 @@ pub struct AnalysisRequest {
   pub entry: Snapshot,
   pub initial: InitialEnvironment,
   pub limits: AnalysisLimits,
-  pub source_inputs: BTreeMap<ReferenceId, SourceInput>,
-  pub inputs: engine::EvaluationInputs,
 }
 
 impl AnalysisRequest {
@@ -121,17 +122,6 @@ impl AnalysisRequest {
       entry,
       initial: InitialEnvironment::default(),
       limits: AnalysisLimits::default(),
-      source_inputs: BTreeMap::new(),
-      inputs: BTreeMap::new(),
     }
   }
-}
-
-pub(in crate::interface::application::engine) fn validate(
-  request: &AnalysisRequest,
-) -> Result<(), Error> {
-  if request.limits.value_bytes == 0 {
-    return Err(Error::InvalidAnalysis("Value size must be positive".into()));
-  }
-  Ok(())
 }

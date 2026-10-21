@@ -103,17 +103,6 @@ impl NameRelations {
     self.scopes.get(&id).map(|scope| &scope.location)
   }
 
-  fn isolated_parent(
-    &self,
-    environment: NameEnvironment,
-  ) -> Option<NameEnvironment> {
-    if let NameEnvironment::Isolated(id) = environment {
-      self.scopes.get(&id).and_then(|scope| scope.parent)
-    } else {
-      None
-    }
-  }
-
   #[must_use]
   pub fn may_inherit(
     &self,
@@ -154,7 +143,9 @@ impl NameRelations {
           })
         }
         NameEnvironment::Caller(_) => return unknown_caller,
-        NameEnvironment::Isolated(_) => self.isolated_parent(environment),
+        NameEnvironment::Isolated(_) => {
+          isolated_parent(&self.scopes, environment)
+        }
       };
     }
     false
@@ -251,6 +242,17 @@ struct DeferredContext {
   sequential: bool,
 }
 
+fn isolated_parent(
+  scopes: &BTreeMap<ContextId, NameScope>,
+  environment: NameEnvironment,
+) -> Option<NameEnvironment> {
+  if let NameEnvironment::Isolated(id) = environment {
+    scopes.get(&id).and_then(|scope| scope.parent)
+  } else {
+    None
+  }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct DeferredNames {
   names: BTreeMap<UseSite, DeferredName>,
@@ -279,17 +281,6 @@ impl DeferredNames {
       .and_then(|name| name.resolution.clone())
   }
 
-  fn isolated_parent(
-    &self,
-    environment: NameEnvironment,
-  ) -> Option<NameEnvironment> {
-    if let NameEnvironment::Isolated(id) = environment {
-      self.scopes.get(&id).and_then(|scope| scope.parent)
-    } else {
-      None
-    }
-  }
-
   fn deferred_scopes(
     &mut self,
     document: &Document,
@@ -311,10 +302,8 @@ impl DeferredNames {
         });
       let parent = context.parent.map(|id| contexts[id.index]);
       let outer = parent.map(|context| context.environment);
-      let separate = matches!(
-        context.kind.as_str(),
-        "subshell" | "command_substitution" | "backquote_substitution"
-      ) || node.is_some_and(super::parser::asynchronous);
+      let separate = super::parser::subshell(&context.kind)
+        || node.is_some_and(super::parser::asynchronous);
       let environment =
         if context.parent.is_none() || context.kind == "function_body" {
           NameEnvironment::Caller(context.id)
@@ -395,11 +384,10 @@ impl DeferredNames {
             available.insert(name.clone(), symbol);
           }
         } else if occurrence.kind == OccurrenceKind::Command {
-          if engine::special_builtin(name) {
-            resolution = Some(Resolution {
-              alternatives: [engine::Alternative::Builtin].into(),
-              ..Resolution::default()
-            });
+          if let Some(invariant) =
+            engine::analysis::invariant_command(&occurrence.name)
+          {
+            resolution = Some(invariant);
           } else if let Some(symbol) = available.get(name).copied() {
             resolution = Some(Resolution {
               candidates: [symbol].into(),
@@ -449,7 +437,7 @@ impl DeferredNames {
     environment: NameEnvironment,
   ) -> FunctionBindings {
     std::iter::successors(Some(environment), |environment| {
-      self.isolated_parent(*environment)
+      isolated_parent(&self.scopes, *environment)
     })
     .find_map(|environment| functions.get(&environment))
     .cloned()
@@ -1153,9 +1141,8 @@ impl<'a> Relationships<'a> {
           Some(ArgumentKind::Command { name }) => {
             (Some(SymbolKind::Function), literal(name), Access::Read)
           }
-          Some(ArgumentKind::Number | ArgumentKind::ShellBody) | None => {
-            (None, None, Access::Unknown)
-          }
+          Some(ArgumentKind::ShellBody) => return None,
+          Some(ArgumentKind::Number) | None => (None, None, Access::Unknown),
         };
         Some(Description {
           kind,
@@ -1343,9 +1330,7 @@ fn function_targets(
         targets.insert(EffectTarget::Function(name));
         continue;
       }
-      "subshell" | "command_substitution" | "backquote_substitution" => {
-        continue;
-      }
+      kind if super::parser::subshell(kind) => continue,
       "simple_command" => {
         let command = engine::analysis::unattempted_command(
           document.snapshot(),

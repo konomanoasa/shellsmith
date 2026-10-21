@@ -100,6 +100,66 @@ mod lsp {
     }
   }
 
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn locations_and_links_use_open_uris_and_refresh_them_on_close_and_reopen()
+   {
+    let fixture = Fixture::new();
+    let library = fixture.write("lib.sh", "value=disk\n");
+    let main = fixture.write("main.sh", ". ./lib.sh\n: \"$value\"\n");
+    let first = fixture.root.join("first alias.sh");
+    let second = fixture.root.join("second alias.sh");
+    for alias in [&first, &second] {
+      std::os::unix::fs::symlink(&library, alias).unwrap();
+    }
+    let main_uri = Url::from_file_path(main).unwrap().to_string();
+    let library_uri = Url::from_file_path(library).unwrap().to_string();
+    let first_uri = Url::from_file_path(first).unwrap().to_string();
+    let second_uri = Url::from_file_path(second).unwrap().to_string();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    let root_uri = Url::from_file_path(&fixture.root).unwrap();
+    server.request("initialize", json!({"capabilities":{},"workspaceFolders":[{"uri":root_uri,"name":"fixture"}]})).await;
+    server.notify("initialized", json!({})).await;
+    let mut opened = None;
+    for (next, expected_uri, line) in [
+      (None, &library_uri, 0),
+      (Some(&first_uri), &first_uri, 1),
+      (None, &library_uri, 0),
+      (Some(&second_uri), &second_uri, 1),
+    ] {
+      if let Some(previous) = opened {
+        server
+          .notify(
+            "textDocument/didClose",
+            json!({"textDocument":{"uri":previous}}),
+          )
+          .await;
+      }
+      if let Some(uri) = next {
+        server.notify("textDocument/didOpen", json!({"textDocument":{"uri":uri,"languageId":"sh","version":1,"text":"\nvalue=buffer\n"}})).await;
+      }
+      opened = next;
+      let location = json!({"uri":expected_uri,"range":{"start":{"line":line,"character":0},"end":{"line":line,"character":5}}});
+      let definitions = server.request("textDocument/definition", json!({"textDocument":{"uri":main_uri},"position":{"line":1,"character":4}})).await;
+      assert_eq!(definitions["result"], json!([location]), "{definitions}");
+      let links =
+        request(&mut server, "textDocument/documentLink", &main_uri).await;
+      assert_eq!(
+        links["result"],
+        json!([{"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":10}},"target":expected_uri}]),
+        "{links}"
+      );
+      let symbols = json!([{"name":"value","kind":13,"location":location}]);
+      let document =
+        request(&mut server, "textDocument/documentSymbol", &library_uri).await;
+      assert_eq!(document["result"], symbols, "{document}");
+      let workspace = server
+        .request("workspace/symbol", json!({"query":"value"}))
+        .await;
+      assert_eq!(workspace["result"], symbols, "{workspace}");
+    }
+  }
+
   #[tokio::test]
   async fn rename_preserves_utf16_versions_original_uri_and_revalidates_after_prepare()
    {
@@ -174,13 +234,17 @@ mod lsp {
 
   #[cfg(unix)]
   #[tokio::test]
-  async fn rename_refuses_an_open_uri_whose_symlink_target_has_changed() {
+  async fn requests_refuse_an_open_uri_whose_symlink_target_has_changed() {
     let fixture = Fixture::new();
     let original = fixture.write("original.sh", "x=1; : $x");
     let replacement = fixture.write("replacement.sh", "unrelated=2");
+    let directory = fixture.root.join("directory");
+    std::fs::create_dir(&directory).unwrap();
     let alias = fixture.root.join("alias.sh");
     std::os::unix::fs::symlink(&original, &alias).unwrap();
     let uri = Url::from_file_path(&alias).unwrap().to_string();
+    let main = fixture.write("main.sh", ". ./original.sh\n: $x\n");
+    let main_uri = Url::from_file_path(main).unwrap().to_string();
     let mut server = Client::new(Settings::new(fixture.root.clone()));
     initialize(&mut server, false).await;
     server.notify("textDocument/didOpen", json!({"textDocument":{"uri":uri,"languageId":"sh","version":1,"text":"x=1; : $x"}})).await;
@@ -190,15 +254,52 @@ mod lsp {
         json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0}}),
       )
       .await;
-    std::fs::remove_file(&alias).unwrap();
-    std::os::unix::fs::symlink(&replacement, &alias).unwrap();
-    for requested in [
-      uri.clone(),
-      Url::from_file_path(original).unwrap().to_string(),
-    ] {
-      let response = server.request("textDocument/rename", json!({"textDocument":{"uri":requested},"position":{"line":0,"character":0},"newName":"y"})).await;
-      assert_eq!(response["error"]["code"], -32801);
-      assert!(response.get("result").is_none());
+    let document = json!({"textDocument":{"uri":uri}});
+    let position =
+      json!({"textDocument":{"uri":uri},"position":{"line":0,"character":8}});
+    let original = Url::from_file_path(original).unwrap().to_string();
+    let requests = [
+      ("textDocument/semanticTokens/full", document.clone()),
+      ("textDocument/documentSymbol", document.clone()),
+      ("textDocument/documentLink", document),
+      ("textDocument/definition", position.clone()),
+      ("textDocument/prepareRename", position),
+      (
+        "textDocument/rename",
+        json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0},"newName":"y"}),
+      ),
+      (
+        "textDocument/rename",
+        json!({"textDocument":{"uri":original},"position":{"line":0,"character":0},"newName":"y"}),
+      ),
+      (
+        "textDocument/definition",
+        json!({"textDocument":{"uri":main_uri},"position":{"line":1,"character":3}}),
+      ),
+      (
+        "textDocument/documentLink",
+        json!({"textDocument":{"uri":main_uri}}),
+      ),
+      (
+        "textDocument/documentSymbol",
+        json!({"textDocument":{"uri":original}}),
+      ),
+      ("workspace/symbol", json!({"query":"x"})),
+    ];
+    for target in [&directory, &replacement] {
+      std::fs::remove_file(&alias).unwrap();
+      std::os::unix::fs::symlink(target, &alias).unwrap();
+      for (method, params) in &requests {
+        let response = server.request(method, params.clone()).await;
+        assert_eq!(
+          response["error"]["code"], -32801,
+          "{target:?} {method} {params}"
+        );
+        assert!(
+          response.get("result").is_none(),
+          "{target:?} {method} {params}"
+        );
+      }
     }
     server
       .notify("textDocument/didClose", json!({"textDocument":{"uri":uri}}))
@@ -933,6 +1034,64 @@ mod lsp {
     assert_eq!(responses[1]["result"][0]["name"], "second");
   }
 
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn workspace_folders_are_removed_by_their_client_paths() {
+    async fn names(server: &mut Client) -> Vec<Value> {
+      let result = server
+        .request("workspace/symbol", json!({"query":""}))
+        .await;
+      result["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|symbol| symbol["name"].clone())
+        .collect()
+    }
+    async fn folders(server: &mut Client, change: &str, folder: &Value) {
+      let event = if change == "added" {
+        json!({"added":[folder],"removed":[]})
+      } else {
+        json!({"added":[],"removed":[folder]})
+      };
+      server
+        .notify(
+          "workspace/didChangeWorkspaceFolders",
+          json!({ "event": event }),
+        )
+        .await;
+    }
+    let fixture = Fixture::new();
+    fixture.write("real/a.sh", "real=1");
+    fixture.write("other/b.sh", "other=2");
+    let link = fixture.root.join("link");
+    std::os::unix::fs::symlink(fixture.root.join("real"), &link).unwrap();
+    let link_folder =
+      json!({"uri":Url::from_file_path(&link).unwrap(),"name":"link"});
+    let real_folder = json!({"uri":Url::from_file_path(fixture.root.join("real")).unwrap(),"name":"real"});
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    server
+      .request(
+        "initialize",
+        json!({"capabilities":{},"workspaceFolders":[link_folder,real_folder]}),
+      )
+      .await;
+    server.notify("initialized", json!({})).await;
+    assert_eq!(names(&mut server).await, ["real"]);
+    folders(&mut server, "removed", &link_folder).await;
+    assert_eq!(names(&mut server).await, ["real"]);
+    folders(&mut server, "removed", &real_folder).await;
+    assert_eq!(names(&mut server).await, Vec::<Value>::new());
+    folders(&mut server, "added", &link_folder).await;
+    assert_eq!(names(&mut server).await, ["real"]);
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(fixture.root.join("other"), &link).unwrap();
+    server.notify("workspace/didChangeWatchedFiles", json!({"changes":[{"uri":Url::from_file_path(&link).unwrap(),"type":2}]})).await;
+    assert_eq!(names(&mut server).await, ["other"]);
+    folders(&mut server, "removed", &link_folder).await;
+    assert_eq!(names(&mut server).await, Vec::<Value>::new());
+  }
+
   #[tokio::test]
   async fn workspace_folder_changes_and_file_notifications_refresh_collected_symbols()
    {
@@ -969,19 +1128,32 @@ mod lsp {
       Url::from_file_path(&first).unwrap().as_str(),
     )
     .await;
+    let virtual_folder = json!({"uri":"untitled:folder","name":"virtual"});
     server
       .notify(
         "workspace/didChangeWorkspaceFolders",
-        json!({"event":{"removed":[first_folder],"added":[second_folder]}}),
+        json!({"event":{"removed":[first_folder],"added":[virtual_folder,second_folder]}}),
       )
       .await;
+    assert!(
+      log_message(&mut server).await["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Expected a file URI")
+    );
     let result = server
       .request("workspace/symbol", json!({"query":""}))
       .await;
     assert_eq!(result["result"].as_array().unwrap().len(), 1);
     assert_eq!(result["result"][0]["name"], "second");
     std::fs::write(&second, "updated=3").unwrap();
-    server.notify("workspace/didChangeWatchedFiles", json!({"changes":[{"uri":Url::from_file_path(&second).unwrap(),"type":2}]})).await;
+    server.notify("workspace/didChangeWatchedFiles", json!({"changes":[{"uri":"untitled:buffer","type":2},{"uri":Url::from_file_path(&second).unwrap(),"type":2}]})).await;
+    assert!(
+      log_message(&mut server).await["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Expected a file URI")
+    );
     let result = server
       .request("workspace/symbol", json!({"query":""}))
       .await;

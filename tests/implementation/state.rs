@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn positional_joins_keep_cardinality_causes_separate_from_element_causes() {
+  let mut left = Environment::new(&InitialEnvironment::empty());
+  left.positional =
+    Positionals::Known(vec![Value::Unknown(ValueIssue::SizeLimit)]);
+  let right = Environment::new(&InitialEnvironment::empty());
+  left.join(&right);
+  assert_eq!(left.parameter(b"#").0, Value::Unknown(ValueIssue::Dynamic));
+  assert_eq!(
+    left
+      .parameter(b"1")
+      .0
+      .issue()
+      .unwrap()
+      .causes()
+      .collect::<Vec<_>>(),
+    [ValueIssue::Dynamic, ValueIssue::SizeLimit]
+  );
+
+  let mut right = right;
+  right.positional = Positionals::unknown(ValueIssue::Arithmetic);
+  left.join(&right);
+  assert_eq!(
+    left
+      .parameter(b"#")
+      .0
+      .issue()
+      .unwrap()
+      .causes()
+      .collect::<Vec<_>>(),
+    [ValueIssue::Dynamic, ValueIssue::Arithmetic]
+  );
+  assert_eq!(
+    left
+      .parameter(b"1")
+      .0
+      .issue()
+      .unwrap()
+      .causes()
+      .collect::<Vec<_>>(),
+    [
+      ValueIssue::Dynamic,
+      ValueIssue::SizeLimit,
+      ValueIssue::Arithmetic
+    ]
+  );
+}
+
+#[test]
 fn patterned_fallbacks_survive_joins_and_allow_explicit_overwrites() {
   let absent = Binding::new(initial(InitialBinding::Absent));
   let explicit = Binding {
@@ -16,6 +64,7 @@ fn patterned_fallbacks_survive_joins_and_allow_explicit_overwrites() {
   left.restrict(
     Value::partial(b"tmp_".to_vec(), Vec::new(), 4, ValueIssue::Dynamic),
     ResolutionIssue::DynamicName,
+    ValueIssue::Dynamic,
   );
   let right = Names {
     values: OrdMap::from_iter([(b"tmp_x".to_vec(), explicit.clone())]),
@@ -155,5 +204,13 @@ fn word_and_output_preserve_constraints_across_boundaries() {
     ),
     4,
   );
-  assert_eq!(bounded.scalar(), Value::Unknown(ValueIssue::SizeLimit));
+  assert_eq!(
+    bounded
+      .scalar()
+      .issue()
+      .unwrap()
+      .causes()
+      .collect::<Vec<_>>(),
+    [ValueIssue::Dynamic, ValueIssue::SizeLimit]
+  );
 }

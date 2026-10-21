@@ -135,7 +135,7 @@ impl ValueConstraint {
 }
 
 impl Value {
-  pub(crate) fn partial(
+  pub(in crate::interface::application::engine) fn partial(
     prefix: Vec<u8>,
     suffix: Vec<u8>,
     minimum: usize,
@@ -175,20 +175,28 @@ impl Value {
     }) {
       return Self::Unknown(issue);
     }
-    // Widen within first-byte partitions to bound growing loop values.
+    // Widen within first-byte partitions to bound growing loop values. A
+    // choice without a known first byte widens all choices but the empty
+    // value into one.
     let choices = if choices
       .iter()
       .any(|choice| !choice.exact && choice.prefix.is_empty())
     {
-      vec![
-        choices
-          .into_iter()
-          .reduce(|mut a, b| {
-            a.hull(&b);
-            a
-          })
-          .unwrap_or_else(ValueConstraint::any),
-      ]
+      let empty = ValueConstraint::literal(Vec::new());
+      let kept = choices.contains(&empty);
+      let hull = choices
+        .into_iter()
+        .filter(|choice| *choice != empty)
+        .reduce(|mut a, b| {
+          a.hull(&b);
+          a
+        })
+        .unwrap_or_else(ValueConstraint::any);
+      if kept && !hull.accepts(&[]) {
+        vec![empty, hull]
+      } else {
+        vec![hull]
+      }
     } else {
       let mut groups =
         std::collections::BTreeMap::<Option<u8>, ValueConstraint>::new();
@@ -215,7 +223,9 @@ impl Value {
     Self::Partial(PartialValue { choices, issue })
   }
 
-  pub(crate) fn constraints(&self) -> Vec<ValueConstraint> {
+  pub(in crate::interface::application::engine) fn constraints(
+    &self,
+  ) -> Vec<ValueConstraint> {
     match self {
       Self::Literal(bytes) => vec![ValueConstraint::literal(bytes.clone())],
       Self::Partial(value) => value.choices.clone(),
@@ -234,7 +244,7 @@ impl Value {
       .unwrap_or_else(ValueConstraint::any)
   }
 
-  pub(crate) fn known_size(&self) -> usize {
+  pub(in crate::interface::application::engine) fn known_size(&self) -> usize {
     match self {
       Self::Literal(bytes) => bytes.len(),
       Self::Partial(value) => value
@@ -247,14 +257,18 @@ impl Value {
     }
   }
 
-  pub(crate) fn known_prefix(&self) -> Vec<u8> {
+  pub(in crate::interface::application::engine) fn known_prefix(
+    &self,
+  ) -> Vec<u8> {
     if let Self::Literal(bytes) = self {
       return bytes.clone();
     }
     self.hull().prefix
   }
 
-  pub(crate) fn issue(&self) -> Option<ValueIssue> {
+  pub(in crate::interface::application::engine) fn issue(
+    &self,
+  ) -> Option<ValueIssue> {
     match self {
       Self::Literal(_) => None,
       Self::Partial(value) => Some(value.issue),
@@ -262,23 +276,42 @@ impl Value {
     }
   }
 
-  fn combined_issue(&self, other: &Self) -> ValueIssue {
+  pub(in crate::interface::application::engine) fn literal(
+    &self,
+  ) -> Result<&[u8], ValueIssue> {
+    match self {
+      Self::Literal(bytes) => Ok(bytes),
+      _ => Err(self.issue().expect("unknown value")),
+    }
+  }
+
+  fn combined_issue(
+    &self,
+    other: &Self,
+    cause: Option<ValueIssue>,
+  ) -> ValueIssue {
     self
       .issue()
       .into_iter()
       .chain(other.issue())
+      .chain(cause)
       .reduce(ValueIssue::combine)
       .unwrap_or(ValueIssue::Dynamic)
   }
 
-  pub(crate) fn empty(&self) -> Option<bool> {
+  pub(in crate::interface::application::engine) fn empty(
+    &self,
+  ) -> Option<bool> {
     if let Self::Literal(bytes) = self {
       return Some(bytes.is_empty());
     }
     (!self.can_equal(b"")).then_some(false)
   }
 
-  pub(crate) fn can_equal(&self, bytes: &[u8]) -> bool {
+  pub(in crate::interface::application::engine) fn can_equal(
+    &self,
+    bytes: &[u8],
+  ) -> bool {
     match self {
       Self::Literal(value) => value == bytes,
       Self::Partial(value) => {
@@ -288,7 +321,10 @@ impl Value {
     }
   }
 
-  pub(crate) fn may_start_with(&self, prefix: &[u8]) -> bool {
+  pub(in crate::interface::application::engine) fn may_start_with(
+    &self,
+    prefix: &[u8],
+  ) -> bool {
     if let Self::Literal(bytes) = self {
       return bytes.starts_with(prefix);
     }
@@ -301,7 +337,7 @@ impl Value {
     })
   }
 
-  pub(crate) fn may_be_name(&self) -> bool {
+  pub(in crate::interface::application::engine) fn may_be_name(&self) -> bool {
     if let Self::Literal(bytes) = self {
       return !bytes.is_empty() && !bytes.contains(&b'/');
     }
@@ -311,7 +347,10 @@ impl Value {
     })
   }
 
-  pub(crate) fn intersects(&self, other: &Self) -> bool {
+  pub(in crate::interface::application::engine) fn intersects(
+    &self,
+    other: &Self,
+  ) -> bool {
     let left = self.constraints();
     let right = other.constraints();
     left.iter().any(|left| {
@@ -330,7 +369,10 @@ impl Value {
     })
   }
 
-  pub(crate) fn covers(&self, other: &Self) -> bool {
+  pub(in crate::interface::application::engine) fn covers(
+    &self,
+    other: &Self,
+  ) -> bool {
     if self == other {
       return true;
     }
@@ -350,17 +392,33 @@ impl Value {
       .all(|right| left.iter().any(|left| left.covers(right)))
   }
 
-  pub(crate) fn join(&mut self, other: &Self) {
-    if self == other {
-      return;
+  pub(in crate::interface::application::engine) fn join(
+    &mut self,
+    other: &Self,
+  ) {
+    if self != other {
+      self.join_choice(other, None);
     }
-    let issue = self.combined_issue(other);
+  }
+
+  /// Joins `other` as the alternative of a choice that `cause` leaves
+  /// undetermined.
+  pub(in crate::interface::application::engine) fn join_choice(
+    &mut self,
+    other: &Self,
+    cause: Option<ValueIssue>,
+  ) {
+    let issue = self.combined_issue(other, cause);
     let mut choices = self.constraints();
     choices.extend(other.constraints());
     *self = Self::constrained(choices, issue);
   }
 
-  pub(crate) fn concat(&mut self, other: &Self, limit: usize) {
+  pub(in crate::interface::application::engine) fn concat(
+    &mut self,
+    other: &Self,
+    limit: usize,
+  ) {
     if let (Self::Literal(left), Self::Literal(right)) = (&mut *self, other) {
       if right.len() > limit.saturating_sub(left.len()) {
         *self = Self::Unknown(ValueIssue::SizeLimit);
@@ -375,7 +433,7 @@ impl Value {
     if *self == Self::Literal(Vec::new()) {
       *self = other.clone();
     } else {
-      let issue = self.combined_issue(other);
+      let issue = self.combined_issue(other, None);
       let right = other.hull();
       let mut choices = Vec::new();
       for left in self.constraints() {
@@ -388,11 +446,14 @@ impl Value {
       *self = Self::constrained(choices, issue);
     }
     if self.known_size() > limit {
-      *self = Self::Unknown(ValueIssue::SizeLimit);
+      *self =
+        Self::Unknown(self.issue().map_or(ValueIssue::SizeLimit, |issue| {
+          issue.combine(ValueIssue::SizeLimit)
+        }));
     }
   }
 
-  pub(crate) fn trim_newlines(&mut self) {
+  pub(in crate::interface::application::engine) fn trim_newlines(&mut self) {
     if let Self::Literal(bytes) = self {
       while bytes.last() == Some(&b'\n') {
         bytes.pop();
@@ -407,7 +468,10 @@ impl Value {
     *self = Self::constrained(choices, issue);
   }
 
-  pub(crate) fn remove_prefix(&self, length: usize) -> Self {
+  pub(in crate::interface::application::engine) fn remove_prefix(
+    &self,
+    length: usize,
+  ) -> Self {
     let mut choices = self.constraints();
     if choices.iter().any(|choice| choice.prefix.len() < length) {
       return Self::Unknown(self.issue().unwrap_or(ValueIssue::Dynamic));
@@ -429,7 +493,10 @@ impl Value {
     Self::constrained(choices, self.issue().unwrap_or(ValueIssue::Dynamic))
   }
 
-  pub(crate) fn before(&self, delimiter: u8) -> Self {
+  pub(in crate::interface::application::engine) fn before(
+    &self,
+    delimiter: u8,
+  ) -> Self {
     let mut choices = self.constraints();
     for choice in &mut choices {
       if let Some(index) = choice.prefix.iter().position(|b| *b == delimiter) {
@@ -495,7 +562,10 @@ impl ValueIssue {
     }
   }
 
-  pub(crate) fn combine(self, other: Self) -> Self {
+  pub(in crate::interface::application::engine) fn combine(
+    self,
+    other: Self,
+  ) -> Self {
     if self == other {
       self
     } else {

@@ -491,10 +491,10 @@ mod documents {
   }
 
   #[test]
-  fn source_paths_cannot_traverse_a_regular_file_as_a_directory() {
+  fn source_paths_cannot_traverse_files_or_missing_directories() {
     let fixture = Fixture::new();
     fixture.write("regular", "not a directory");
-    fixture.write("lib.sh", "wrong=1\n");
+    let library = fixture.write("lib.sh", "wrong=1\n");
     let main = fixture.write("main.sh", ". ./regular/../lib.sh\n");
     let cancel = AtomicBool::new(false);
     let settings = Settings::new(fixture.root.clone());
@@ -503,6 +503,11 @@ mod documents {
     let id = app.document_id(&main).unwrap();
     assert_eq!(app.document_links(id, &cancel).unwrap(), []);
     assert_eq!(app.workspace().symbols_named(b"wrong").count(), 0);
+    app.open(&library, "wrong=1\n", &cancel).unwrap();
+    for source in [". ./regular/../lib.sh\n", ". ./missing/../lib.sh\n"] {
+      app.open(&main, source, &cancel).unwrap();
+      assert_eq!(app.document_links(id, &cancel).unwrap(), [], "{source}");
+    }
   }
 
   #[test]
@@ -887,7 +892,7 @@ mod documents {
     settings
       .initial
       .environment
-      .insert(b"PATH".to_vec(), Vec::new());
+      .insert(b"PATH".to_vec(), b"./missing:".to_vec());
     let mut app = Application::new(settings).unwrap();
     let cancelled = AtomicBool::new(false);
     app.add_input(&entry);
@@ -1154,22 +1159,37 @@ mod environment {
   }
 
   #[test]
-  fn shell_initialized_variables_do_not_select_unset_defaults() {
+  fn shell_initialized_variables_skip_unset_defaults_and_held_ones_are_set() {
     let fixture = Fixture::new();
     fixture.write("default.sh", ":\n");
-    for name in ["LINENO", "PPID", "PS1", "PS2", "PS4"] {
-      let main =
-        fixture.write("main.sh", &format!(". \"${{{name}-./default.sh}}\"\n"));
-      let mut app = application(&fixture);
-      app.add_input(&main);
-      let cancelled = AtomicBool::new(false);
-      app.refresh(&cancelled).unwrap();
-      let id = app.document_id(&main).unwrap();
-      assert!(
-        app.document_links(id, &cancelled).unwrap().is_empty(),
-        "{name}"
-      );
-      assert_eq!(app.workspace().documents().count(), 1, "{name}");
+    for (name, held) in [
+      ("LINENO", true),
+      ("PPID", true),
+      ("PS1", false),
+      ("PS2", false),
+      ("PS4", false),
+    ] {
+      for (source, linked) in [
+        (format!(". \"${{{name}-./default.sh}}\"\n"), false),
+        (format!(". \"${{{name}+./default.sh}}\"\n"), held),
+      ] {
+        let main = fixture.write("main.sh", &source);
+        let mut app = application(&fixture);
+        app.add_input(&main);
+        let cancelled = AtomicBool::new(false);
+        app.refresh(&cancelled).unwrap();
+        let id = app.document_id(&main).unwrap();
+        assert_eq!(
+          app.document_links(id, &cancelled).unwrap().len(),
+          usize::from(linked),
+          "{source}"
+        );
+        assert_eq!(
+          app.workspace().documents().count(),
+          1 + usize::from(linked),
+          "{source}"
+        );
+      }
     }
   }
 
@@ -1496,6 +1516,9 @@ mod paths {
     fixture.write("lib/visible.sh", "visible=1");
     fixture.write("lib/.hidden.sh", "hidden=1");
     fixture.write("lib/nested/leaf.sh", "nested=1");
+    fixture.write("dot/x.hidden.sh", "visible=1");
+    fixture.write("dot/.hidden.sh", "hidden=1");
+    fixture.write("escaped/\\x.sh", "escaped=1");
     for (source, targets) in [
       (". ./lib/*.sh", vec!["lib/visible.sh"]),
       (". ./lib/.*.sh", vec!["lib/.hidden.sh"]),
@@ -1503,6 +1526,13 @@ mod paths {
       (". ./lib/visible.sh/*.sh", vec![]),
       (". ./lib/missing*.sh", vec![]),
       (". './lib/*.sh'", vec![]),
+      (". ./dot/*[.]hidden.sh", vec![]),
+      (
+        r"pattern='./lib/\v*.sh'; . $pattern",
+        vec!["lib/visible.sh"],
+      ),
+      (r"pattern='./\lib/*.sh'; . $pattern", vec!["lib/visible.sh"]),
+      (r"pattern='./escaped/\*.sh'; . $pattern", vec![]),
     ] {
       let main = fixture.write("main.sh", source);
       let mut settings = Settings::new(fixture.root.clone());
@@ -1548,6 +1578,7 @@ mod paths {
       "CDPATH=.; cd sub; . ./library2.sh",
       "HOME=./sub; cd; . ./library2.sh",
       "cd sub; cd ..; cd -; . ./library2.sh",
+      "cd sub/; . ./library2.sh",
       "cd sub; (cd ..); . ./library2.sh",
     ] {
       let main = fixture.write("main.sh", source);
@@ -1564,6 +1595,103 @@ mod paths {
       assert_eq!(
         app.workspace().symbols_named(b"found").count(),
         1,
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn cd_sets_pwd_and_pwd_output_only_for_spellings_posix_fixes() {
+    use shellsmith::interface::application::engine::{
+      OccurrenceKind, Value, ValueIssue,
+    };
+    let fixture = Fixture::new();
+    fixture.write("sub/a/file.sh", "");
+    let root = fixture.root.to_str().unwrap();
+    let exact = |path: String| Value::Literal(path.into_bytes());
+    let unspecified = Value::Unknown(ValueIssue::Unspecified);
+    for (source, expected) in [
+      (
+        "cd sub; result=$PWD".to_owned(),
+        exact(format!("{root}/sub")),
+      ),
+      (
+        "cd ./sub/./a; result=$PWD".to_owned(),
+        exact(format!("{root}/sub/a")),
+      ),
+      (
+        "CDPATH=sub/; cd a; result=$PWD".to_owned(),
+        exact(format!("{root}/sub/a")),
+      ),
+      (
+        format!("cd /{root}/sub; result=$PWD"),
+        exact(format!("/{root}/sub")),
+      ),
+      ("cd /..; result=$PWD".to_owned(), exact("/..".to_owned())),
+      (
+        "cd sub; cd ..; result=$OLDPWD".to_owned(),
+        exact(format!("{root}/sub")),
+      ),
+      (
+        "cd sub; result=$(command -p pwd)".to_owned(),
+        exact(format!("{root}/sub")),
+      ),
+      ("cd sub/; result=$PWD".to_owned(), unspecified.clone()),
+      ("cd sub; cd ..; result=$PWD".to_owned(), unspecified.clone()),
+      ("cd sub; cd .; result=$PWD".to_owned(), unspecified.clone()),
+      ("cd sub//a; result=$PWD".to_owned(), unspecified.clone()),
+      (
+        "cd sub/; cd a; result=$OLDPWD".to_owned(),
+        unspecified.clone(),
+      ),
+      (
+        "cd sub/; result=$(command -p pwd)".to_owned(),
+        unspecified.clone(),
+      ),
+      (
+        "cd /..; result=$(command -p pwd)".to_owned(),
+        Value::Unknown(ValueIssue::UnsupportedExpansion),
+      ),
+      (
+        "readonly PWD; PWD=/x; result=$(command -p pwd)".to_owned(),
+        exact(root.to_owned()),
+      ),
+      (
+        "readonly PWD; cd sub; result=$(command -p pwd)".to_owned(),
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+    ] {
+      let source = format!("{source}; : \"$result\"");
+      let main = fixture.write("main.sh", &source);
+      let mut settings = Settings::new(fixture.root.clone());
+      settings.initial = InitialEnvironment::empty();
+      let mut app = Application::new(settings).unwrap();
+      app.add_input(&main);
+      app.refresh(&AtomicBool::new(false)).unwrap();
+      let id = app.document_id(&main).unwrap();
+      app.classify(id, &AtomicBool::new(false)).unwrap();
+      let read = app
+        .workspace()
+        .document(id)
+        .unwrap()
+        .occurrences()
+        .iter()
+        .rev()
+        .find(|site| {
+          site.kind == OccurrenceKind::VariableExpansion
+            && site.name == Value::Literal(b"result".to_vec())
+        })
+        .unwrap()
+        .id;
+      assert_eq!(
+        app
+          .workspace()
+          .analysis()
+          .unwrap()
+          .values(read)
+          .map(|(_, value)| value.clone())
+          .collect::<Vec<_>>(),
+        [expected],
         "{source}"
       );
     }
@@ -1596,6 +1724,20 @@ mod paths {
           "trap \"cd '{directory}'; . ./library.sh\" EXIT; PWD=/elsewhere"
         ),
         false,
+      ),
+      (
+        format!("read name; read \"$name\"; cd '{directory}'; . ./library.sh"),
+        false,
+      ),
+      (
+        format!("read name; read \"x$name\"; cd '{directory}'; . ./library.sh"),
+        true,
+      ),
+      (
+        format!(
+          "f() {{ cd \"$1\"; f x; }}; f a; cd '{directory}'; . ./library.sh"
+        ),
+        true,
       ),
     ] {
       let main = fixture.write("main.sh", &source);
@@ -2094,6 +2236,56 @@ mod sources {
           .collect::<Vec<_>>(),
         [&expected.clone()],
         "{annotation}"
+      );
+    }
+  }
+
+  #[test]
+  fn source_annotations_resolve_a_leading_tilde_with_the_initial_home() {
+    let fixture = Fixture::new();
+    let home = fixture.write("home/lib.sh", ":\n");
+    let literal = fixture.write("nested/~/lib.sh", ":\n");
+    let user = fixture.write("nested/~user/lib.sh", ":\n");
+    let home_directory = fixture.root.join("home");
+    let home_bytes = home_directory.as_os_str().as_encoded_bytes().to_vec();
+    for (annotation, assignment, initial_home, expected) in [
+      ("~/lib.sh", "", Some(home_bytes.clone()), vec![&home]),
+      ("\"~/lib.sh\"", "", Some(home_bytes.clone()), vec![&home]),
+      (
+        "~/lib.sh",
+        "HOME=/elsewhere\n",
+        Some(home_bytes.clone()),
+        vec![&home],
+      ),
+      ("~user/lib.sh", "", Some(home_bytes.clone()), vec![&user]),
+      ("./~/lib.sh", "", Some(home_bytes), vec![&literal]),
+      ("~/lib.sh", "", None, vec![]),
+      ("~/lib.sh", "", Some(Vec::new()), vec![]),
+      ("~/lib.sh", "", Some(b"home".to_vec()), vec![]),
+    ] {
+      let source = format!(
+        "read path\n{assignment}# shellsmith source={annotation}\n. \"$path\"\n"
+      );
+      let main = fixture.write("nested/main.sh", &source);
+      let mut settings = Settings::new(fixture.root.clone());
+      settings.initial = InitialEnvironment::empty();
+      if let Some(value) = initial_home.clone() {
+        settings.initial.environment.insert(b"HOME".to_vec(), value);
+      }
+      let mut app = Application::new(settings).unwrap();
+      let cancel = AtomicBool::new(false);
+      app.open(&main, &source, &cancel).unwrap();
+      let id = app.document_id(&main).unwrap();
+      assert_eq!(
+        app
+          .document_links(id, &cancel)
+          .unwrap()
+          .iter()
+          .map(|(_, path)| path)
+          .collect::<Vec<_>>(),
+        expected,
+        "{annotation} {:?}",
+        initial_home.as_deref().map(String::from_utf8_lossy)
       );
     }
   }
@@ -2647,10 +2839,19 @@ mod sources {
     let fixture = fixtures::Fixture::new();
     let first = fixture.write("first/lib.sh", "loaded=first\n");
     let second = fixture.write("second/lib.sh", "loaded=second\n");
+    let current = fixture.write("lib.sh", "loaded=current\n");
+    fixture.write("percent%/lib.sh", "loaded=percent\n");
     for (source, expected) in [
       (
         "PATH=./first; . lib.sh; PATH=./second; . lib.sh",
         vec![first.clone(), second.clone()],
+      ),
+      ("PATH=:./first; . lib.sh", vec![current.clone()]),
+      ("PATH=; . lib.sh", vec![]),
+      ("PATH=./percent%; . lib.sh", vec![]),
+      (
+        "PATH=./first; PATH=./second x=$(. lib.sh) command :",
+        vec![],
       ),
       ("PATH=./first; PATH=./second . lib.sh", vec![second.clone()]),
       (
@@ -3212,6 +3413,11 @@ mod rename {
         "f() { :; }; trap 'f' EXIT; f",
         "f()",
         "next() { :; }; trap 'next' EXIT; next",
+      ),
+      (
+        "f() { :; }; trap f EXIT",
+        "f()",
+        "next() { :; }; trap next EXIT",
       ),
       (
         "x=1; trap ': \"$x\"; x=2; : \"$x\"' EXIT; : $x",
@@ -3857,7 +4063,8 @@ mod rename {
       "readonly \"other=$value\"",
       "export \"tmp_$target=value\"",
       "readonly \"tmp_$target=value\"",
-      "getopts \"$options\" selected \"$@\"",
+      "getopts \":$options\" selected \"$@\"",
+      "getopts -- \"$options\" selected \"$@\"",
       "getopts a selected $arguments",
       "unset -f -- \"$target\"",
       "unset -f fn\"$suffix\"",
@@ -3914,6 +4121,11 @@ mod rename {
         "y",
       ),
       ("x=1; idle() { getopts \"$@\" other; }; : $x", "x=1", "y"),
+      (
+        "x=1; idle() { getopts \"$options\" other \"$@\"; }; : $x",
+        "x=1",
+        "y",
+      ),
       ("x=1; idle() { getopts $options other; }; : $x", "x=1", "y"),
       (
         "x=1; idle() { unset \"$options\" \"$target\"; }; : $x",
@@ -4150,6 +4362,76 @@ mod rename {
         );
       }
     }
+  }
+
+  #[test]
+  fn rename_rejects_optional_reserved_words_as_new_function_names() {
+    let fixture = Fixture::new();
+    let path = fixture.write("main.sh", "");
+    let cancel = AtomicBool::new(false);
+    let mut app = application(&fixture);
+    for source in [
+      "f() { :; }",
+      "f() { :; }; f",
+      "f() { :; }; 'f'",
+      "f() { :; }; \"f\"",
+    ] {
+      app.open(&path, source, &cancel).unwrap();
+      for name in ["function", "namespace", "select", "time"] {
+        assert!(
+          matches!(
+            app.rename(&path, 0, name, &cancel),
+            Err(Error::InvalidName(_))
+          ),
+          "{source} -> {name}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn rename_allows_optional_reserved_variable_names_and_replacing_function_names()
+   {
+    for (name, variable, function) in [
+      ("function", "function=1; : $function", "function() { :; }"),
+      (
+        "namespace",
+        "namespace=1; : $namespace",
+        "namespace() { :; }",
+      ),
+      ("select", "select=1; : $select", "select() { :; }"),
+      ("time", "time=1; : $time", "time() { :; }"),
+    ] {
+      assert_renamed("x=1; : $x", "x=", name, variable);
+      assert_renamed(variable, name, "x", "x=1; : $x");
+      assert_renamed(function, name, "f", "f() { :; }");
+    }
+  }
+
+  #[test]
+  fn rename_requests_keep_trap_body_symbols_of_other_inputs() {
+    let fixture = Fixture::new();
+    let trap = fixture.write("a.sh", "trap 'f() { :; }' EXIT\n");
+    let main = fixture.write("b.sh", "x=1; : $x\n");
+    let mut app = application(&fixture);
+    app.add_input(&fixture.root);
+    let cancel = AtomicBool::new(false);
+    app.refresh(&cancel).unwrap();
+    let symbols = |app: &Application| {
+      let id = app.document_id(&trap).unwrap();
+      let names: Vec<_> = app
+        .document_symbols(id)
+        .unwrap()
+        .map(|entry| entry.details.symbol.name.clone())
+        .collect();
+      (names, app.workspace_symbols("f").count())
+    };
+    let expected = (vec![b"f".to_vec()], 1);
+    assert_eq!(symbols(&app), expected);
+    assert!(app.prepare_rename(&main, 0, &cancel).unwrap().is_some());
+    assert_eq!(symbols(&app), expected);
+    assert_eq!(app.rename(&main, 0, "y", &cancel).unwrap().len(), 2);
+    assert_eq!(symbols(&app), expected);
   }
 
   #[test]

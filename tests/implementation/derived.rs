@@ -1,6 +1,24 @@
 use super::*;
 use crate::interface::application::engine::AnalysisRequest;
 
+struct NoInputs;
+
+impl engine::AnalysisInputs for NoInputs {
+  fn source(
+    &mut self,
+    input: &engine::SourceInput,
+  ) -> Result<engine::SourceDocument, Error> {
+    panic!("Unexpected source input: {input:?}")
+  }
+
+  fn evaluate(
+    &mut self,
+    query: &engine::InputQuery,
+  ) -> Result<engine::InputResult, Error> {
+    panic!("Unexpected query: {query:?}")
+  }
+}
+
 #[test]
 fn projected_symbol_details_require_agreement_on_ranges_and_containers() {
   let cancel = AtomicBool::new(false);
@@ -41,7 +59,6 @@ fn projected_symbol_details_require_agreement_on_ranges_and_containers() {
         registration,
         Ok(Some((
           DerivedOrigin {
-            registration,
             argument: Location {
               snapshot,
               bytes: 5..19,
@@ -111,7 +128,6 @@ fn symbol_hierarchy_preserves_known_names_without_inventing_generated_ranges() {
       registration,
       Ok(Some((
         DerivedOrigin {
-          registration,
           argument: Location {
             snapshot,
             bytes: 15..33,
@@ -195,10 +211,9 @@ fn syntax_index_and_analysis_reuse_body_snapshots_and_invalidate_them_together()
     &indexed,
     &workspace.indexed[&snapshot.document].1
   ));
-  workspace
-    .set_analysis_request(AnalysisRequest::new(snapshot))
+  let result = workspace
+    .analyze(AnalysisRequest::new(snapshot), &mut NoInputs, &cancel)
     .unwrap();
-  let result = workspace.analyze(&cancel).unwrap();
   assert_eq!(result.contexts().len(), 2);
   assert!(matches!(
     result.contexts()[1].kind,
@@ -228,10 +243,14 @@ fn syntax_index_and_analysis_reuse_body_snapshots_and_invalidate_them_together()
   workspace
     .update(next, b"trap 'exit 1' EXIT", &cancel)
     .unwrap();
-  workspace
-    .set_analysis_request(AnalysisRequest::new(next))
-    .unwrap();
-  assert_eq!(workspace.analyze(&cancel).unwrap().contexts().len(), 1);
+  assert_eq!(
+    workspace
+      .analyze(AnalysisRequest::new(next), &mut NoInputs, &cancel)
+      .unwrap()
+      .contexts()
+      .len(),
+    1
+  );
   workspace
     .update(
       Snapshot {
@@ -260,7 +279,6 @@ fn origin(parts: Vec<OriginPart>) -> DerivedOrigin {
     revision: Revision(1),
   };
   DerivedOrigin {
-    registration: OccurrenceId { snapshot, index: 0 },
     argument: Location {
       snapshot,
       bytes: 0..40,
@@ -340,20 +358,12 @@ fn derived_programs_share_text_but_keep_snapshot_identity_and_release_unused_ent
   };
   let document =
     Document::parse(snapshot, b"read x\nread x\n", &cancelled).unwrap();
-  let registrations: Vec<_> = document
-    .occurrences()
-    .iter()
-    .filter(|site| site.kind == engine::OccurrenceKind::Command)
-    .map(|site| site.id)
-    .collect();
-  assert_eq!(registrations.len(), 2);
   let mut workspace = Workspace::default();
   workspace.insert(document).unwrap();
   let mut derived = Vec::new();
-  for (registration, bytes) in registrations.into_iter().zip([5..6, 12..13]) {
+  for bytes in [5..6, 12..13] {
     let (key, origin) = DerivedKey::new(
       DerivedOrigin {
-        registration,
         argument: Location {
           snapshot,
           bytes: bytes.clone(),
@@ -367,13 +377,7 @@ fn derived_programs_share_text_but_keep_snapshot_identity_and_release_unused_ent
       &workspace.derived,
     );
     workspace
-      .add_derived(
-        DerivedCandidate {
-          key: key.clone(),
-          origin,
-        },
-        &cancelled,
-      )
+      .add_derived(key.clone(), origin, &cancelled)
       .unwrap();
     derived.push(workspace.derived_keys[&key]);
   }

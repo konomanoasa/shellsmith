@@ -7,9 +7,10 @@ use super::super::execution::{Environment, Flow, Transfer, alternative};
 use super::super::expansion::Argument;
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::word;
+use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
   Alternative, ArgumentKind, ExecutionKind, Resolution, ResolutionIssue,
-  UseSite, Value, ValueIssue,
+  SymbolId, UseSite, Value, ValueIssue,
 };
 
 #[derive(Clone, Copy)]
@@ -44,7 +45,7 @@ fn argument_use(
     };
     if name != b"command" {
       if super::arguments::numeric_argument(name) {
-        let fields = words.filter(|arg| arg.boundary_known).count()
+        let fields = words.filter(|arg| arg.boundary.is_ok()).count()
           + arguments
             .iter()
             .filter(|node| word::has_guaranteed_field(**node, source))
@@ -53,38 +54,25 @@ fn argument_use(
           return ArgumentUse::Effects;
         }
       }
-      return if super::arguments::uses_arguments(name)
-        || env.io.output.is_some()
+      return if super::builtins::uses_arguments(name) || env.io.output.is_some()
       {
         ArgumentUse::Values
       } else {
         ArgumentUse::Effects
       };
     }
-    loop {
-      let Some(argument) = words.as_slice().first() else {
-        return ArgumentUse::Command;
-      };
-      match forward_option(argument) {
-        ForwardOption::Name => break,
-        ForwardOption::End => {
-          words.next();
-          break;
-        }
-        ForwardOption::Search => {
-          words.next();
-        }
-        ForwardOption::Query => return ArgumentUse::Values,
-        ForwardOption::Invalid | ForwardOption::Unknown => {
-          return ArgumentUse::Effects;
-        }
+    match command_options(words.as_slice()) {
+      Ok(options) if !options.query => {
+        words = words.as_slice()[options.operands..].iter();
       }
+      Ok(_) => return ArgumentUse::Values,
+      Err(_) => return ArgumentUse::Effects,
     }
     suppress = true;
   }
 }
 
-pub(super) enum ForwardOption {
+enum ForwardOption {
   Name,
   End,
   Search,
@@ -93,8 +81,8 @@ pub(super) enum ForwardOption {
   Unknown,
 }
 
-pub(super) fn forward_option(argument: &Argument<'_>) -> ForwardOption {
-  if !argument.boundary_known {
+fn forward_option(argument: &Argument<'_>) -> ForwardOption {
+  if argument.boundary.is_err() {
     return ForwardOption::Unknown;
   }
   let Value::Literal(value) = &argument.value else {
@@ -119,6 +107,49 @@ pub(super) fn forward_option(argument: &Argument<'_>) -> ForwardOption {
   }
 }
 
+pub(super) struct CommandOptions {
+  /// The index of the first operand.
+  pub operands: usize,
+  pub query: bool,
+  pub verbose: bool,
+  pub standard: bool,
+}
+
+/// Parses every option of `command`, or returns why they are unknown.
+pub(super) fn command_options(
+  args: &[Argument<'_>],
+) -> Result<CommandOptions, ResolutionIssue> {
+  let mut options = CommandOptions {
+    operands: args.len(),
+    query: false,
+    verbose: false,
+    standard: false,
+  };
+  for (index, argument) in args.iter().enumerate() {
+    match forward_option(argument) {
+      ForwardOption::Name => {
+        options.operands = index;
+        break;
+      }
+      ForwardOption::End => {
+        options.operands = index + 1;
+        break;
+      }
+      ForwardOption::Search => options.standard = true,
+      ForwardOption::Query => {
+        options.query = true;
+        options.verbose |= matches!(
+          &argument.value,
+          Value::Literal(value) if value.contains(&b'V')
+        );
+      }
+      ForwardOption::Invalid => return Err(ResolutionIssue::UnknownEffect),
+      ForwardOption::Unknown => return Err(ResolutionIssue::DynamicName),
+    }
+  }
+  Ok(options)
+}
+
 #[derive(Clone)]
 struct CallArguments<'a> {
   node: Node<'a>,
@@ -141,10 +172,7 @@ impl<'a> Resolver<'a> {
       .child_by_field_name("suffix")
       .map_or_else(Vec::new, children);
     let redirects = redirects(prefix, &suffix);
-    let Some(command) = node
-      .child_by_field_name("name")
-      .or_else(|| node.child_by_field_name("word"))
-    else {
+    let Some(command) = parser::command_word(node) else {
       return Self::without_command(node, prefix, redirects, env, frame);
     };
     let arguments = suffix
@@ -177,12 +205,7 @@ impl<'a> Resolver<'a> {
     env: Environment,
   ) -> Task<'a> {
     if !env.alternatives.is_empty() {
-      let source = self
-        .workspace
-        .document(call.frame.snapshot.document)
-        .expect("current document")
-        .source
-        .as_bytes();
+      let source = self.workspace.source(call.frame.snapshot.document);
       let usage = argument_use(&call.words, &call.arguments, source, &env);
       let needed = call.arguments.iter().copied().enumerate().filter_map(
         |(index, argument)| {
@@ -195,7 +218,11 @@ impl<'a> Resolver<'a> {
       );
       let names = self.value_dependencies(needed, call.frame);
       if let Some(states) = env.alternatives.select(&env, &names) {
-        return self.alternative_arguments(call, states, Flow::default());
+        return self.each_alternative(
+          states,
+          Flow::default(),
+          move |resolver, env| resolver.command_arguments(call.clone(), env),
+        );
       }
       if matches!(usage, ArgumentUse::Command) && !call.arguments.is_empty() {
         let CallArguments {
@@ -244,23 +271,6 @@ impl<'a> Resolver<'a> {
     )
   }
 
-  fn alternative_arguments(
-    &mut self,
-    call: CallArguments<'a>,
-    mut states: super::super::execution::AlternativeStates,
-    mut flow: Flow,
-  ) -> Task<'a> {
-    let Some(env) = states.next() else {
-      return Task::Done(flow);
-    };
-    self
-      .command_arguments(call.clone(), env)
-      .then(move |resolver, next| {
-        flow.join(next);
-        resolver.alternative_arguments(call, states, flow)
-      })
-  }
-
   fn expanded_command(
     &mut self,
     node: Node<'a>,
@@ -283,92 +293,105 @@ impl<'a> Resolver<'a> {
     let assignments = assignments(prefix);
     let uncertain_order = !assignments.is_empty()
       && !redirects.is_empty()
-      && !matches!(&name, Value::Literal(name) if !special_builtin(name));
+      && (special_name(&name) || !matches!(name, Value::Literal(_)));
     let order = (env.order.clone(), env.io.input_order_unknown);
     let affected = if uncertain_order {
+      self.gap(node, frame, ResolutionIssue::EvaluationOrder);
       self
         .expansion_targets(assignments.iter().chain(&redirects).copied(), frame)
     } else {
-      std::collections::BTreeSet::new()
+      BTreeSet::new()
     };
     env.order.extend(affected.iter().cloned());
-    if uncertain_order {
-      self.gap(node, frame, ResolutionIssue::EvaluationOrder);
-    }
-    let source = self
-      .workspace
-      .document(frame.snapshot.document)
-      .expect("document")
-      .source
-      .as_bytes();
+    let source = self.workspace.source(frame.snapshot.document);
+    let search = Self::name_search(command, source, &name, &env);
     let io = temporary_redirections(&name, &args)
       .then(|| Redirections::new(&redirects, source, &mut env));
     env.io.input_order_unknown |= uncertain_order;
     Task::sequence(redirects, env, frame).then(
       move |resolver, mut redirected| {
-        let before = redirected.0.remove(&Transfer::Next);
+        let before = redirected.take(Transfer::Next);
         flow.join(redirected);
         let Some(mut before) = before else {
           return Task::Done(flow);
         };
         let input_order = before.io.input_order_unknown && order.1;
         before.io.input_order_unknown |= uncertain_order;
-        let frame = resolver.temporary_prefix(node, &name, &before, frame);
-        let prepared = if assignments.len() > 1
-          && !matches!(&name, Value::Literal(name) if special_builtin(name))
-        {
-          resolver.uncertain_order(node, assignments, before.clone(), frame)
-        } else {
-          Task::sequence(assignments, before.clone(), frame)
-        };
-        prepared.then(move |resolver, mut prepared| {
-          let env = prepared.0.remove(&Transfer::Next);
-          flow.join(prepared);
-          let Some(mut env) = env else {
-            return Task::Done(flow);
-          };
-          env.order = order.0;
-          env.io.input_order_unknown = input_order;
-          if uncertain_order {
-            resolver.invalidate(
-              node,
-              &mut env,
-              frame,
-              ResolutionIssue::EvaluationOrder,
-              affected,
-            );
-          }
-          let resolution = Self::command_resolution(&name, &env, false);
-          if let Some(id) = resolver.site(command, frame) {
-            resolver.record(id, frame.context, resolution.clone(), &env);
-          }
-          if let Some(prefix) = prefix
-            && !matches!(&name, Value::Literal(name) if special_builtin(name))
-          {
-            resolver.prefix_order(node, prefix, &mut env, frame);
-          }
-          resolver
-            .invoke(node, &name, &args, env, frame, Search::Normal)
-            .then(move |resolver, mut called| {
-              if let Some(prefix) = prefix {
-                resolver.restore_prefix(
-                  prefix,
-                  &before,
-                  &name,
-                  &resolution,
-                  &mut called,
-                  frame,
-                );
-              }
-              if let Some(io) = io {
-                io.restore(&mut called);
-              }
-              flow.join(called);
-              Task::Done(flow)
-            })
-        })
+        let frame =
+          resolver.temporary_prefix(node, &name, &before, frame, search);
+        resolver
+          .prefix_assignments(node, assignments, &name, before.clone(), frame)
+          .then(move |resolver, mut prepared| {
+            let env = prepared.take(Transfer::Next);
+            flow.join(prepared);
+            let Some(mut env) = env else {
+              return Task::Done(flow);
+            };
+            env.order = order.0;
+            env.io.input_order_unknown = input_order;
+            if uncertain_order {
+              resolver.invalidate(
+                node,
+                &mut env,
+                frame,
+                ResolutionIssue::EvaluationOrder,
+                ValueIssue::Dynamic,
+                affected,
+              );
+            }
+            let resolution = Self::search_resolution(&name, &env, search);
+            if let Some(id) = resolver.site(command, frame) {
+              resolver.record_use(
+                UseSite::Syntax(id),
+                frame.context,
+                resolution.clone(),
+                None,
+                &env,
+              );
+            }
+            if let Some(prefix) = prefix
+              && !special_name(&name)
+            {
+              resolver.prefix_order(node, prefix, &mut env, frame);
+            }
+            resolver
+              .invoke(node, &name, &args, env, frame, search)
+              .then(move |resolver, mut called| {
+                if let Some(prefix) = prefix {
+                  resolver.restore_prefix(
+                    prefix,
+                    &before,
+                    &name,
+                    &resolution,
+                    &mut called,
+                    frame,
+                  );
+                }
+                if let Some(io) = io {
+                  io.restore(&mut called);
+                }
+                flow.join(called);
+                Task::Done(flow)
+              })
+          })
       },
     )
+  }
+
+  fn prefix_assignments(
+    &mut self,
+    node: Node<'a>,
+    assignments: Vec<Node<'a>>,
+    name: &Value,
+    env: Environment,
+    frame: Frame,
+  ) -> Task<'a> {
+    if assignments.len() > 1 && !special_name(name) {
+      let targets = self.expansion_targets(assignments.iter().copied(), frame);
+      self.uncertain_order(node, assignments, targets, env, frame)
+    } else {
+      Task::sequence(assignments, env, frame)
+    }
   }
 
   fn without_command(
@@ -385,7 +408,7 @@ impl<'a> Resolver<'a> {
     env.io.input_order_unknown |= uncertain_order && !redirects.is_empty();
     Task::sequence(assignments, env, frame).then(move |resolver, mut flow| {
       if !redirects.is_empty()
-        && let Some(env) = flow.0.get_mut(&Transfer::Next)
+        && let Some(env) = flow.get_mut(Transfer::Next)
       {
         let assigned_status = env.substitution_status.take();
         let saved_input = env.io.save_input();
@@ -394,26 +417,22 @@ impl<'a> Resolver<'a> {
           frame,
           ExecutionKind::Redirection,
           frame.snapshot,
-          true,
         );
         let task = if uncertain_order {
-          let mut input = env.clone();
-          input
-            .order
-            .extend(resolver.expansion_targets(possible_writes, frame));
-          resolver.uncertain_order(node, redirects, input, inner)
+          let targets = resolver.expansion_targets(
+            possible_writes.into_iter().chain(redirects.iter().copied()),
+            frame,
+          );
+          resolver.uncertain_order(node, redirects, targets, env.clone(), inner)
         } else {
           Task::sequence(redirects, env.clone(), inner)
         };
         return task.then(move |_, redirects| {
-          if let Some(state) = flow.0.get_mut(&Transfer::Next) {
-            let returned =
-              redirects.0.into_values().reduce(|mut left, right| {
-                left.join(&right);
-                left
-              });
+          if let Some(state) = flow.get_mut(Transfer::Next) {
+            let returned = redirects.merged();
             let mut status = assigned_status;
             if let Some(returned) = returned {
+              state.failure.then(returned.failure);
               if let Some(redirected_status) = returned.substitution_status {
                 if let Some(status) = &mut status {
                   status.join(&redirected_status);
@@ -426,8 +445,7 @@ impl<'a> Resolver<'a> {
             } else {
               state.io.restore_input(saved_input);
             }
-            state.special.insert(
-              b"?".to_vec(),
+            state.set_status(
               status.unwrap_or(Value::Unknown(ValueIssue::Dynamic)),
             );
             state.io.input_order_unknown = previous_input_order;
@@ -435,15 +453,13 @@ impl<'a> Resolver<'a> {
           Task::Done(flow)
         });
       }
-      if let Some(state) = flow.0.get_mut(&Transfer::Next) {
+      if let Some(state) = flow.get_mut(Transfer::Next) {
         state.io.input_order_unknown = previous_input_order;
-        state.special.insert(
-          b"?".to_vec(),
-          state
-            .substitution_status
-            .take()
-            .unwrap_or(Value::Literal(b"0".to_vec())),
-        );
+        let status = state
+          .substitution_status
+          .take()
+          .unwrap_or(Value::Literal(b"0".to_vec()));
+        state.set_status(status);
       }
       Task::Done(flow)
     })
@@ -467,6 +483,7 @@ impl<'a> Resolver<'a> {
       env,
       frame,
       ResolutionIssue::EvaluationOrder,
+      ValueIssue::Dynamic,
       targets,
     );
   }
@@ -477,17 +494,12 @@ impl<'a> Resolver<'a> {
     name: &Value,
     env: &Environment,
     frame: Frame,
+    search: Search,
   ) -> Frame {
     let assignments = assignments(node.child_by_field_name("prefix"));
     if assignments.is_empty()
-      || matches!(name, Value::Literal(name) if special_builtin(name))
-    {
-      return frame;
-    }
-    let resolution = Self::command_resolution(name, env, false);
-    if !resolution.candidates.is_empty()
-      || !resolution.issues.is_empty()
-      || resolution.alternatives.contains(&Alternative::External)
+      || special_name(name)
+      || prefix_may_persist(name, &Self::search_resolution(name, env, search))
     {
       return frame;
     }
@@ -496,7 +508,6 @@ impl<'a> Resolver<'a> {
       frame,
       ExecutionKind::TemporaryAssignments,
       frame.snapshot,
-      false,
     );
     for assignment in assignments {
       if let Some(id) = assignment
@@ -525,13 +536,10 @@ impl<'a> Resolver<'a> {
     flow: &mut Flow,
     frame: Frame,
   ) {
-    if matches!(name, Value::Literal(name) if special_builtin(name)) {
+    if special_name(name) {
       return;
     }
-    let uncertain = !resolution.candidates.is_empty()
-      || !resolution.issues.is_empty()
-      || resolution.alternatives.contains(&Alternative::External)
-      || SPECIAL.iter().any(|special| name.can_equal(special));
+    let uncertain = prefix_may_persist(name, resolution);
     for assignment in children(prefix) {
       let Some(id) = assignment
         .child_by_field_name("name")
@@ -548,7 +556,7 @@ impl<'a> Resolver<'a> {
       if before.readonly(name) == Some(true) {
         continue;
       }
-      for env in flow.0.values_mut() {
+      for env in flow.environments_mut() {
         env.variable_changed(name, None);
         env.alternatives.forget(name);
         let old = before.variables.get(name);
@@ -616,9 +624,7 @@ impl<'a> Resolver<'a> {
     } else if special_builtin(name) {
       alternative(Alternative::Builtin)
     } else if unspecified(name) {
-      let mut result = alternative(Alternative::External);
-      result.issues.insert(ResolutionIssue::UnknownEffect);
-      result
+      unspecified_resolution()
     } else if suppress {
       utility_resolution(name)
     } else {
@@ -627,6 +633,51 @@ impl<'a> Resolver<'a> {
         result.join(&utility_resolution(name));
       }
       result
+    }
+  }
+
+  /// Search for a simple command name, which POSIX leaves unspecified where
+  /// an implementation may recognize the name as a reserved word.
+  pub(super) fn name_search(
+    command: Node<'_>,
+    source: &[u8],
+    name: &Value,
+    env: &Environment,
+  ) -> Search {
+    let Some(word) = command
+      .named_child(0)
+      .filter(|_| command.kind() == "cmd_name")
+    else {
+      return Search::Normal;
+    };
+    let word = word::lexical(word, source);
+    let reserved = if word == b"time" {
+      // `time` runs the time utility wherever that utility would run.
+      Self::command_resolution(name, env, false)
+        != alternative(Alternative::ExternalCommand)
+    } else {
+      optional_reserved_word(&word)
+        || (colon_word(&word)
+          && !word.iter().any(|byte| matches!(byte, b'\\' | b'\'' | b'"')))
+    };
+    if reserved {
+      Search::Reserved
+    } else {
+      Search::Normal
+    }
+  }
+
+  pub(super) fn search_resolution(
+    name: &Value,
+    env: &Environment,
+    search: Search,
+  ) -> Resolution {
+    match search {
+      Search::Normal => Self::command_resolution(name, env, false),
+      Search::Reserved => unspecified_resolution(),
+      Search::SuppressFunctions | Search::Standard => {
+        Self::command_resolution(name, env, true)
+      }
     }
   }
 
@@ -639,8 +690,7 @@ impl<'a> Resolver<'a> {
     frame: Frame,
     search: Search,
   ) -> Task<'a> {
-    let resolution =
-      Self::command_resolution(name, &env, search != Search::Normal);
+    let resolution = Self::search_resolution(name, &env, search);
     if !resolution.candidates.is_empty()
       || !resolution.issues.is_empty()
       || resolution.alternatives != [Alternative::Builtin].into()
@@ -672,7 +722,7 @@ impl<'a> Resolver<'a> {
     self
       .invoke_candidates(node, candidates, &call, Flow::default(), frame)
       .then(move |resolver, mut flow| {
-        for state in flow.0.values_mut() {
+        for state in flow.environments_mut() {
           state.positional.clone_from(&env.positional);
           state.alternatives.restore_positionals(&env.alternatives);
         }
@@ -681,7 +731,7 @@ impl<'a> Resolver<'a> {
             resolver.utility(node, name, args.clone(), env.clone(), frame)
           } else {
             let names = builtin_names(&name, &env, search != Search::Normal);
-            resolver.invoke_builtins(node, names.into_iter(), &args, &env, Flow::default(), frame)
+            resolver.invoke_builtins(node, names.into_iter(), args.clone(), env.clone(), Flow::default(), frame)
           }
         } else { Task::Done(Flow::default()) };
         task.then(move |resolver, builtin| {
@@ -710,10 +760,8 @@ impl<'a> Resolver<'a> {
               external.io.consume_input(None);
             }
             if external.io.stderr_captured && let Some(output) = &mut external.io.output { output.fail(ValueIssue::Dynamic); }
-            external.special.insert(
-              b"?".to_vec(),
-              Value::Unknown(
-                crate::interface::application::engine::ValueIssue::Dynamic,
+            external.set_status(Value::Unknown(
+                ValueIssue::Dynamic,
               ),
             );
             flow.add(Transfer::Next, external);
@@ -728,7 +776,7 @@ impl<'a> Resolver<'a> {
             } else {
               ResolutionIssue::UnknownEffect
             };
-            flow.join(resolver.opaque(node, env, frame, issue));
+            flow.join(resolver.opaque(node, env, frame, issue, None));
           }
           Task::Done(flow)
         })
@@ -739,42 +787,32 @@ impl<'a> Resolver<'a> {
     &mut self,
     node: Node<'a>,
     mut names: std::vec::IntoIter<Vec<u8>>,
-    args: &[Argument<'a>],
-    env: &Environment,
+    args: Vec<Argument<'a>>,
+    env: Environment,
     mut flow: Flow,
     frame: Frame,
   ) -> Task<'a> {
     let Some(name) = names.next() else {
       return Task::Done(flow);
     };
-    let env = env.clone();
-    let args = args.to_vec();
     self
       .utility(node, &name, args.clone(), env.clone(), frame)
       .then(move |resolver, result| {
         flow.join(result);
-        resolver.invoke_builtins(node, names, &args, &env, flow, frame)
+        resolver.invoke_builtins(node, names, args, env, flow, frame)
       })
   }
 
   fn invoke_candidates(
     &mut self,
     node: Node<'a>,
-    mut candidates: std::vec::IntoIter<
-      crate::interface::application::engine::SymbolId,
-    >,
+    mut candidates: std::vec::IntoIter<SymbolId>,
     env: &Environment,
     mut flow: Flow,
     frame: Frame,
   ) -> Task<'a> {
-    let next = candidates.find_map(|id| {
-      self
-        .index
-        .functions
-        .get(&id)
-        .copied()
-        .map(|body| (id, body))
-    });
+    let next = candidates
+      .find_map(|id| self.index.function_body(id).map(|body| (id, body)));
     let Some((id, body)) = next else {
       return Task::Done(flow);
     };
@@ -789,32 +827,22 @@ impl<'a> Resolver<'a> {
       if let Some(output) = &mut env.io.output {
         output.fail(ValueIssue::UnsupportedExpansion);
       }
-      env
-        .special
-        .insert(b"?".to_vec(), Value::Unknown(ValueIssue::Dynamic));
+      env.set_status(Value::Unknown(ValueIssue::Dynamic));
       self.gap(node, frame, ResolutionIssue::Recursion);
       self.invalidate(
         node,
         &mut env,
         frame,
         ResolutionIssue::Recursion,
+        ValueIssue::Dynamic,
         targets,
       );
       Task::Done(Flow::next(env))
     } else {
-      let inner = self.execution(
-        node,
-        frame,
-        ExecutionKind::Function(id),
-        id.snapshot,
-        false,
-      );
-      Task::eval(body, env.clone(), inner).then(|_, mut returned| {
-        if let Some(state) = returned.0.remove(&Transfer::Return) {
-          returned.add(Transfer::Next, state);
-        }
-        Task::Done(returned)
-      })
+      let inner =
+        self.execution(node, frame, ExecutionKind::Function(id), id.snapshot);
+      Task::eval(body, env.clone(), inner)
+        .then(|_, returned| Task::Done(returned.returned()))
     };
     let env = env.clone();
     task.then(move |resolver, returned| {
@@ -830,40 +858,22 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let mut standard_search = false;
-    while let Some(argument) = args.as_slice().first() {
-      match forward_option(argument) {
-        ForwardOption::Name => break,
-        ForwardOption::End => {
-          self.argument_role(argument, None, frame);
-          args.next();
-          break;
+    let options = match command_options(args.as_slice()) {
+      Ok(options) => options,
+      Err(issue) => {
+        let value_issue = super::arguments::argument_issue(args.as_slice());
+        for arg in args {
+          self.argument_role(&arg, None, frame);
         }
-        ForwardOption::Search => {
-          standard_search = true;
-          self.argument_role(argument, None, frame);
-          args.next();
-        }
-        ForwardOption::Query => {
-          return self.command_query(node, args, env, frame);
-        }
-        option @ (ForwardOption::Invalid | ForwardOption::Unknown) => {
-          for arg in args {
-            self.argument_role(&arg, None, frame);
-          }
-          self.non_source(node, frame);
-          return Task::Done(self.opaque(
-            node,
-            env,
-            frame,
-            if matches!(option, ForwardOption::Unknown) {
-              ResolutionIssue::DynamicName
-            } else {
-              ResolutionIssue::UnknownEffect
-            },
-          ));
-        }
+        self.non_source(node, frame);
+        return Task::Done(self.opaque(node, env, frame, issue, value_issue));
       }
+    };
+    for arg in args.by_ref().take(options.operands) {
+      self.argument_role(&arg, None, frame);
+    }
+    if options.query {
+      return self.command_query(node, args, options.verbose, env, frame);
     }
 
     let Some(command) = args.next() else {
@@ -889,7 +899,7 @@ impl<'a> Resolver<'a> {
         resolver.forward(
           node,
           args,
-          flow.0.remove(&Transfer::Next).expect("forward input"),
+          flow.take(Transfer::Next).expect("forward input"),
           frame,
         )
       });
@@ -900,7 +910,7 @@ impl<'a> Resolver<'a> {
       args.as_slice(),
       env,
       frame,
-      if standard_search {
+      if options.standard {
         Search::Standard
       } else {
         Search::SuppressFunctions
@@ -912,34 +922,17 @@ impl<'a> Resolver<'a> {
     &mut self,
     node: Node<'a>,
     mut args: std::vec::IntoIter<Argument<'a>>,
+    verbose: bool,
     mut env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let mut valid = true;
-    let mut verbose = false;
-    let mut output = Value::Unknown(ValueIssue::UnsupportedExpansion);
-    while let Some(arg) = args.as_slice().first() {
-      match forward_option(arg) {
-        ForwardOption::Name => break,
-        ForwardOption::End => {
-          self.argument_role(arg, None, frame);
-          args.next();
-          break;
-        }
-        ForwardOption::Search | ForwardOption::Query => {
-          verbose |= matches!(&arg.value, Value::Literal(value) if value.contains(&b'V'));
-          self.argument_role(arg, None, frame);
-          args.next();
-        }
-        ForwardOption::Invalid | ForwardOption::Unknown => {
-          valid = false;
-          break;
-        }
-      }
-    }
-    if valid && args.len() == 1 {
+    let mut output = Value::Unknown(
+      super::arguments::argument_issue(args.as_slice())
+        .unwrap_or(ValueIssue::UnsupportedExpansion),
+    );
+    if args.len() == 1 {
       let arg = args.next().expect("query operand");
-      if arg.boundary_known {
+      if arg.boundary.is_ok() {
         let resolution = Self::command_resolution(&arg.value, &env, false);
         if !verbose {
           output = query_output(&arg.value, &resolution);
@@ -967,9 +960,7 @@ impl<'a> Resolver<'a> {
     }
     env.emit(output, self.result.request.limits.value_bytes);
     self.non_source(node, frame);
-    env
-      .special
-      .insert(b"?".to_vec(), Value::Unknown(ValueIssue::Dynamic));
+    env.set_status(Value::Unknown(ValueIssue::Dynamic));
     Task::Done(Flow::next(env))
   }
 }
@@ -994,7 +985,7 @@ fn redirects<'a>(
     .collect()
 }
 
-pub(super) const UNSPECIFIED: &[&[u8]] = &[
+const UNSPECIFIED: &[&[u8]] = &[
   b"alloc",
   b"autoload",
   b"bind",
@@ -1056,6 +1047,46 @@ fn unspecified(name: &[u8]) -> bool {
   UNSPECIFIED.contains(&name)
 }
 
+fn unspecified_resolution() -> Resolution {
+  let mut result = alternative(Alternative::External);
+  result.issues.insert(ResolutionIssue::UnknownEffect);
+  result
+}
+
+const RESERVED: &[&[u8]] = &[
+  b"!", b"{", b"}", b"case", b"do", b"done", b"elif", b"else", b"esac", b"fi",
+  b"for", b"if", b"in", b"then", b"until", b"while",
+];
+
+/// Words that an implementation may recognize as reserved words.
+const OPTIONAL_RESERVED: &[&[u8]] =
+  &[b"[[", b"]]", b"function", b"namespace", b"select", b"time"];
+
+#[must_use]
+pub fn reserved_word(word: &[u8]) -> bool {
+  RESERVED.contains(&word)
+}
+
+#[must_use]
+pub fn optional_reserved_word(word: &[u8]) -> bool {
+  OPTIONAL_RESERVED.contains(&word)
+}
+
+/// Whether POSIX reserves `word` for ending in a colon; the `:` utility is
+/// specified separately.
+fn colon_word(word: &[u8]) -> bool {
+  word.len() > 1 && word.ends_with(b":")
+}
+
+/// Whether the prefix assignments of a command named `name`, which is not a
+/// definite special built-in, may persist after it.
+fn prefix_may_persist(name: &Value, resolution: &Resolution) -> bool {
+  !resolution.candidates.is_empty()
+    || !resolution.issues.is_empty()
+    || resolution.alternatives.contains(&Alternative::External)
+    || SPECIAL.iter().any(|special| name.can_equal(special))
+}
+
 const SPECIAL: &[&[u8]] = &[
   b":",
   b".",
@@ -1079,43 +1110,39 @@ pub fn special_builtin(name: &[u8]) -> bool {
   SPECIAL.contains(&name)
 }
 
-const BUILTINS: &[&[u8]] = &[
-  b"command", b"alias", b"unalias", b"read", b"getopts", b"true", b"false",
-  b"echo", b"printf", b"pwd", b"test", b"[", b"cd", b"umask", b"wait", b"jobs",
-  b"fg", b"bg", b"hash", b"type", b"ulimit", b"kill", b"fc", b"newgrp",
+/// Intrinsic utilities (XCU 1.7), which a PATH search never replaces.
+const INTRINSIC: &[&[u8]] = &[
+  b"alias", b"bg", b"cd", b"command", b"fc", b"fg", b"getopts", b"hash",
+  b"jobs", b"kill", b"read", b"type", b"ulimit", b"umask", b"unalias", b"wait",
 ];
 
-fn builtin(name: &[u8]) -> bool {
-  special_builtin(name) || BUILTINS.contains(&name)
-}
+/// Modeled regular built-ins, for which a PATH search may find an external
+/// implementation.
+const REGULAR: &[&[u8]] = &[
+  b"[", b"echo", b"false", b"newgrp", b"printf", b"pwd", b"test", b"true",
+];
 
 pub(super) fn builtin_candidates(
   value: &Value,
 ) -> impl Iterator<Item = &'static [u8]> + '_ {
   SPECIAL
     .iter()
-    .chain(BUILTINS)
+    .chain(INTRINSIC)
+    .chain(REGULAR)
     .copied()
     .filter(|name| value.can_equal(name))
 }
 
 fn utility_resolution(name: &[u8]) -> Resolution {
-  let mut result = alternative(if builtin(name) {
-    Alternative::Builtin
-  } else {
-    Alternative::ExternalCommand
-  });
-  if matches!(
-    name,
-    b"["
-      | b"echo"
-      | b"false"
-      | b"newgrp"
-      | b"printf"
-      | b"pwd"
-      | b"test"
-      | b"true"
-  ) {
+  let regular = REGULAR.contains(&name);
+  let mut result = alternative(
+    if regular || special_builtin(name) || INTRINSIC.contains(&name) {
+      Alternative::Builtin
+    } else {
+      Alternative::ExternalCommand
+    },
+  );
+  if regular {
     result.alternatives.insert(Alternative::ExternalCommand);
   }
   result
@@ -1124,7 +1151,8 @@ fn utility_resolution(name: &[u8]) -> Resolution {
 fn command_names(value: &Value, env: &Environment) -> BTreeSet<Vec<u8>> {
   let mut names: BTreeSet<_> = SPECIAL
     .iter()
-    .chain(BUILTINS)
+    .chain(INTRINSIC)
+    .chain(REGULAR)
     .chain(UNSPECIFIED)
     .copied()
     .chain(env.functions.values.keys().map(Vec::as_slice))
@@ -1160,12 +1188,9 @@ pub(super) fn builtin_names(
 }
 
 fn query_output(name: &Value, resolution: &Resolution) -> Value {
-  let reserved: &[&[u8]] = &[
-    b"!", b"{", b"}", b"case", b"do", b"done", b"elif", b"else", b"esac",
-    b"fi", b"for", b"if", b"in", b"then", b"until", b"while",
-  ];
+  let issue = name.issue().unwrap_or(ValueIssue::Dynamic);
   if let Value::Literal(bytes) = name
-    && (special_builtin(bytes) || reserved.contains(&bytes.as_slice()))
+    && (special_builtin(bytes) || reserved_word(bytes))
   {
     let mut output = name.clone();
     output.concat(&Value::Literal(vec![b'\n']), usize::MAX);
@@ -1184,18 +1209,32 @@ fn query_output(name: &Value, resolution: &Resolution) -> Value {
     output.concat(&Value::Literal(vec![b'\n']), usize::MAX);
     outputs.push(output);
   }
-  for reserved in reserved.iter().filter(|reserved| name.can_equal(reserved)) {
+  for reserved in RESERVED
+    .iter()
+    .chain(OPTIONAL_RESERVED)
+    .filter(|reserved| name.can_equal(reserved))
+  {
     let mut output = reserved.to_vec();
     output.push(b'\n');
     outputs.push(Value::Literal(output));
+  }
+  if name.intersects(&Value::partial(
+    Vec::new(),
+    b":".to_vec(),
+    2,
+    ValueIssue::Dynamic,
+  )) && !matches!(name, Value::Literal(bytes) if !colon_word(bytes))
+  {
+    let mut output = name.clone();
+    output.concat(&Value::Literal(vec![b'\n']), usize::MAX);
+    outputs.push(output);
   }
   if unknown
     || resolution
       .alternatives
       .contains(&Alternative::ExternalCommand)
   {
-    let mut path =
-      Value::partial(b"/".to_vec(), b"\n".to_vec(), 2, ValueIssue::Dynamic);
+    let mut path = Value::partial(b"/".to_vec(), b"\n".to_vec(), 2, issue);
     path.join(&Value::Literal(Vec::new()));
     outputs.push(path);
   }
@@ -1205,50 +1244,46 @@ fn query_output(name: &Value, resolution: &Resolution) -> Value {
       left.join(&right);
       left
     })
-    .unwrap_or(Value::Unknown(ValueIssue::Dynamic))
+    .unwrap_or(Value::Unknown(issue))
 }
 
 fn temporary_redirections<'a>(
   mut name: &'a Value,
-  args: &'a [Argument<'_>],
+  mut args: &'a [Argument<'_>],
 ) -> bool {
-  let mut args = args.iter();
   while name == &Value::Literal(b"command".to_vec()) {
-    loop {
-      let Some(arg) = args.next() else {
-        return true;
-      };
-      match forward_option(arg) {
-        ForwardOption::Search => {}
-        ForwardOption::End => {
-          let Some(arg) = args.next() else {
-            return true;
-          };
-          name = &arg.value;
-          break;
-        }
-        ForwardOption::Name => {
-          name = &arg.value;
-          break;
-        }
-        ForwardOption::Query | ForwardOption::Invalid => return true,
-        ForwardOption::Unknown => return false,
+    match command_options(args) {
+      Ok(options) if !options.query => {
+        let Some((command, rest)) = args[options.operands..].split_first()
+        else {
+          return true;
+        };
+        name = &command.value;
+        args = rest;
       }
+      Err(ResolutionIssue::DynamicName) => return false,
+      Ok(_) | Err(_) => return true,
     }
   }
   !name.can_equal(b"exec") && !name.can_equal(b"command")
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Search {
+pub(super) enum Search {
   Normal,
+  /// The name may be a reserved word with unspecified results.
+  Reserved,
   SuppressFunctions,
   Standard,
+}
+
+/// Whether `name` is definitely the name of a special built-in.
+pub(super) fn special_name(name: &Value) -> bool {
+  matches!(name, Value::Literal(name) if special_builtin(name))
 }
 
 pub(in crate::interface::application::engine) fn invariant_command(
   name: &Value,
 ) -> Option<Resolution> {
-  matches!(name, Value::Literal(name) if special_builtin(name))
-    .then(|| alternative(Alternative::Builtin))
+  special_name(name).then(|| alternative(Alternative::Builtin))
 }

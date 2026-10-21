@@ -43,11 +43,11 @@ impl Application {
           .copied()
         {
           let outer = &entries[parent];
-          if outer.range.as_ref().is_some_and(|outer| {
-            outer.snapshot == range.snapshot
-              && outer.bytes.start <= range.bytes.start
-              && range.bytes.end <= outer.bytes.end
-          }) {
+          if outer
+            .range
+            .as_ref()
+            .is_some_and(|outer| outer.contains(range))
+          {
             return Some(parent);
           }
           container = outer.container;

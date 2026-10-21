@@ -1,4 +1,6 @@
 use super::*;
+use async_lsp::lsp_types::request as req;
+use async_lsp::router::Router;
 
 #[tokio::test]
 async fn duplicate_active_ids_are_rejected_without_cancelling_the_original_and_can_be_reused_after_completion()

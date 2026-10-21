@@ -217,8 +217,6 @@ pub(super) fn classify_arguments(
   }
 }
 
-/// Index of the first `getopts` operand after a discarded leading `--`, or
-/// `None` when that argument is unknown.
 pub(super) fn getopts_operands(args: &[Argument<'_>]) -> Option<usize> {
   match args.first() {
     Some(first) if first.boundary.is_err() => None,
@@ -325,8 +323,7 @@ pub(super) fn unset_options(
   Some((index, namespace == Some(b'f'), namespace.is_some()))
 }
 
-/// Index of the first `export` or `readonly` operand, or `None` when an
-/// argument may be an option other than `-p`, or `-p` precedes operands.
+/// Rejects unknown options and `-p` followed by operands.
 pub(super) fn declaration_operands(args: &[Argument<'_>]) -> Option<usize> {
   let mut print = false;
   let mut index = 0;
@@ -364,8 +361,7 @@ pub(super) struct ReadOptions {
   pub delimiter: bool,
 }
 
-/// Parses `read` options, or returns `None` when an argument may be an
-/// option that changes which arguments are operands.
+/// Returns `None` if options leave operand positions uncertain.
 pub(super) fn read_options(args: &[Argument<'_>]) -> Option<ReadOptions> {
   let mut options = ReadOptions {
     operands: 0,
@@ -423,8 +419,6 @@ fn decimal_operand<'a>(args: &'a [Argument<'_>]) -> Option<&'a [u8]> {
   Some(bytes)
 }
 
-/// The only argument as a `T` when it is a decimal number that `T`
-/// represents.
 pub(super) fn decimal_value<T: std::str::FromStr>(
   args: &[Argument<'_>],
 ) -> Option<T> {

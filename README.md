@@ -13,6 +13,7 @@ Language server for shell scripts.
 
 - Document links
 - Document symbols
+- Find references
 - Go to definition
 - Rename
 - Semantic tokens

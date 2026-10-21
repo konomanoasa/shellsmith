@@ -266,8 +266,6 @@ impl Alternatives {
     self.values.is_empty()
   }
 
-  /// Forgets the choices of the variables, or the functions, that `changed`
-  /// accepts.
   pub fn forget_names(
     &mut self,
     functions: bool,
@@ -319,6 +317,25 @@ impl Alternatives {
 
   pub fn clear(&mut self) {
     self.values.clear();
+  }
+
+  pub fn retain_common(&mut self, other: &Self) {
+    if self == other {
+      return;
+    }
+    if !Rc::ptr_eq(&self.decisions, &other.decisions) || other.is_empty() {
+      self.clear();
+      return;
+    }
+    let removed: Vec<_> = self
+      .values
+      .iter()
+      .filter(|(key, value)| other.values.get(*key) != Some(*value))
+      .map(|(key, _)| key.clone())
+      .collect();
+    for key in removed {
+      self.values.remove(&key);
+    }
   }
 
   pub fn joined(left: &Environment, right: &Environment) -> Self {

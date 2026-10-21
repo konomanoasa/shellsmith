@@ -3,10 +3,11 @@
 Planned work in order. Release dates are not fixed.
 See [README](README.md#features) for currently available features.
 
+1. Diagnostics for POSIX sh
+1. CLI support beyond LSP startup
 1. Formatting for POSIX sh
-2. CLI support beyond LSP startup
-3. Diagnostics for POSIX sh
-4. Completion
-5. dash support
-6. bash support
-7. zsh support
+1. bash support
+1. dash support
+1. zsh support
+1. Completion
+1. Hover

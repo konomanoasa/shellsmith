@@ -1,6 +1,8 @@
-mod collection;
+mod analysis;
+mod application;
+mod discovery;
 mod files;
-mod host;
+mod inputs;
 mod names;
 mod session;
 
@@ -8,6 +10,6 @@ mod session;
 #[path = "../../../tests/common/fixtures.rs"]
 mod fixtures;
 
-pub use host::{Application, Error, Failure, Settings};
-pub(super) use names::{EntryNames, NameCollection};
+pub use application::{Application, Error, Failure, Settings};
+pub(super) use names::NameCollection;
 pub use session::{RequestScope, Session};

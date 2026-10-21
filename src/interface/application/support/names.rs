@@ -1,26 +1,27 @@
-use super::{Application, Error, files};
+use super::{Application, Error, Failure};
 use crate::interface::application::engine;
-use engine::{Document, Workspace, check_cancelled};
+use engine::check_cancelled;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug)]
-pub(in crate::interface::application) struct EntryNames {
+pub(in crate::interface::application) struct EntryMetadata {
   pub path: PathBuf,
-  pub relations: engine::NameRelations,
-  pub definitions: BTreeMap<engine::SymbolId, Option<engine::Location>>,
   pub dependencies: BTreeSet<(PathBuf, PathBuf)>,
   pub damaged: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(in crate::interface::application) struct NameCollection {
-  pub entries: Vec<EntryNames>,
+  pub entries: Vec<EntryMetadata>,
+  pub results: engine::NameResults,
   pub documents: BTreeMap<engine::Snapshot, (PathBuf, Arc<str>)>,
   roots: BTreeSet<PathBuf>,
   explicit: BTreeSet<PathBuf>,
+  inputs: BTreeSet<PathBuf>,
+  discovery_failures: Vec<Failure>,
 }
 
 impl Application {
@@ -35,33 +36,19 @@ impl Application {
     {
       return Ok(names.clone());
     }
-    self.refresh_for(None, cancelled)?;
-    if self.document_id(&path).is_none() {
-      self.load(&path, cancelled)?;
-    }
-    let roots = self
-      .workspace
-      .documents()
-      .filter_map(|document| {
-        self
-          .path(document.snapshot().document)
-          .map(Path::to_path_buf)
-      })
-      .collect();
+    let analyses = self.prepare_analysis(&path, cancelled)?;
+    let roots = analyses.entries.keys().cloned().collect();
     let mut names = self.collect_names(roots, cancelled)?;
-    if !self.failures.is_empty() {
-      return Err(Error::RenameRefused(
-        "Some workspace inputs could not be read".into(),
-      ));
-    }
-    names.explicit.insert(path);
+    names.inputs.clone_from(&analyses.inputs);
+    names
+      .discovery_failures
+      .clone_from(&analyses.discovery_failures);
+    names.explicit.clone_from(&analyses.explicit);
     let names = Arc::new(names);
     self.names = Some(names.clone());
     Ok(names)
   }
 
-  /// Collects the names of each of `roots` and adds the documents that the
-  /// collection loaded to the workspace.
   fn collect_names(
     &mut self,
     roots: BTreeSet<PathBuf>,
@@ -71,30 +58,11 @@ impl Application {
     let collection = self.collect_entries(roots, cancelled);
     self.workspace = workspace;
     let collection = collection?;
-    let loaded: Vec<_> = self
-      .cache
-      .loaded
-      .values()
-      .filter_map(|loaded| loaded.as_ref().ok())
-      .filter(|document| {
-        self
-          .workspace
-          .document(document.snapshot().document)
-          .is_none()
-      })
-      .cloned()
-      .collect();
-    for document in loaded {
-      let id = document.snapshot().document;
-      self.workspace.insert_shared(document)?;
-      self
-        .workspace
-        .index_document(id, self.settings.limits, cancelled)?;
-    }
+    self.restore_analysis_documents(cancelled)?;
     Ok(collection)
   }
 
-  /// Analyzes each of `roots` alone, in a workspace of its own.
+  /// Each root has an independent execution environment.
   fn collect_entries(
     &mut self,
     roots: BTreeSet<PathBuf>,
@@ -104,11 +72,33 @@ impl Application {
       roots,
       ..NameCollection::default()
     };
+    let mut workspaces = Vec::new();
     for path in &collection.roots {
       check_cancelled(cancelled)?;
-      collection
-        .entries
-        .push(self.collect_entry_names(path, cancelled)?);
+      self.workspace = self.analyze_entry(path, cancelled)?;
+      let analysis = self.workspace.analysis().expect("completed analysis");
+      let dependencies = analysis
+        .source_bindings()
+        .iter()
+        .filter_map(|(reference, state)| {
+          let engine::DependencyState::Resolved(target) = state else {
+            return None;
+          };
+          Some((
+            self
+              .path(
+                self.workspace.source_snapshot(reference.snapshot).document,
+              )?
+              .to_path_buf(),
+            self.path(target.document)?.to_path_buf(),
+          ))
+        })
+        .collect();
+      collection.entries.push(EntryMetadata {
+        path: path.clone(),
+        dependencies,
+        damaged: false,
+      });
       for document in self.workspace.documents() {
         if let Some(path) = self.path(document.snapshot().document) {
           collection.documents.insert(
@@ -117,78 +107,23 @@ impl Application {
           );
         }
       }
+      workspaces.push(self.workspace.clone());
     }
-    Ok(collection)
-  }
-
-  fn collect_entry_names(
-    &mut self,
-    path: &Path,
-    cancelled: &AtomicBool,
-  ) -> Result<EntryNames, Error> {
-    let document = self
-      .cache
-      .loaded
-      .get(path)
-      .and_then(|loaded| loaded.as_ref().ok())
-      .cloned()
-      .ok_or_else(|| {
-        Error::Message(format!("Cannot load {}", path.display()))
-      })?;
-    let id = document.snapshot().document;
-    self.workspace = Workspace::default();
-    self.workspace.insert_shared(document)?;
-    self.analyze_document(id, cancelled)?;
-    let relations = self.workspace.name_relations(cancelled)?;
-    let analysis = self.workspace.analysis().expect("completed analysis");
-    let mut definitions = BTreeMap::new();
-    for symbol in relations
-      .names
-      .iter()
-      .flat_map(|name| &name.definitions)
-      .chain(
-        relations
-          .occurrences
-          .iter()
-          .filter_map(|site| site.resolution.as_ref())
-          .flat_map(|resolution| &resolution.candidates),
-      )
+    collection.results =
+      engine::AnalysisResults::new(&workspaces).names(cancelled)?;
+    for ((metadata, result), workspace) in collection
+      .entries
+      .iter_mut()
+      .zip(&collection.results.entries)
+      .zip(&workspaces)
     {
-      definitions.entry(*symbol).or_insert_with(|| {
-        self
-          .workspace
-          .symbol(*symbol)
-          .and_then(|symbol| self.workspace.definition_location(symbol))
+      metadata.damaged = result.relations.occurrences.iter().any(|site| {
+        workspace
+          .document(site.location.snapshot.document)
+          .is_some_and(engine::Document::has_syntax_errors)
       });
     }
-    let dependencies = analysis
-      .source_bindings()
-      .iter()
-      .filter_map(|(reference, state)| {
-        let engine::DependencyState::Resolved(target) = state else {
-          return None;
-        };
-        Some((
-          self
-            .path(self.workspace.source_snapshot(reference.snapshot).document)?
-            .to_path_buf(),
-          self.path(target.document)?.to_path_buf(),
-        ))
-      })
-      .collect();
-    let damaged = relations.occurrences.iter().any(|site| {
-      self
-        .workspace
-        .document(site.location.snapshot.document)
-        .is_some_and(Document::has_syntax_errors)
-    });
-    Ok(EntryNames {
-      path: path.to_path_buf(),
-      relations,
-      definitions,
-      dependencies,
-      damaged,
-    })
+    Ok(collection)
   }
 
   pub(in crate::interface::application) fn reanalyze_names(
@@ -211,6 +146,10 @@ impl Application {
     let mut result =
       scratch.collect_names(collection.roots.clone(), cancelled)?;
     result.explicit.clone_from(&collection.explicit);
+    result.inputs.clone_from(&collection.inputs);
+    result
+      .discovery_failures
+      .clone_from(&collection.discovery_failures);
     Ok(result)
   }
 
@@ -220,13 +159,9 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
-    if !self.failures.is_empty() {
-      return Err(Error::RenameRefused(
-        "Some workspace inputs could not be read".into(),
-      ));
-    }
     if !self.name_inputs_current(collection, cancelled)? {
       self.names = None;
+      self.analyses = None;
       return Err(Error::Superseded);
     }
     Ok(())
@@ -239,30 +174,11 @@ impl Application {
   ) -> Result<bool, Error> {
     let (selected, failures) =
       self.collect_inputs(collection.explicit.clone(), cancelled)?;
-    if selected != collection.roots || !failures.is_empty() {
+    if selected != collection.inputs
+      || failures != collection.discovery_failures
+    {
       return Ok(false);
     }
-    for (path, source) in collection.documents.values() {
-      check_cancelled(cancelled)?;
-      if !self.opened.contains_key(path)
-        && !files::read(path, &self.opened)
-          .is_ok_and(|bytes| bytes == source.as_bytes())
-      {
-        return Ok(false);
-      }
-    }
-    for (input, expected) in &self.cache.paths {
-      check_cancelled(cancelled)?;
-      if &self.resolve_source(input) != expected {
-        return Ok(false);
-      }
-    }
-    for (input, expected) in &self.cache.evaluated {
-      check_cancelled(cancelled)?;
-      if files::evaluate(input, cancelled)? != *expected {
-        return Ok(false);
-      }
-    }
-    Ok(true)
+    self.cache.current(&self.opened, &self.entries, cancelled)
   }
 }

@@ -720,6 +720,42 @@ mod bindings {
   }
 
   #[test]
+  fn merges_preserve_distinct_definitions_and_unset_paths_with_equal_values() {
+    for body in [
+      "read unknown; : \"${unknown:-default}\"",
+      "read unknown; : \"$((unknown ? 1 : 2))\"",
+      "readonly locked; read locked",
+      "case word in x) : ;& *) : ;; esac",
+      "while condition; do unrelated=1; done",
+      ": | :",
+    ] {
+      for other in ["x=1", "unset x"] {
+        let source =
+          format!("if condition; then x=1; else {other}; fi; {body}; : \"$x\"");
+        let (workspace, analysis) = analyze(&source);
+        let ids: Vec<_> = workspace
+          .symbols_named(b"x")
+          .map(|symbol| symbol.id)
+          .collect();
+        let uses = reads(&workspace, &analysis, b"x");
+        let resolution = &uses.last().unwrap().resolution;
+        assert_eq!(
+          resolution.candidates,
+          ids.into_iter().collect(),
+          "{source}"
+        );
+        let alternatives = if other == "unset x" {
+          [Alternative::Unset].into()
+        } else {
+          [].into()
+        };
+        assert_eq!(resolution.alternatives, alternatives, "{source}");
+        assert!(resolution.issues.is_empty(), "{source}");
+      }
+    }
+  }
+
+  #[test]
   fn heredoc_expansions_run_with_redirections_and_quoted_bodies_are_inert() {
     let (workspace, analysis) = analyze(
       "x=1\nf() { x=2; }\nf <<EOF\n$x\nEOF\n: \"$x\"\ncat <<'EOF'\n$x\nEOF\n",
@@ -2461,8 +2497,7 @@ mod inputs {
 mod names {
   use crate::support;
   use shellsmith::interface::application::engine::{
-    EffectTarget, NameEnvironment, NameSpelling, PartialValue, SymbolKind,
-    Value, ValueConstraint, ValueIssue,
+    EffectTarget, NameEnvironment, NameSpelling, SymbolKind, Value,
   };
   use std::sync::atomic::AtomicBool;
 
@@ -2577,85 +2612,34 @@ mod names {
   }
 
   #[test]
-  fn uncalled_function_effects_keep_names_and_environment_boundaries() {
-    for (body, exact, pattern, all) in [
-      ("unset -f other", vec!["other"], false, false),
-      ("unset other", vec!["other"], false, false),
-      (
-        "if :; then unset -f a; else b() { :; }; fi",
-        vec!["a", "b"],
-        false,
-        false,
-      ),
-      ("unset -f \"tmp_$suffix\"", vec![], true, false),
-      (
-        "other() { unset -f \"$target\"; }",
-        vec!["other"],
-        false,
-        false,
-      ),
-      ("(unset -f \"$target\")", vec![], false, false),
-      ("value=$(unset -f \"$target\")", vec![], false, false),
-      ("{ unset -f \"$target\"; } &", vec![], false, false),
-      ("unset -f \"$target\" | :", vec![], false, true),
-      ("\"/bin/$tool\"", vec![], false, false),
-      ("uname", vec![], false, true),
-      ("\"$tool\"", vec![], false, true),
-      ("\".$suffix\" ./unknown", vec![], false, true),
-      (
-        "eval \"$code\"; trap 'unset -f other' EXIT",
-        vec![],
-        false,
-        false,
-      ),
+  fn uncalled_functions_keep_syntax_dependencies_without_resolving_local_calls()
+  {
+    for body in [
+      "unset -f other",
+      "other() { :; }",
+      "unset -f \"$target\"",
+      "(unset -f other)",
     ] {
-      let source = format!("idle() {{ (clean() {{ {body}\n }}; clean); }}");
+      let source = format!("idle() {{ (clean() {{ {body}; }}; clean); }}");
       let (mut workspace, analysis) = support::analyze(&source);
       workspace.publish_analysis(analysis).unwrap();
       let names = workspace.name_relations(&AtomicBool::new(false)).unwrap();
-      let targets: std::collections::BTreeSet<_> = names
-        .effects
+      let offset = source.rfind("clean)").unwrap();
+      let site = names
+        .occurrences
         .iter()
-        .filter(|effect| {
-          effect.location.bytes.start == source.rfind("clean)").unwrap()
-        })
-        .flat_map(|effect| effect.targets.iter())
-        .collect();
-      let actual: Vec<_> = targets
-        .iter()
-        .filter_map(|target| match target {
-          EffectTarget::Function(name) => {
-            Some(std::str::from_utf8(name).unwrap())
-          }
-          _ => None,
-        })
-        .collect();
-      assert_eq!(actual, exact, "{body}");
-      assert_eq!(targets.contains(&EffectTarget::Functions), all, "{body}");
-      let patterns: Vec<_> = targets
-        .iter()
-        .filter_map(|target| match target {
-          EffectTarget::FunctionPattern(value) => Some(value),
-          _ => None,
-        })
-        .collect();
-      assert_eq!(patterns.len(), usize::from(pattern), "{body}");
-      for value in patterns {
-        assert_eq!(
-          value,
-          &Value::Partial(PartialValue {
-            choices: vec![ValueConstraint {
-              prefix: b"tmp_".to_vec(),
-              suffix: vec![],
-              minimum: 4,
-              required: (*b"tmp_").into(),
-              exact: false,
-            }],
-            issue: ValueIssue::Dynamic,
-          }),
-          "{body}"
-        );
-      }
+        .find(|site| site.location.bytes.start == offset)
+        .unwrap();
+      assert_eq!(site.context, None);
+      assert_eq!(site.resolution, None);
+      assert_eq!(site.identity, None);
+      assert!(names.dependencies.iter().any(|dependency| {
+        dependency.location.bytes.start == offset
+          && dependency
+            .targets
+            .contains(&EffectTarget::Function(b"clean".to_vec()))
+      }));
+      assert_eq!(workspace.analysis().unwrap().contexts().len(), 1);
     }
   }
 
@@ -2672,6 +2656,95 @@ mod names {
       .map(|site| &source[site.location.bytes.clone()])
       .collect();
     assert_eq!(arguments, ["x", "helper"]);
+  }
+
+  #[test]
+  fn uncalled_functions_keep_uses_unattempted_in_all_control_flows() {
+    use shellsmith::interface::application::engine::{DocumentId, UseSite};
+    for body in [
+      "a() { :; }",
+      "if :; then a() { :; }; else a() { :; }; fi",
+      "if :; then a() { :; }; fi",
+      "a() { :; }; while :; do a() { :; }; done",
+      "a() { :; }; unset -f a",
+      "a() { :; }; a() { :; }",
+      "a() { :; }; (a() { :; })",
+      "a() { :; }; value=$(a() { :; })",
+      "a() { :; }; { unset -f a; } &",
+      "install() { a() { :; }; }; install",
+      "a() { :; }; clean() { unset -f a; }; clean",
+      "a() { :; }; case $x in one) a() { :; };; esac",
+    ] {
+      let source = format!("idle() {{ {body}\na # target\n}}");
+      let (mut workspace, analysis) = support::analyze(&source);
+      let document = workspace.document(DocumentId(1)).unwrap();
+      assert!(!document.has_syntax_errors(), "{body}");
+      let snapshot = document.snapshot();
+      let offset = source.find("a # target").unwrap();
+      let occurrence = document
+        .occurrences()
+        .iter()
+        .find(|site| site.location.bytes.start == offset)
+        .unwrap()
+        .id;
+      assert_eq!(
+        analysis.resolutions(UseSite::Syntax(occurrence)).count(),
+        0,
+        "{body}"
+      );
+      assert_eq!(analysis.contexts().len(), 1, "{body}");
+      workspace.publish_analysis(analysis).unwrap();
+      assert_eq!(
+        workspace.resolution_at(snapshot, offset).unwrap(),
+        None,
+        "{body}"
+      );
+      let names = workspace.name_relations(&AtomicBool::new(false)).unwrap();
+      let sites = names.at(snapshot, offset);
+      assert_eq!(sites.len(), 1, "{body}");
+      assert_eq!(sites[0].1.context, None, "{body}");
+      assert_eq!(sites[0].1.resolution, None, "{body}");
+      assert_eq!(sites[0].1.identity, None, "{body}");
+      assert_eq!(workspace.analysis().unwrap().contexts().len(), 1, "{body}");
+    }
+  }
+
+  #[test]
+  fn uncalled_bodies_do_not_inherit_definitions_or_change_the_entry() {
+    use shellsmith::interface::application::engine::DocumentId;
+    let source = "a() { :; }; value=entry; idle() { a; value=body; unset -f a; }; a; : \"$value\"";
+    let (mut workspace, analysis) = support::analyze(source);
+    let snapshot = workspace.document(DocumentId(1)).unwrap().snapshot();
+    let contexts = analysis.contexts().to_vec();
+    let definition = workspace.symbols_named(b"a").next().unwrap().id;
+    workspace.publish_analysis(analysis).unwrap();
+    let inside = workspace
+      .resolution_at(snapshot, source.find("{ a;").unwrap() + 2)
+      .unwrap();
+    assert_eq!(inside, None);
+    let after = workspace
+      .resolution_at(snapshot, source.rfind("a;").unwrap())
+      .unwrap()
+      .unwrap();
+    assert_eq!(after.candidates, [definition].into());
+    assert!(after.issues.is_empty());
+    let read = workspace
+      .document(DocumentId(1))
+      .unwrap()
+      .occurrences()
+      .iter()
+      .find(|site| site.location.bytes.start == source.rfind("value").unwrap())
+      .unwrap()
+      .id;
+    assert!(
+      workspace
+        .analysis()
+        .unwrap()
+        .values(read)
+        .all(|(_, value)| value == &Value::Literal(b"entry".to_vec()))
+    );
+    workspace.name_relations(&AtomicBool::new(false)).unwrap();
+    assert_eq!(workspace.analysis().unwrap().contexts(), contexts);
   }
 
   #[test]
@@ -2716,22 +2789,16 @@ mod names {
       .filter(|site| site.names.contains(&helper.id))
       .collect();
     assert_eq!(sites.len(), 2);
-    assert!(
-      sites
-        .iter()
-        .all(|site| site.context.is_none() && site.resolution.is_some())
-    );
-    assert_eq!(
-      sites[1].resolution.as_ref().unwrap().candidates,
-      helper.definitions
-    );
+    assert!(sites.iter().all(|site| site.context.is_none()
+      && site.resolution.is_none()
+      && site.identity.is_none()));
     assert!(
       names
         .occurrences
         .iter()
         .filter(|site| site.context.is_none()
           && site.names.iter().any(|id| names.names[id.0].text == b"x"))
-        .all(|site| site.resolution.is_none())
+        .all(|site| site.resolution.is_none() && site.identity.is_none())
     );
   }
 
@@ -2794,6 +2861,31 @@ mod names {
   }
 
   #[test]
+  fn confirmed_name_identities_do_not_merge_partially_matching_candidates() {
+    let source = "x=1; (: $x); (if condition; then x=2; fi; : $x)";
+    let (mut workspace, analysis) = support::analyze(source);
+    workspace.publish_analysis(analysis).unwrap();
+    let names = workspace.name_relations(&AtomicBool::new(false)).unwrap();
+    let at = |offset| {
+      names
+        .occurrences
+        .iter()
+        .find(|site| site.location.bytes.start == offset)
+        .unwrap()
+    };
+    let outer = at(0).identity.unwrap();
+    let inherited = at(source.find("$x").unwrap() + 1);
+    assert_ne!(inherited.name, Some(outer));
+    assert_eq!(inherited.identity, Some(outer));
+    let uncertain = at(source.rfind("$x").unwrap() + 1);
+    assert!(uncertain.names.contains(&outer));
+    assert!(uncertain.names.len() > 1);
+    assert_eq!(uncertain.identity, None);
+    let local = at(source.find("x=2").unwrap()).identity.unwrap();
+    assert_ne!(local, outer);
+  }
+
+  #[test]
   fn name_spellings_distinguish_literal_words_from_generated_command_names() {
     let source = "fun() { :; }; f'u'n; command_name=fun; \"$command_name\"";
     let (mut workspace, analysis) = support::analyze(source);
@@ -2817,5 +2909,11 @@ mod names {
         .iter()
         .any(|site| site.spelling == NameSpelling::Generated)
     );
+    let navigation: Vec<_> = sites
+      .iter()
+      .filter_map(|site| site.navigation())
+      .map(|location| &source[location.bytes])
+      .collect();
+    assert_eq!(navigation, ["fun", "f'u'n"]);
   }
 }

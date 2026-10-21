@@ -102,8 +102,6 @@ impl<'a> Resolver<'a> {
     names
   }
 
-  /// Runs `step` in each environment that `states` enumerates and joins the
-  /// resulting flows into `output`.
   pub(in crate::interface::application::engine::analysis) fn each_alternative(
     &mut self,
     mut states: super::alternatives::AlternativeStates,
@@ -397,8 +395,7 @@ impl<'a> Resolver<'a> {
     })
   }
 
-  /// Evaluates `nodes` in an unspecified order, in which each may observe
-  /// the writes to `targets` of the others.
+  /// Any node may observe the others' writes to `targets`.
   pub(in crate::interface::application::engine::analysis) fn uncertain_order(
     &mut self,
     node: Node<'a>,
@@ -792,7 +789,7 @@ impl<'a> Resolver<'a> {
     state.input.io.connect_input(Err(ValueIssue::Dynamic));
     task.then(move |resolver, flow| {
       for (transfer, env) in flow {
-        state.output.join(&env);
+        state.output.widen(&env);
         if transfer != Transfer::Next {
           state.transfers.add(transfer, env);
         }
@@ -1023,7 +1020,7 @@ impl<'a> Resolver<'a> {
 fn loop_transfers(flow: Flow, next: &mut Environment, output: &mut Flow) {
   for (transfer, state) in flow {
     match transfer {
-      Transfer::Next | Transfer::Continue(1) => next.join(&state),
+      Transfer::Next | Transfer::Continue(1) => next.widen(&state),
       Transfer::Break(1) => output.add(Transfer::Next, state),
       Transfer::Break(depth) => output.add(Transfer::Break(depth - 1), state),
       Transfer::Continue(depth) => {

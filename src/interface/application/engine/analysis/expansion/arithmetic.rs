@@ -119,7 +119,6 @@ pub(super) fn unary(operator: &[u8], operand: Number) -> Number {
   })
 }
 
-/// The variables that an arithmetic node and its descendants read and write.
 #[derive(Clone, Default)]
 struct VariableAccess {
   reads: OrdSet<Vec<u8>>,
@@ -132,8 +131,7 @@ impl VariableAccess {
     union(&mut self.writes, &other.writes);
   }
 
-  /// Whether evaluating `self` and `other` unsequenced may decide a value
-  /// (C17 6.5p2).
+  /// Unsequenced access conflicts (C17 6.5p2).
   fn conflicts(&self, other: &Self) -> bool {
     intersects(&self.writes, &other.reads)
       || intersects(&other.writes, &self.reads)
@@ -159,8 +157,7 @@ fn intersects(left: &OrdSet<Vec<u8>>, right: &OrdSet<Vec<u8>>) -> bool {
   smaller.iter().any(|name| larger.contains(name))
 }
 
-/// The variable access of each arithmetic node, computed once per node so
-/// that nested operators do not walk their operands again.
+/// Caching avoids repeatedly walking operands of nested operators.
 #[derive(Default)]
 pub(in crate::interface::application::engine::analysis) struct ArithmeticAccess(
   BTreeMap<(Snapshot, usize), VariableAccess>,
@@ -240,8 +237,7 @@ impl<'a> Resolver<'a> {
     }
   }
 
-  /// Evaluates an arithmetic expression that is not calculated statically;
-  /// it may write any variable.
+  /// Dynamic arithmetic may write any variable.
   pub(in crate::interface::application::engine::analysis) fn runtime_arithmetic(
     &mut self,
     node: Node<'a>,
@@ -439,8 +435,7 @@ impl<'a> Resolver<'a> {
     conflict
   }
 
-  /// Lets the variables that `node` writes be written in unspecified order,
-  /// returning the order to restore afterwards.
+  /// Returns the previous order for restoration after evaluation.
   fn unordered(
     &mut self,
     node: Node<'_>,
@@ -455,8 +450,6 @@ impl<'a> Resolver<'a> {
     order
   }
 
-  /// Restores `order` and makes the variables that `node` wrote in
-  /// unspecified order unknown.
   fn ordered(
     &mut self,
     node: Node<'_>,

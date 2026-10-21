@@ -9,6 +9,22 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<Vec<engine::SemanticSpan>, Error> {
     self.analyze_document(id, cancelled)?;
-    self.workspace.semantic_spans(id).map_err(Error::from)
+    if let Some(analyses) = &self.analyses {
+      if !self.analysis_inputs_current(analyses, cancelled)? {
+        return Err(Error::Superseded);
+      }
+      let snapshot = self
+        .workspace
+        .document(id)
+        .ok_or(engine::Error::UnknownDocument(id))?
+        .snapshot();
+      engine::AnalysisResults::new(
+        std::iter::once(&self.workspace).chain(analyses.entries.values()),
+      )
+      .semantic_spans(snapshot)
+      .map_err(Error::from)
+    } else {
+      self.workspace.semantic_spans(id).map_err(Error::from)
+    }
   }
 }

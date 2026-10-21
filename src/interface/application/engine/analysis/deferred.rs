@@ -9,8 +9,6 @@ use imbl::{OrdMap, ordmap::DiffItem};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
-/// Whether analyzing the body `document` depends on the environment that
-/// reaches its registration.
 fn needs_environment(document: &engine::Document) -> bool {
   document.occurrences().iter().any(|site| {
     site.kind != engine::OccurrenceKind::Command

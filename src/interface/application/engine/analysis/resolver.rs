@@ -37,7 +37,6 @@ impl Frame {
     }
   }
 
-  /// Identifies the gap or unknown effect of `issue` at `node`.
   pub(super) fn effect_key(
     self,
     node: Node<'_>,
@@ -113,8 +112,6 @@ impl<'a> AnalysisWorkspace<'a> {
     self.document(id.snapshot.document)?.symbol(id)
   }
 
-  /// Adds the workspace document `snapshot` to the analysis, returning it
-  /// when it was not part of the analysis.
   fn register(&mut self, snapshot: Snapshot) -> Option<&'a engine::Document> {
     if self.documents.contains_key(&snapshot.document) {
       return None;
@@ -154,53 +151,78 @@ pub(in crate::interface::application::engine) fn analyze<'a>(
 ) -> Result<Analysis, Error> {
   check_cancelled(cancelled)?;
   let workspace = AnalysisWorkspace::new(workspace, arena);
-  let document = workspace
-    .document(request.entry.document)
-    .expect("analysis entry");
-  let root = document.tree.root_node();
-  let track_invariants =
-    document.has_body_candidates() || !document.references().is_empty();
-  let context = ExecutionContextId(0);
-  let initial = Environment::new(&request.initial);
+  let mut resolver = Resolver::new(workspace, request, inputs, cancelled)?;
+  let snapshot = resolver.result.request.entry;
+  let root = resolver
+    .workspace
+    .document(snapshot.document)
+    .expect("analysis entry")
+    .tree
+    .root_node();
+  let initial = Environment::new(&resolver.result.request.initial);
   let frame = Frame {
-    snapshot: request.entry,
-    context,
+    snapshot,
+    context: ExecutionContextId(0),
     loops: 0,
     dynamic_loops: false,
     returnable: false,
   };
-  let mut readable = BTreeSet::new();
-  let index = Index::new(
-    workspace.documents.values().copied(),
-    &mut readable,
-    cancelled,
-  )?;
-  let mut resolver = Resolver {
-    workspace,
-    inputs,
-    error: None,
-    sources: SourceTracking::new(request.entry),
-    cancelled,
-    index,
-    contexts: BTreeMap::new(),
-    gaps: BTreeSet::new(),
-    invariants: InvariantInputs::default(),
-    track_invariants,
-    arithmetic: ArithmeticAccess::default(),
-    result: Analysis::new(
-      request,
-      ExecutionContext {
-        id: context,
-        parent: None,
-        environment: context,
-        kind: ExecutionKind::Entry,
-        location: frame.location(root),
-      },
-      readable,
-    ),
-  };
   resolver.run(Task::eval(root, initial, frame))?;
   resolver.finish()
+}
+
+impl<'a> Resolver<'a> {
+  pub(super) fn new(
+    workspace: AnalysisWorkspace<'a>,
+    request: AnalysisRequest,
+    inputs: &'a mut dyn AnalysisInputs,
+    cancelled: &'a AtomicBool,
+  ) -> Result<Self, Error> {
+    let document = workspace
+      .document(request.entry.document)
+      .expect("analysis entry");
+    let root = document.tree.root_node();
+    let track_invariants =
+      document.has_body_candidates() || !document.references().is_empty();
+    let context = ExecutionContextId(0);
+    let frame = Frame {
+      snapshot: request.entry,
+      context,
+      loops: 0,
+      dynamic_loops: false,
+      returnable: false,
+    };
+    let mut readable = BTreeSet::new();
+    let index = Index::new(
+      workspace.documents.values().copied(),
+      &mut readable,
+      cancelled,
+    )?;
+    Ok(Self {
+      workspace,
+      inputs,
+      error: None,
+      sources: SourceTracking::new(request.entry),
+      cancelled,
+      index,
+      contexts: BTreeMap::new(),
+      gaps: BTreeSet::new(),
+      invariants: InvariantInputs::default(),
+      track_invariants,
+      arithmetic: ArithmeticAccess::default(),
+      result: Analysis::new(
+        request,
+        ExecutionContext {
+          id: context,
+          parent: None,
+          environment: context,
+          kind: ExecutionKind::Entry,
+          location: frame.location(root),
+        },
+        readable,
+      ),
+    })
+  }
 }
 
 impl Resolver<'_> {
@@ -226,7 +248,6 @@ impl Resolver<'_> {
       self.cancelled,
     )?;
     self.result.derived = derived;
-    self.collect_deferred_sources()?;
     self.finish_sources();
     if let Some(error) = self.error.take() {
       return Err(error);
@@ -329,8 +350,6 @@ impl Resolver<'_> {
       .or_insert(state);
   }
 
-  /// Records the resolution of a use, which reads the variable `variable`
-  /// if any.
   pub(super) fn record_use(
     &mut self,
     site: UseSite,
@@ -436,7 +455,6 @@ impl<'a> Index<'a> {
       .copied()
   }
 
-  /// The symbol that the definition `id` defines.
   pub fn defined_symbol(&self, id: OccurrenceId) -> Option<SymbolId> {
     self.definitions.get(&id).copied()
   }
@@ -445,7 +463,6 @@ impl<'a> Index<'a> {
     self.functions.get(&id).copied()
   }
 
-  /// The body of the here-document that the redirection `node` reads.
   pub fn heredoc(
     &self,
     snapshot: Snapshot,
@@ -454,7 +471,6 @@ impl<'a> Index<'a> {
     self.heredocs.get(&(snapshot, node.start_byte())).copied()
   }
 
-  /// The `.` reference of the command `node`.
   pub fn source(
     &self,
     snapshot: Snapshot,
@@ -466,7 +482,6 @@ impl<'a> Index<'a> {
       .copied()
   }
 
-  /// Indexes `documents` and adds their reading sites to `readable`.
   pub fn new(
     documents: impl Iterator<Item = &'a engine::Document>,
     readable: &mut BTreeSet<OccurrenceId>,

@@ -21,8 +21,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::Node;
 
-/// Whether the modeled effect of the built-in `name` reads its argument
-/// values.
 pub(super) fn uses_arguments(name: &[u8]) -> bool {
   numeric_argument(name)
     || matches!(
@@ -39,8 +37,7 @@ pub(super) fn uses_arguments(name: &[u8]) -> bool {
     )
 }
 
-/// Whether the external implementation of the regular built-in `name`
-/// leaves standard input unread.
+/// External implementations also leave standard input unread.
 pub(super) fn preserves_input(name: &[u8]) -> bool {
   matches!(
     name,

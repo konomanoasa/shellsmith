@@ -65,7 +65,7 @@ impl Workspace {
     self.documents.values().cloned()
   }
 
-  pub(in crate::interface::application::engine) fn shared_document(
+  pub(in crate::interface::application) fn shared_document(
     &self,
     id: DocumentId,
   ) -> Option<Arc<Document>> {
@@ -257,7 +257,6 @@ impl Workspace {
     seen.into_iter().collect()
   }
 
-  /// The derived documents whose text comes from `owner`.
   fn derived_children(
     &self,
     owner: DocumentId,
@@ -410,8 +409,6 @@ impl Workspace {
   }
 }
 
-/// Whether a symbol `name` matches a search `query`, which matches every name
-/// when empty and otherwise any name that contains it.
 pub(super) fn matches_query(name: &[u8], query: &[u8]) -> bool {
   query.is_empty() || name.windows(query.len()).any(|part| part == query)
 }

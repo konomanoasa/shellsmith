@@ -1,9 +1,9 @@
-use super::{Document, Workspace, derived::syntax_spelling};
+use super::{Document, Workspace, projection::ProjectedResolution};
 use crate::interface::application::engine::{
-  self, Access, Analysis, AnalysisGap, ArgumentKind, AttributeState, ContextId,
-  EffectTarget, Error, ExecutionContext, ExecutionContextId, Location,
-  OccurrenceKind, Resolution, Snapshot, SymbolId, SymbolKind, UseSite, Value,
-  check_cancelled,
+  self, Access, Alternative, Analysis, AnalysisGap, ArgumentKind,
+  AttributeState, ContextId, EffectTarget, Error, ExecutionContext,
+  ExecutionContextId, Location, Occurrence, OccurrenceKind, Resolution,
+  Snapshot, SymbolId, SymbolKind, UseSite, Value, check_cancelled,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicBool;
@@ -52,13 +52,40 @@ pub struct NameOccurrence {
   pub site: UseSite,
   pub location: Location,
   pub spelling: NameSpelling,
+  pub spans: Vec<Location>,
   pub context: Option<ExecutionContextId>,
+  /// The name in this occurrence's environment, before following definitions.
+  pub name: Option<NameId>,
+  /// A confirmed identity, shared only through certain inheritance relationships.
+  pub identity: Option<NameId>,
   pub names: BTreeSet<NameId>,
   pub access: Access,
   pub definitions: BTreeSet<SymbolId>,
   pub resolution: Option<Resolution>,
   pub compatible: bool,
   pub readonly: AttributeState,
+}
+
+impl NameOccurrence {
+  #[must_use]
+  pub fn navigation(&self) -> Option<Location> {
+    let first = self.spans.first()?;
+    let last = self.spans.last()?;
+    self
+      .spans
+      .iter()
+      .all(|part| part.snapshot == first.snapshot)
+      .then_some(())?;
+    self
+      .spans
+      .windows(2)
+      .all(|parts| parts[0].bytes.end <= parts[1].bytes.start)
+      .then_some(())?;
+    Some(Location {
+      snapshot: first.snapshot,
+      bytes: first.bytes.start..last.bytes.end,
+    })
+  }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -173,7 +200,114 @@ impl NameRelations {
         }
       }
     }
+    self.resolve_identities(&definitions, cancelled)?;
     Ok(())
+  }
+
+  fn resolve_identities(
+    &mut self,
+    definitions: &BTreeMap<SymbolId, BTreeSet<NameId>>,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    let mut bindings = Vec::with_capacity(self.occurrences.len());
+    for site in &self.occurrences {
+      check_cancelled(cancelled)?;
+      bindings.push(self.binding_targets(site, definitions));
+    }
+    let mut identities: Vec<_> = (0..self.names.len()).collect();
+    loop {
+      let mut changed = false;
+      for (site, targets) in self.occurrences.iter().zip(&bindings) {
+        check_cancelled(cancelled)?;
+        let Some(targets) = targets else { continue };
+        if !site
+          .resolution
+          .as_ref()
+          .expect("resolved binding")
+          .alternatives
+          .is_empty()
+        {
+          continue;
+        }
+        let mut targets = targets.iter().map(|id| identity(&identities, id.0));
+        let Some(target) = targets.next() else {
+          continue;
+        };
+        if targets.all(|other| other == target) {
+          let local =
+            identity(&identities, site.name.expect("named binding").0);
+          if local != target {
+            identities[local.max(target)] = local.min(target);
+            changed = true;
+          }
+        }
+      }
+      if !changed {
+        break;
+      }
+    }
+    for (site, targets) in self.occurrences.iter_mut().zip(bindings) {
+      check_cancelled(cancelled)?;
+      let Some(targets) = targets else { continue };
+      let local = identity(&identities, site.name.expect("named binding").0);
+      if targets
+        .iter()
+        .all(|target| identity(&identities, target.0) == local)
+      {
+        site.identity = Some(NameId(local));
+      }
+    }
+    Ok(())
+  }
+
+  fn binding_targets(
+    &self,
+    site: &NameOccurrence,
+    definitions: &BTreeMap<SymbolId, BTreeSet<NameId>>,
+  ) -> Option<BTreeSet<NameId>> {
+    let name = &self.names[site.name?.0];
+    let resolution = site.resolution.as_ref()?;
+    if !site.compatible
+      || site.access == Access::Unknown
+      || !resolution.is_complete()
+      || resolution.alternatives.iter().any(|alternative| {
+        !matches!(
+          (name.kind, site.access, alternative),
+          (
+            SymbolKind::Variable,
+            _,
+            Alternative::Environment
+              | Alternative::External
+              | Alternative::Unset
+          ) | (
+            SymbolKind::Function,
+            Access::NameReference,
+            Alternative::Unset
+          )
+        )
+      })
+    {
+      return None;
+    }
+    let mut targets = BTreeSet::new();
+    for symbol in &resolution.candidates {
+      let owners: Vec<_> = definitions
+        .get(symbol)?
+        .iter()
+        .copied()
+        .filter(|id| {
+          let owner = &self.names[id.0];
+          owner.kind == name.kind
+            && owner.text == name.text
+            && self.may_inherit(name.environment, owner.environment)
+        })
+        .collect();
+      if owners.is_empty() {
+        return None;
+      }
+      targets.extend(owners);
+    }
+    Some(targets)
   }
 
   #[must_use]
@@ -202,6 +336,13 @@ impl NameRelations {
   }
 }
 
+fn identity(identities: &[usize], mut index: usize) -> usize {
+  while identities[index] != index {
+    index = identities[index];
+  }
+  index
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct NameKey {
   environment: NameEnvironment,
@@ -224,22 +365,21 @@ struct Relationships<'a> {
   analysis: &'a Analysis,
   result: NameRelations,
   keys: BTreeMap<NameKey, NameId>,
+  argument_compatible: BTreeMap<UseSite, bool>,
   unattempted: BTreeMap<UseSite, engine::ArgumentRole>,
-  deferred: BTreeMap<UseSite, DeferredName>,
+  deferred: BTreeMap<UseSite, SyntaxName>,
   scope_nodes: BTreeMap<(Snapshot, usize, usize), NameEnvironment>,
 }
 
 #[derive(Clone, Debug)]
-struct DeferredName {
+struct SyntaxName {
   environment: NameEnvironment,
-  resolution: Option<Resolution>,
   definition: Option<SymbolId>,
 }
 
 #[derive(Clone, Copy)]
-struct DeferredContext {
+struct SyntaxContext {
   environment: NameEnvironment,
-  sequential: bool,
 }
 
 fn isolated_parent(
@@ -254,8 +394,8 @@ fn isolated_parent(
 }
 
 #[derive(Debug, Default)]
-pub(super) struct DeferredNames {
-  names: BTreeMap<UseSite, DeferredName>,
+struct SyntaxNames {
+  names: BTreeMap<UseSite, SyntaxName>,
   scopes: BTreeMap<ContextId, NameScope>,
   scope_nodes: BTreeMap<(Snapshot, usize, usize), NameEnvironment>,
   dependencies: Vec<NameDependency>,
@@ -264,7 +404,7 @@ pub(super) struct DeferredNames {
     BTreeMap<engine::OccurrenceId, engine::analysis::UnattemptedCommand>,
 }
 
-impl DeferredNames {
+impl SyntaxNames {
   pub fn collect(
     document: &Document,
     cancelled: &AtomicBool,
@@ -274,19 +414,12 @@ impl DeferredNames {
     Ok(result)
   }
 
-  pub fn resolution(&self, site: UseSite) -> Option<Resolution> {
-    self
-      .names
-      .get(&site)
-      .and_then(|name| name.resolution.clone())
-  }
-
   fn deferred_scopes(
     &mut self,
     document: &Document,
     cancelled: &AtomicBool,
-  ) -> Result<Vec<DeferredContext>, Error> {
-    let mut contexts: Vec<DeferredContext> = Vec::new();
+  ) -> Result<Vec<SyntaxContext>, Error> {
+    let mut contexts: Vec<SyntaxContext> = Vec::new();
     for context in document.contexts() {
       check_cancelled(cancelled)?;
       let node = document
@@ -329,12 +462,7 @@ impl DeferredNames {
           environment,
         );
       }
-      contexts.push(DeferredContext {
-        environment,
-        sequential: parent.is_none_or(|parent| {
-          parent.environment != environment || parent.sequential
-        }) && node.is_some_and(|node| !uncertain_order(node)),
-      });
+      contexts.push(SyntaxContext { environment });
     }
     Ok(contexts)
   }
@@ -350,80 +478,18 @@ impl DeferredNames {
       .iter()
       .map(|symbol| (symbol.definition, symbol.id))
       .collect();
-    let mut functions = BTreeMap::new();
-    let mut function_effects = BTreeMap::new();
-    let mut recovery = recovery_positions(document, cancelled)?;
     for occurrence in document.occurrences() {
       check_cancelled(cancelled)?;
-      while recovery
-        .first()
-        .is_some_and(|position| *position <= occurrence.location.bytes.start)
-      {
-        recovery.pop_first();
-        functions.clear();
-      }
       let site = UseSite::Syntax(occurrence.id);
-      let DeferredContext {
-        environment,
-        sequential,
-      } = contexts[occurrence.context.index];
-      if !functions.contains_key(&environment) {
-        let inherited = self.inherited_functions(&functions, environment);
-        functions.insert(environment, inherited);
-      }
-      let available = functions.get_mut(&environment).expect("name scope");
-      if !sequential {
-        available.clear();
-      }
-      let mut resolution = None;
+      let environment = contexts[occurrence.context.index].environment;
       let own_definition = definitions.get(&occurrence.id).copied();
-      if let Value::Literal(name) = &occurrence.name {
-        if occurrence.kind == OccurrenceKind::FunctionDefinition {
-          resolution = Some(Resolution::default());
-          if sequential && let Some(symbol) = own_definition {
-            available.insert(name.clone(), symbol);
-          }
-        } else if occurrence.kind == OccurrenceKind::Command {
-          if let Some(invariant) =
-            engine::analysis::invariant_command(&occurrence.name)
-          {
-            resolution = Some(invariant);
-          } else if let Some(symbol) = available.get(name).copied() {
-            resolution = Some(Resolution {
-              candidates: [symbol].into(),
-              ..Resolution::default()
-            });
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-              function_effects.entry(symbol)
-            {
-              entry.insert(function_targets(document, symbol, cancelled)?);
-            }
-            let targets = &function_effects[&symbol];
-            forget_functions(available, targets);
-            if !targets.is_empty() {
-              self.effects.push(NameEffect {
-                environment,
-                location: occurrence.location.clone(),
-                targets: targets.clone(),
-              });
-            }
-          }
-        }
-      }
       if occurrence.kind == OccurrenceKind::Command {
-        let targets = self.deferred_arguments(
-          document,
-          occurrence,
-          environment,
-          resolution.as_ref(),
-        );
-        forget_functions(available, &targets);
+        self.deferred_arguments(document, occurrence, environment);
       }
       self.names.insert(
         site,
-        DeferredName {
+        SyntaxName {
           environment,
-          resolution,
           definition: own_definition,
         },
       );
@@ -431,31 +497,14 @@ impl DeferredNames {
     Ok(())
   }
 
-  fn inherited_functions(
-    &self,
-    functions: &BTreeMap<NameEnvironment, FunctionBindings>,
-    environment: NameEnvironment,
-  ) -> FunctionBindings {
-    std::iter::successors(Some(environment), |environment| {
-      isolated_parent(&self.scopes, *environment)
-    })
-    .find_map(|environment| functions.get(&environment))
-    .cloned()
-    .unwrap_or_default()
-  }
-
   fn deferred_arguments(
     &mut self,
     document: &Document,
     occurrence: &engine::Occurrence,
     environment: NameEnvironment,
-    resolution: Option<&Resolution>,
-  ) -> BTreeSet<EffectTarget> {
-    if resolution.is_some_and(|resolution| !resolution.candidates.is_empty()) {
-      return BTreeSet::new();
-    }
+  ) {
     let Some(command) = document.command_at(&occurrence.location) else {
-      return BTreeSet::new();
+      return;
     };
     let command = engine::analysis::unattempted_command(
       document.snapshot(),
@@ -476,13 +525,9 @@ impl DeferredNames {
         targets: command.targets.clone(),
       });
     }
-    let targets = command.targets.clone();
     self.commands.insert(occurrence.id, command);
-    targets
   }
 }
-
-type FunctionBindings = imbl::OrdMap<Vec<u8>, SymbolId>;
 
 impl Workspace {
   pub fn name_relations(
@@ -551,9 +596,9 @@ impl Workspace {
         cancelled,
       )?;
     }
-    let inactive = builder.add_bodies(&mut visited, &attempted, cancelled)?;
+    builder.add_bodies(&mut visited, &attempted, cancelled)?;
     builder.unattempted_expansions(&visited, cancelled)?;
-    builder.incomplete_bodies(&inactive);
+    builder.incomplete_bodies();
     for site in builder.unattempted.keys().copied().collect::<Vec<_>>() {
       if !attempted.contains(&site) {
         builder.add(site, None, BTreeSet::new());
@@ -583,66 +628,28 @@ impl<'a> Relationships<'a> {
     visited: &mut BTreeSet<engine::DocumentId>,
     attempted: &BTreeSet<UseSite>,
     cancelled: &AtomicBool,
-  ) -> Result<BTreeSet<engine::DocumentId>, Error> {
-    let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
-    let mut documents = BTreeSet::new();
-    for (site, body) in &self.analysis.derived.bodies {
-      for snapshot in body.documents.keys() {
-        children
-          .entry(site.snapshot)
-          .or_default()
-          .push((*snapshot, *site));
-        documents.insert(*snapshot);
-      }
-    }
-    let mut pending: Vec<_> = children
-      .keys()
-      .filter(|snapshot| !documents.contains(snapshot))
-      .copied()
+  ) -> Result<(), Error> {
+    let documents: BTreeSet<_> = self
+      .analysis
+      .derived
+      .bodies
+      .values()
+      .flat_map(|body| body.documents.keys().copied())
       .collect();
-    let mut inactive = BTreeSet::new();
-    while let Some(parent) = pending.pop() {
+    for snapshot in documents {
       check_cancelled(cancelled)?;
-      for (snapshot, registration) in
-        children.remove(&parent).unwrap_or_default()
-      {
-        pending.push(snapshot);
-        if !self.body_applicable(registration, &inactive) {
-          inactive.insert(snapshot.document);
-          continue;
-        }
-        let document = self
-          .workspace
-          .document(snapshot.document)
-          .ok_or(Error::UnknownDocument(snapshot.document))?;
-        self.add_document(document, &[], attempted, cancelled)?;
-        visited.insert(snapshot.document);
-      }
+      let document = self
+        .workspace
+        .document(snapshot.document)
+        .ok_or(Error::UnknownDocument(snapshot.document))?;
+      self.add_document(document, &[], attempted, cancelled)?;
+      visited.insert(snapshot.document);
     }
-    Ok(inactive)
+    Ok(())
   }
 
-  fn body_applicable(
-    &self,
-    registration: engine::OccurrenceId,
-    inactive: &BTreeSet<engine::DocumentId>,
-  ) -> bool {
-    if inactive.contains(&registration.snapshot.document) {
-      return false;
-    }
-    !(self.analysis.derived.bodies[&registration].conditional
-      && self
-        .deferred
-        .get(&UseSite::Syntax(registration))
-        .and_then(|site| site.resolution.as_ref())
-        .is_some_and(|resolution| !resolution.candidates.is_empty()))
-  }
-
-  fn incomplete_bodies(&mut self, inactive: &BTreeSet<engine::DocumentId>) {
+  fn incomplete_bodies(&mut self) {
     for (registration, body) in &self.analysis.derived.bodies {
-      if !self.body_applicable(*registration, inactive) {
-        continue;
-      }
       let site = self
         .workspace
         .occurrence(*registration)
@@ -688,10 +695,36 @@ impl<'a> Relationships<'a> {
         ..NameRelations::default()
       },
       keys: BTreeMap::new(),
+      argument_compatible: BTreeMap::new(),
       unattempted: BTreeMap::new(),
       deferred: BTreeMap::new(),
       scope_nodes: BTreeMap::new(),
     }
+  }
+
+  fn check_projected_names(
+    &mut self,
+    analyzed: &[usize],
+    projected: &BTreeMap<(usize, usize), ProjectedResolution>,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    for index in analyzed {
+      check_cancelled(cancelled)?;
+      let site = &mut self.result.occurrences[*index];
+      if site
+        .site
+        .syntax()
+        .is_some_and(|id| id.snapshot != site.location.snapshot)
+      {
+        site.compatible &= !site.spans.is_empty()
+          && site.spans.iter().all(|part| {
+            projected
+              .get(&(part.bytes.start, part.bytes.end))
+              .is_some_and(|result| result.resolution.is_some())
+          });
+      }
+    }
+    Ok(())
   }
 
   fn add_document(
@@ -704,19 +737,7 @@ impl<'a> Relationships<'a> {
     let projected = self
       .workspace
       .projected_resolutions(document.snapshot(), None);
-    for index in analyzed {
-      check_cancelled(cancelled)?;
-      let site = &mut self.result.occurrences[*index];
-      if site
-        .site
-        .syntax()
-        .is_some_and(|id| id.snapshot != site.location.snapshot)
-      {
-        site.compatible &= projected
-          .get(&(site.location.bytes.start, site.location.bytes.end))
-          .is_some_and(|result| result.resolution.is_some());
-      }
-    }
+    self.check_projected_names(analyzed, &projected, cancelled)?;
     let mut pending = Vec::new();
     for occurrence in document.occurrences() {
       check_cancelled(cancelled)?;
@@ -731,7 +752,7 @@ impl<'a> Relationships<'a> {
         pending.push(occurrence);
       }
     }
-    let deferred = document.deferred(cancelled)?;
+    let deferred = SyntaxNames::collect(document, cancelled)?;
     for (id, scope) in &deferred.scopes {
       self.result.scopes.insert(
         *id,
@@ -790,13 +811,21 @@ impl<'a> Relationships<'a> {
       check_cancelled(cancelled)?;
       self.add(UseSite::Syntax(occurrence.id), None, BTreeSet::new());
     }
+    self.add_arguments(document, attempted);
+    Ok(())
+  }
+
+  fn add_arguments(
+    &mut self,
+    document: &Document,
+    attempted: &BTreeSet<UseSite>,
+  ) {
     for role in document.argument_roles() {
       let site = UseSite::argument(&role.location);
       if !attempted.contains(&site) {
         self.unattempted.entry(site).or_insert_with(|| role.clone());
       }
     }
-    Ok(())
   }
 
   fn deferred_environment(
@@ -929,6 +958,15 @@ impl<'a> Relationships<'a> {
     else {
       return;
     };
+    let compatible = compatible
+      && (context.is_none()
+        || matches!(site, UseSite::Syntax(_))
+        || *self.argument_compatible.entry(site).or_insert_with(|| {
+          self
+            .analysis
+            .argument_summary(site)
+            .is_some_and(|summary| summary.kind.is_some())
+        }));
     let mut names = BTreeSet::new();
     if let (Some(kind), Some(text)) = (kind, &text) {
       let environment = context
@@ -961,24 +999,28 @@ impl<'a> Relationships<'a> {
       self.result.names[id.0].definitions.extend(&definitions);
       names.insert(id);
     }
-    let resolution = context
-      .map(|context| {
-        self
-          .analysis
-          .resolution(site, context)
-          .cloned()
-          .unwrap_or_default()
-      })
-      .or_else(|| deferred.and_then(|site| site.resolution.clone()));
+    let resolution = context.map(|context| {
+      self
+        .analysis
+        .resolution(site, context)
+        .cloned()
+        .unwrap_or_default()
+    });
+    let spans = text
+      .as_ref()
+      .map_or_else(Vec::new, |_| self.project_spelling(&spelling));
     let spelling = text.as_ref().map_or(NameSpelling::Generated, |name| {
-      self.spelling(document, &location, &spelling, name)
+      self.spelling(document, &location, &spans, name)
     });
     let source = self.source_location(&location);
     let occurrence = NameOccurrence {
       site,
       location: source,
       spelling,
+      spans,
       context,
+      name: names.first().copied(),
+      identity: None,
       names,
       access,
       definitions,
@@ -996,7 +1038,10 @@ impl<'a> Relationships<'a> {
     }
     for id in &occurrence.names {
       let name = &self.result.names[id.0];
-      if (occurrence.resolution.is_none()
+      if (occurrence
+        .resolution
+        .as_ref()
+        .is_none_or(|resolution| !resolution.is_complete())
         || matches!(name.environment, NameEnvironment::Caller(_)))
         && !(name.kind == SymbolKind::Function
           && engine::special_builtin(&name.text))
@@ -1156,21 +1201,24 @@ impl<'a> Relationships<'a> {
     }
   }
 
+  fn project_spelling(&self, fragments: &[Location]) -> Vec<Location> {
+    fragments
+      .iter()
+      .map(|part| self.workspace.project_locations(part))
+      .collect::<Option<Vec<_>>>()
+      .unwrap_or_default()
+      .into_iter()
+      .flatten()
+      .collect()
+  }
+
   fn spelling(
     &self,
     document: &Document,
     location: &Location,
-    fragments: &[Location],
+    projected: &[Location],
     name: &[u8],
   ) -> NameSpelling {
-    let projected: Option<Vec<_>> = fragments
-      .iter()
-      .map(|part| self.workspace.project_locations(part))
-      .collect();
-    let Some(projected) = projected else {
-      return NameSpelling::Generated;
-    };
-    let projected: Vec<_> = projected.into_iter().flatten().collect();
     if projected.is_empty() {
       return NameSpelling::Generated;
     }
@@ -1208,7 +1256,7 @@ impl<'a> Relationships<'a> {
     {
       return NameSpelling::LiteralWord(location.clone());
     }
-    NameSpelling::Fragments(projected)
+    NameSpelling::Fragments(projected.to_vec())
   }
 }
 
@@ -1219,136 +1267,29 @@ fn literal(value: &Value) -> Option<Vec<u8>> {
   }
 }
 
-fn recovery_positions(
-  document: &Document,
-  cancelled: &AtomicBool,
-) -> Result<BTreeSet<usize>, Error> {
-  let mut positions = BTreeSet::new();
-  if document.has_syntax_errors() {
-    let mut pending = vec![document.tree.root_node()];
-    while let Some(node) = pending.pop() {
-      check_cancelled(cancelled)?;
-      if node.is_error() || node.is_missing() {
-        positions.insert(node.start_byte());
-      } else if node.has_error() {
-        pending.extend(node.children(&mut node.walk()));
-      }
-    }
+pub(super) fn syntax_spelling(
+  document: &super::Document,
+  site: &Occurrence,
+) -> Vec<Location> {
+  if site.kind != engine::OccurrenceKind::Command {
+    return vec![site.location.clone()];
   }
-  Ok(positions)
-}
-
-fn forget_functions(
-  available: &mut FunctionBindings,
-  targets: &BTreeSet<EffectTarget>,
-) {
-  for target in targets {
-    match target {
-      EffectTarget::Function(name) => {
-        available.remove(name);
-      }
-      EffectTarget::FunctionPattern(value) => {
-        let names: Vec<_> = available
-          .keys()
-          .filter(|name| value.can_equal(name))
-          .cloned()
-          .collect();
-        for name in names {
-          available.remove(&name);
-        }
-      }
-      EffectTarget::Functions => available.clear(),
-      _ => {}
-    }
+  if !matches!(site.name, Value::Literal(_)) {
+    return Vec::new();
   }
-}
-
-fn uncertain_order(node: tree_sitter::Node<'_>) -> bool {
-  match node.kind() {
-    "if_clause"
-    | "else_part"
-    | "case_clause"
-    | "for_clause"
-    | "while_clause"
-    | "until_clause"
-    | "backquote_substitution"
-    | "here_document_body" => true,
-    "and_or" => {
-      node
-        .named_children(&mut node.walk())
-        .filter(|child| child.kind() == "pipeline")
-        .count()
-        > 1
-    }
-    "pipe_sequence" => {
-      node
-        .children_by_field_name("command", &mut node.walk())
-        .count()
-        > 1
-    }
-    _ => false,
-  }
-}
-
-fn function_targets(
-  document: &Document,
-  symbol: SymbolId,
-  cancelled: &AtomicBool,
-) -> Result<BTreeSet<EffectTarget>, Error> {
-  let definition = document
-    .symbol(symbol)
-    .and_then(|symbol| document.occurrence(symbol.definition))
-    .expect("function definition");
-  let node = document
-    .tree
-    .root_node()
-    .named_descendant_for_byte_range(
-      definition.location.bytes.start,
-      definition.location.bytes.end,
-    )
-    .expect("function name");
-  let body = std::iter::successors(Some(node), tree_sitter::Node::parent)
-    .find(|node| node.kind() == "function_definition")
-    .and_then(|node| node.child_by_field_name("body"))
-    .expect("function body");
-  let mut pending = vec![body];
-  let mut targets = BTreeSet::new();
-  while let Some(node) = pending.pop() {
-    check_cancelled(cancelled)?;
-    if super::parser::damaged(node) {
-      return Ok([EffectTarget::Functions].into());
-    }
-    if super::parser::asynchronous(node) {
-      continue;
-    }
-    match node.kind() {
-      "function_definition" => {
-        let Some(name) = node.child_by_field_name("name") else {
-          return Ok([EffectTarget::Functions].into());
-        };
-        let name = engine::word::lexical(name, document.source().as_bytes());
-        targets.insert(EffectTarget::Function(name));
-        continue;
-      }
-      kind if super::parser::subshell(kind) => continue,
-      "simple_command" => {
-        let command = engine::analysis::unattempted_command(
-          document.snapshot(),
-          node,
-          document.source().as_bytes(),
-        );
-        targets.extend(command.targets.into_iter().filter(|target| {
-          matches!(
-            target,
-            EffectTarget::Function(_)
-              | EffectTarget::FunctionPattern(_)
-              | EffectTarget::Functions
-          )
-        }));
-      }
-      _ => {}
-    }
-    pending.extend(node.named_children(&mut node.walk()));
-  }
-  Ok(targets)
+  let Some(node) = document.tree.root_node().named_descendant_for_byte_range(
+    site.location.bytes.start,
+    site.location.bytes.end,
+  ) else {
+    return Vec::new();
+  };
+  engine::word::literal(node, document.source().as_bytes())
+    .fragments
+    .into_iter()
+    .filter_map(|fragment| fragment.source)
+    .map(|bytes| Location {
+      snapshot: site.location.snapshot,
+      bytes,
+    })
+    .collect()
 }

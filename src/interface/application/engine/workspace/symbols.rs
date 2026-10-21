@@ -1,5 +1,4 @@
 use super::Workspace;
-use super::derived::listing_key;
 use super::documents::matches_query;
 use crate::interface::application::engine::{
   Context, ContextId, DocumentId, Location, OccurrenceKind, Snapshot, Symbol,
@@ -224,5 +223,95 @@ impl<'a> Hierarchy<'a> {
       },
       |parent| vec![parent],
     )
+  }
+}
+
+fn listing_key<'a>(
+  symbol: &'a Symbol,
+  location: &Location,
+) -> (&'a [u8], Snapshot, usize, usize, SymbolKind) {
+  (
+    symbol.name.as_slice(),
+    location.snapshot,
+    location.bytes.start,
+    location.bytes.end,
+    symbol.kind,
+  )
+}
+
+impl Workspace {
+  #[must_use]
+  pub fn definition_location(&self, symbol: &Symbol) -> Option<Location> {
+    let site = self.occurrence(symbol.definition)?;
+    self.navigation_location(&site.location)
+  }
+
+  pub fn projected_symbols(
+    &self,
+    id: DocumentId,
+  ) -> impl Iterator<Item = (&Symbol, crate::interface::application::engine::Location)>
+  {
+    self
+      .search_symbol_locations(&[])
+      .filter(move |(_, location)| location.snapshot.document == id)
+  }
+
+  pub fn search_symbol_locations<'a>(
+    &'a self,
+    query: &'a [u8],
+  ) -> impl Iterator<
+    Item = (&'a Symbol, crate::interface::application::engine::Location),
+  > {
+    let mut seen = BTreeSet::new();
+    self
+      .symbol_locations(query)
+      .filter(move |(symbol, location)| {
+        seen.insert(listing_key(symbol, location))
+      })
+  }
+
+  pub(super) fn symbol_locations<'a>(
+    &'a self,
+    query: &'a [u8],
+  ) -> impl Iterator<Item = (&'a Symbol, Location)> {
+    let mut visible = BTreeSet::new();
+    let roots: BTreeSet<_> = self
+      .search_symbols(query)
+      .filter(|symbol| self.derived.contains_key(&symbol.id.snapshot.document))
+      .map(|symbol| self.source_snapshot(symbol.id.snapshot))
+      .collect();
+    for root in roots {
+      for group in self.projections(root, None).filter(|group| group.complete) {
+        let mut matches: BTreeMap<
+          _,
+          (BTreeSet<SymbolId>, BTreeSet<DocumentId>),
+        > = BTreeMap::new();
+        for unit in &group.documents {
+          for symbol in unit.document.symbols() {
+            let Some(location) = self.definition_location(symbol) else {
+              continue;
+            };
+            let (symbols, documents) =
+              matches.entry(listing_key(symbol, &location)).or_default();
+            symbols.insert(symbol.id);
+            documents.insert(symbol.id.snapshot.document);
+          }
+        }
+        visible.extend(
+          matches
+            .into_values()
+            .filter(|(_, documents)| documents.len() == group.documents.len())
+            .flat_map(|(ids, _)| ids),
+        );
+      }
+    }
+    self.search_symbols(query).filter_map(move |symbol| {
+      if self.derived.contains_key(&symbol.id.snapshot.document)
+        && !visible.contains(&symbol.id)
+      {
+        return None;
+      }
+      Some((symbol, self.definition_location(symbol)?))
+    })
   }
 }

@@ -175,9 +175,7 @@ impl Value {
     }) {
       return Self::Unknown(issue);
     }
-    // Widen within first-byte partitions to bound growing loop values. A
-    // choice without a known first byte widens all choices but the empty
-    // value into one.
+    // First-byte partitions bound loop growth without merging empty and nonempty values.
     let choices = if choices
       .iter()
       .any(|choice| !choice.exact && choice.prefix.is_empty())
@@ -401,8 +399,7 @@ impl Value {
     }
   }
 
-  /// Joins `other` as the alternative of a choice that `cause` leaves
-  /// undetermined.
+  /// `cause` explains why the choice is undetermined.
   pub(in crate::interface::application::engine) fn join_choice(
     &mut self,
     other: &Self,

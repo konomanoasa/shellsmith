@@ -2078,6 +2078,113 @@ mod expansion {
   }
 
   #[test]
+  fn finite_merges_preserve_related_values_without_correlating_independent_values()
+   {
+    for body in [
+      ": \"${unknown:-default}\"",
+      ": \"$((unknown && 1))\"",
+      ": \"$((unknown || 1))\"",
+      ": \"$((unknown ? 1 : 2))\"",
+      "readonly locked; read locked",
+      "case word in x) : ;& *) : ;; esac",
+    ] {
+      let related = format!(
+        "if condition; then a=1; b=1; else a=2; b=2; fi; read unknown; {body}; result=$((a-b)); : \"$result\""
+      );
+      assert_eq!(
+        last_value(&related, InitialEnvironment::empty()),
+        Value::Literal(b"0".to_vec()),
+        "{body}"
+      );
+      let independent = format!(
+        "if first; then a=1; else a=2; fi; if second; then b=1; else b=2; fi; read unknown; {body}; result=$((a-b)); : \"$result\""
+      );
+      let Value::Partial(value) =
+        last_value(&independent, InitialEnvironment::empty())
+      else {
+        panic!("independent values: {body}");
+      };
+      assert!(value.choices.iter().all(|choice| choice.exact), "{body}");
+      assert_eq!(
+        value
+          .choices
+          .iter()
+          .map(|choice| choice.prefix.as_slice())
+          .collect::<Vec<_>>(),
+        [b"-1".as_slice(), b"0", b"1"],
+        "{body}"
+      );
+    }
+    for source in [
+      "read unknown; : \"$((unknown ? (a=b=3) : (a=b=4)))\"; result=$((a-b)); : \"$result\"",
+      "if condition; then a=1; b=1; else unset a; b=0; fi; read unknown; : \"${unknown:-default}\"; result=$((a-b)); : \"$result\"",
+    ] {
+      assert_eq!(
+        last_value(source, InitialEnvironment::empty()),
+        Value::Literal(b"0".to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn repeated_execution_keeps_unmodified_relations_across_nested_transfers() {
+    for body in [
+      "while condition; do :; done",
+      "while condition; do unrelated=1; done",
+      "for item in x y; do :; done",
+      ": | :",
+      "unrelated=1 | :",
+      "f() { while outer; do for item in x y; do if skip; then continue; else if finish; then break 2; else return; fi; fi; done; done; }; f",
+      "while outer; do while inner; do if skip; then continue 2; else break; fi; done; unrelated=1; done",
+    ] {
+      let source = format!(
+        "if condition; then a=1; b=1; else a=2; b=2; fi; {body}; result=$((a-b)); : \"$result\""
+      );
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(b"0".to_vec()),
+        "{body}"
+      );
+    }
+    for body in [
+      "while condition; do a=3; done",
+      "while condition; do a=$((a+1)); done",
+      "a=3 | :",
+    ] {
+      let source = format!(
+        "if condition; then a=1; b=1; else a=2; b=2; fi; {body}; result=$((a-b)); : \"$result\""
+      );
+      assert!(
+        matches!(
+          last_value(&source, InitialEnvironment::empty()),
+          Value::Unknown(_) | Value::Partial(_)
+        ),
+        "{body}"
+      );
+    }
+  }
+
+  #[test]
+  fn merges_keep_function_and_positional_choices_paired_with_variables() {
+    for body in [
+      "read unknown; : \"${unknown:-default}\"",
+      "while condition; do unrelated=1; done",
+      "for item in x y; do unrelated() { :; }; done",
+      ": | :",
+    ] {
+      let source = format!(
+        "if condition; then a=1; set -- 2; f() {{ result=$(($1-a-1)); }}; else a=2; set -- 4; f() {{ result=$(($1-a-2)); }}; fi; {body}; f \"$@\"; : \"$result\""
+      );
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(b"0".to_vec()),
+        "{body}"
+      );
+    }
+  }
+
+  #[test]
   fn independent_branch_values_are_only_combined_when_the_command_uses_them() {
     let mut source = String::new();
     let mut arguments = String::new();
@@ -2120,6 +2227,12 @@ mod expansion {
     }
     for (body, expected) in [
       (format!("sum=$(({sum})); result=$(({difference}))"), "0"),
+      (
+        format!(
+          "sum=$(({sum})); while condition; do unrelated=1; done; result=$(({difference}))"
+        ),
+        "0",
+      ),
       (
         format!("joined=\"{joined}\"; copied=$joined; result=${{#copied}}"),
         "32",

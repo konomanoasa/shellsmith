@@ -28,6 +28,167 @@ mod lsp {
   }
 
   #[tokio::test]
+  async fn completed_workspace_analysis_refreshes_tokens_after_caller_changes()
+  {
+    let fixture = Fixture::new();
+    let library = fixture.write("lib.sh", "a() { :; }\nb() { a; }\n");
+    let caller = fixture.write("main.sh", ". ./lib.sh; b");
+    let library_uri = Url::from_file_path(&library).unwrap().to_string();
+    let caller_uri = Url::from_file_path(&caller).unwrap().to_string();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    server.request("initialize", json!({
+      "workspaceFolders":[{"uri":Url::from_file_path(&fixture.root).unwrap(),"name":"fixture"}],
+      "capabilities":{
+        "workspace":{"semanticTokens":{"refreshSupport":true}},
+        "textDocument":{"semanticTokens":{"requests":{"full":true},"formats":["relative"],"tokenTypes":["function","command"],"tokenModifiers":[]}}
+      }
+    })).await;
+    server.notify("initialized", json!({})).await;
+    assert_eq!(
+      server.receive().await["method"],
+      "workspace/semanticTokens/refresh"
+    );
+    let tokens = decoded(
+      &request(
+        &mut server,
+        "textDocument/semanticTokens/full",
+        &library_uri,
+      )
+      .await,
+    );
+    assert!(tokens.contains(&(1, 6, 1, 0, 0)), "{tokens:?}");
+    let selection = json!({"textDocument":{"uri":library_uri},"position":{"line":1,"character":6}});
+    let definitions = server
+      .request("textDocument/definition", selection.clone())
+      .await;
+    assert_eq!(
+      definitions["result"],
+      json!([{"uri":library_uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}])
+    );
+    let references = server.request("textDocument/references", json!({"textDocument":{"uri":library_uri},"position":{"line":1,"character":6},"context":{"includeDeclaration":false}})).await;
+    assert_eq!(
+      references["result"],
+      json!([{"uri":library_uri,"range":{"start":{"line":1,"character":6},"end":{"line":1,"character":7}}}])
+    );
+
+    for (source, expected) in [
+      (". ./lib.sh; unset -f a; b", 1),
+      (". ./lib.sh; a() { echo replacement; }; b", 0),
+    ] {
+      fixture.write("main.sh", source);
+      server
+        .notify(
+          "workspace/didChangeWatchedFiles",
+          json!({"changes":[{"uri":caller_uri,"type":2}]}),
+        )
+        .await;
+      for _ in 0..2 {
+        assert_eq!(
+          server.receive().await["method"],
+          "workspace/semanticTokens/refresh"
+        );
+      }
+      let tokens = decoded(
+        &request(
+          &mut server,
+          "textDocument/semanticTokens/full",
+          &library_uri,
+        )
+        .await,
+      );
+      assert!(tokens.contains(&(1, 6, 1, expected, 0)), "{tokens:?}");
+      let definitions = server
+        .request("textDocument/definition", selection.clone())
+        .await;
+      let references = server.request("textDocument/references", json!({"textDocument":{"uri":library_uri},"position":{"line":1,"character":6},"context":{"includeDeclaration":false}})).await;
+      if expected == 1 {
+        assert_eq!(definitions["result"], Value::Null);
+        assert_eq!(references["result"], Value::Null);
+      } else {
+        let start = source.find("a()").unwrap();
+        assert_eq!(
+          definitions["result"],
+          json!([{"uri":caller_uri,"range":{"start":{"line":0,"character":start},"end":{"line":0,"character":start + 1}}}])
+        );
+        assert_eq!(
+          references["result"],
+          json!([{"uri":library_uri,"range":{"start":{"line":1,"character":6},"end":{"line":1,"character":7}}}])
+        );
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn references_advertise_support_and_preserve_utf16_ranges_and_inclusion()
+   {
+    let fixture = Fixture::new();
+    let path = fixture.write("main.sh", "disk=ignored");
+    let uri = Url::from_file_path(path).unwrap().to_string();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    let initialized = initialize(&mut server, true).await;
+    assert_eq!(
+      initialized["result"]["capabilities"]["referencesProvider"],
+      true
+    );
+    let source =
+      ": '😀'; value=1\r\n: \"${value}\"\r\nvalue=2\r\n: \"$value\"\r\n";
+    server.notify("textDocument/didOpen", json!({"textDocument":{"uri":uri,"languageId":"sh","version":1,"text":source}})).await;
+    let location = |line, start, end| json!({"uri":uri,"range":{"start":{"line":line,"character":start},"end":{"line":line,"character":end}}});
+    for include in [false, true] {
+      let response = server.request("textDocument/references", json!({"textDocument":{"uri":uri},"position":{"line":0,"character":8},"context":{"includeDeclaration":include}})).await;
+      let expected = if include {
+        json!([
+          location(0, 8, 13),
+          location(1, 5, 10),
+          location(2, 0, 5),
+          location(3, 4, 9)
+        ])
+      } else {
+        json!([location(1, 5, 10), location(3, 4, 9)])
+      };
+      assert_eq!(response["result"], expected, "{response}");
+    }
+    let empty = server.request("textDocument/references", json!({"textDocument":{"uri":uri},"position":{"line":1,"character":3},"context":{"includeDeclaration":true}})).await;
+    assert_eq!(empty["result"], Value::Null);
+    assert!(empty.get("error").is_none());
+    server.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"value=3"}]})).await;
+    for (include, expected) in
+      [(false, Value::Null), (true, json!([location(0, 0, 5)]))]
+    {
+      let response = server.request("textDocument/references", json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0},"context":{"includeDeclaration":include}})).await;
+      assert_eq!(response["result"], expected, "{response}");
+    }
+  }
+
+  #[tokio::test]
+  async fn references_log_unreadable_inputs_and_fail_for_unavailable_requested_documents()
+   {
+    let fixture = Fixture::new();
+    let path = fixture.write("main.sh", "value=1; : \"$value\"");
+    std::fs::write(fixture.root.join("broken.sh"), [0xff]).unwrap();
+    let uri = Url::from_file_path(path).unwrap().to_string();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    server.request("initialize", json!({"rootUri":Url::from_file_path(&fixture.root).unwrap(),"capabilities":{}})).await;
+    server.notify("initialized", json!({})).await;
+    let response = server.request("textDocument/references", json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0},"context":{"includeDeclaration":false}})).await;
+    assert_eq!(
+      response["result"],
+      json!([{"uri":uri,"range":{"start":{"line":0,"character":13},"end":{"line":0,"character":18}}}]),
+      "{response}"
+    );
+    let message = log_message(&mut server).await;
+    assert!(
+      message["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("broken.sh")
+    );
+    let uri = Url::from_file_path(fixture.root.join("missing.sh")).unwrap();
+    let response = server.request("textDocument/references", json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0},"context":{"includeDeclaration":false}})).await;
+    assert!(response.get("error").is_some(), "{response}");
+  }
+
+  #[tokio::test]
   async fn symbol_hierarchy_negotiates_format_and_preserves_utf16_ranges_and_containers()
    {
     fn range(line: u32, start: u32, end: u32) -> Value {
@@ -142,6 +303,12 @@ mod lsp {
       let location = json!({"uri":expected_uri,"range":{"start":{"line":line,"character":0},"end":{"line":line,"character":5}}});
       let definitions = server.request("textDocument/definition", json!({"textDocument":{"uri":main_uri},"position":{"line":1,"character":4}})).await;
       assert_eq!(definitions["result"], json!([location]), "{definitions}");
+      let references = server.request("textDocument/references", json!({"textDocument":{"uri":expected_uri},"position":{"line":line,"character":0},"context":{"includeDeclaration":true}})).await;
+      assert_eq!(
+        references["result"],
+        json!([location, {"uri":main_uri,"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":9}}}]),
+        "{references}"
+      );
       let links =
         request(&mut server, "textDocument/documentLink", &main_uri).await;
       assert_eq!(
@@ -513,9 +680,13 @@ mod lsp {
     {
       return message;
     }
-    let message = server.receive().await;
-    assert_eq!(message["method"], "window/logMessage");
-    message
+    loop {
+      let message = server.receive().await;
+      if message["method"] == "window/logMessage" {
+        return message;
+      }
+      assert_eq!(message["method"], "workspace/semanticTokens/refresh");
+    }
   }
   fn decoded(response: &Value) -> Vec<(u64, u64, u64, u64, u64)> {
     let data = response["result"]["data"]

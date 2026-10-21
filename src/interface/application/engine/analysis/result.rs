@@ -29,7 +29,6 @@ pub enum ExecutionKind {
 }
 
 impl ExecutionKind {
-  /// Whether the context runs in its own execution environment.
   pub(super) const fn separate(&self) -> bool {
     matches!(
       self,
@@ -103,7 +102,9 @@ impl Resolution {
     self.issues.extend(&other.issues);
   }
 
-  fn is_environment(&self) -> bool {
+  pub(in crate::interface::application::engine) fn is_environment(
+    &self,
+  ) -> bool {
     self.candidates.is_empty()
       && self.issues.is_empty()
       && self.alternatives == BTreeSet::from([Alternative::Environment])
@@ -172,7 +173,7 @@ pub enum EffectTarget {
   Variables,
   Functions,
   Attributes,
-  /// The working directory with the PWD and OLDPWD values that `cd` sets.
+  /// Includes the PWD and OLDPWD values set by `cd`.
   Directory,
   Positionals,
   Options,
@@ -299,6 +300,15 @@ pub struct ArgumentRole {
 }
 
 impl ArgumentRole {
+  pub(in crate::interface::application::engine) fn selection_locations(
+    &self,
+  ) -> impl Iterator<Item = &Location> {
+    self.spelling.iter().chain(
+      (self.context.is_some() && self.spelling.is_empty())
+        .then_some(&self.location),
+    )
+  }
+
   pub(in crate::interface::application::engine) fn join(
     &mut self,
     other: &Self,
@@ -357,6 +367,8 @@ pub struct Analysis {
     BTreeSet<OccurrenceId>,
   pub(in crate::interface::application::engine) references:
     BTreeMap<SymbolId, BTreeSet<(UseSite, ExecutionContextId)>>,
+  pub(in crate::interface::application::engine) non_sources:
+    BTreeSet<ReferenceId>,
   pub(in crate::interface::application::engine) source_operands:
     BTreeMap<ReferenceId, Option<Location>>,
   pub(in crate::interface::application::engine) source_inputs:
@@ -390,12 +402,12 @@ impl Analysis {
       references: BTreeMap::new(),
       source_inputs: BTreeMap::new(),
       source_operands: BTreeMap::new(),
+      non_sources: BTreeSet::new(),
       values: BTreeMap::new(),
     }
   }
 
-  /// Marks argument uses without a reference role as having unknown effects
-  /// and indexes the uses of each symbol.
+  /// Argument uses without a reference role imply unknown effects.
   pub(super) fn index_uses(
     &mut self,
     cancelled: &AtomicBool,
@@ -508,13 +520,6 @@ impl Analysis {
           ..=(occurrence, ExecutionContextId(usize::MAX)),
       )
       .map(|((_, context), value)| (*context, value.as_ref()))
-  }
-
-  pub(super) fn is_environment(&self, id: OccurrenceId) -> bool {
-    self
-      .summarize(UseSite::Syntax(id))
-      .resolution
-      .is_some_and(|resolution| resolution.is_environment())
   }
 
   #[must_use]
@@ -745,5 +750,102 @@ impl Analysis {
       .into_iter()
       .flatten()
       .filter_map(|key| self.uses.get(key))
+  }
+}
+
+pub(in crate::interface::application::engine) fn argument_resolution(
+  analysis: Option<&Analysis>,
+  role: &engine::ArgumentRole,
+) -> Option<engine::Resolution> {
+  if role.spelling.is_empty() {
+    return None;
+  }
+  let site = engine::UseSite::argument(&role.location);
+  role.context?;
+  let analysis = analysis?;
+  match &role.kind {
+    Some(engine::ArgumentKind::Variable {
+      access: engine::Access::Write,
+      ..
+    }) => {
+      let candidates =
+        analysis.written_definitions(site).collect::<BTreeSet<_>>();
+      (!candidates.is_empty()).then_some(engine::Resolution {
+        candidates,
+        ..Default::default()
+      })
+    }
+    Some(
+      engine::ArgumentKind::Variable {
+        access: engine::Access::Unknown,
+        ..
+      }
+      | engine::ArgumentKind::Number,
+    )
+    | None => None,
+    _ => analysis.summarize(site).resolution,
+  }
+}
+
+pub(in crate::interface::application::engine) fn syntax_attempted(
+  site: &engine::Occurrence,
+  analysis: Option<&Analysis>,
+  resolution: Option<&engine::Resolution>,
+) -> bool {
+  analysis.is_some_and(|analysis| {
+    analysis
+      .resolutions(engine::UseSite::Syntax(site.id))
+      .next()
+      .is_some()
+      || resolution.is_some_and(|resolution| {
+        resolution.candidates.iter().any(|symbol| {
+          analysis
+            .writes
+            .range(
+              (*symbol, engine::ExecutionContextId(0))
+                ..=(*symbol, engine::ExecutionContextId(usize::MAX)),
+            )
+            .next()
+            .is_some()
+        })
+      })
+  })
+}
+
+pub(in crate::interface::application::engine) fn syntax_resolution(
+  document: &engine::Document,
+  site: &engine::Occurrence,
+  analysis: Option<&Analysis>,
+) -> Option<engine::Resolution> {
+  if matches!(
+    site.access,
+    engine::Access::Definition | engine::Access::Write
+  ) {
+    document
+      .symbols()
+      .iter()
+      .find(|symbol| symbol.definition == site.id)
+      .map(|symbol| engine::Resolution {
+        candidates: [symbol.id].into(),
+        ..Default::default()
+      })
+  } else {
+    (site.kind == engine::OccurrenceKind::Command)
+      .then(|| engine::analysis::invariant_command(&site.name))
+      .flatten()
+      .or_else(|| {
+        let use_site = engine::UseSite::Syntax(site.id);
+        analysis.and_then(|analysis| analysis.summarize(use_site).resolution)
+      })
+  }
+}
+
+pub(in crate::interface::application::engine) fn join_resolution(
+  left: &mut Option<engine::Resolution>,
+  right: Option<&engine::Resolution>,
+) {
+  match (left.as_mut(), right) {
+    (Some(left), Some(right)) => left.join(right),
+    _ => *left = None,
   }
 }

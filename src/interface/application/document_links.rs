@@ -9,18 +9,31 @@ impl Application {
     id: DocumentId,
     cancelled: &AtomicBool,
   ) -> Result<Vec<(engine::Location, PathBuf)>, Error> {
-    self.analyze_document(id, cancelled)?;
-    Ok(
-      self
-        .workspace
-        .source_links(id)
-        .into_iter()
-        .filter_map(|(location, target)| {
-          self
-            .path(target.document)
-            .map(|path| (location, path.to_path_buf()))
-        })
-        .collect(),
-    )
+    let path = self
+      .path(id)
+      .ok_or(engine::Error::UnknownDocument(id))?
+      .to_path_buf();
+    let analyses = self.prepare_analysis(&path, cancelled)?;
+    let snapshot = self
+      .workspace
+      .document(id)
+      .ok_or(engine::Error::UnknownDocument(id))?
+      .snapshot();
+    let links = engine::AnalysisResults::new(analyses.entries.values())
+      .sources(snapshot)?;
+    let links = links
+      .into_iter()
+      .filter_map(|link| {
+        if !link.complete || link.targets.len() != 1 {
+          return None;
+        }
+        let target = link.targets.first()?;
+        Some((link.location, self.path(target.document)?.to_path_buf()))
+      })
+      .collect();
+    if !self.analysis_inputs_current(&analyses, cancelled)? {
+      return Err(Error::Superseded);
+    }
+    Ok(links)
   }
 }

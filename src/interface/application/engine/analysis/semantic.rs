@@ -1,9 +1,10 @@
-use crate::interface::application::engine::workspace::derived::syntax_resolution;
+use super::result::{argument_resolution, syntax_resolution};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::interface::application::engine::{
-  Access, Alternative, Analysis, ArgumentKind, AttributeState, Classification,
-  Document, Location, OccurrenceKind, Resolution, UseSite, Value,
+  Access, Alternative, Analysis, ArgumentKind, ArgumentRole, AttributeState,
+  Classification, Document, Location, OccurrenceId, OccurrenceKind, Resolution,
+  UseSite, Value,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -42,10 +43,8 @@ impl Document {
   #[must_use]
   pub(in crate::interface::application::engine) fn semantic_spans(
     &self,
-    analysis: Option<&Analysis>,
+    inputs: &[(&Document, &Analysis)],
   ) -> Vec<SemanticSpan> {
-    let analysis =
-      analysis.filter(|result| result.snapshots().contains(&self.snapshot()));
     let mut spans = BTreeMap::new();
     for classification in self.classifications() {
       let Some(kind) = self.semantic_kind(classification) else {
@@ -90,16 +89,28 @@ impl Document {
         modifiers.insert(Modifier::Declaration);
       }
       if site.kind == OccurrenceKind::Command {
-        let resolution = syntax_resolution(self, site, analysis);
+        let resolution = syntax_resolution(self, site, None)
+          .or_else(|| resolved(inputs, site.id.index));
         kind = command_kind(resolution.as_ref(), &mut modifiers);
       }
-      let readonly = analysis
-        .map_or(AttributeState::Unknown, |result| result.readonly(site.id));
+      let readonly = inputs
+        .iter()
+        .flat_map(|(document, analysis)| {
+          analysis
+            .readonly_contexts(OccurrenceId {
+              snapshot: document.snapshot(),
+              index: site.id.index,
+            })
+            .map(|(_, state)| state)
+        })
+        .reduce(AttributeState::join)
+        .unwrap_or(AttributeState::Unknown);
       if readonly == AttributeState::Known(true) {
         modifiers.insert(Modifier::Readonly);
       }
       if kind == SemanticKind::Variable
-        && analysis.is_some_and(|result| result.is_environment(site.id))
+        && resolved(inputs, site.id.index)
+          .is_some_and(|resolution| resolution.is_environment())
       {
         modifiers.insert(Modifier::Environment);
       }
@@ -115,23 +126,45 @@ impl Document {
         },
       );
     }
-    for span in self.argument_spans(analysis) {
+    for span in self.argument_spans(inputs) {
       spans.insert((span.location.bytes.start, span.location.bytes.end), span);
     }
     spans.into_values().collect()
   }
 
-  fn argument_spans(&self, analysis: Option<&Analysis>) -> Vec<SemanticSpan> {
-    let mut spans = Vec::new();
-    let mut arguments = analysis.map_or_else(BTreeMap::new, |analysis| {
-      analysis.argument_summaries(self.snapshot())
-    });
-    for role in self.argument_roles() {
-      arguments
-        .entry((role.location.bytes.start, role.location.bytes.end))
-        .or_insert_with(|| role.clone());
+  fn argument_spans(
+    &self,
+    inputs: &[(&Document, &Analysis)],
+  ) -> Vec<SemanticSpan> {
+    let mut roles: BTreeMap<_, (ArgumentRole, Option<Resolution>)> =
+      BTreeMap::new();
+    for (document, analysis) in inputs {
+      for (range, mut role) in analysis.argument_summaries(document.snapshot())
+      {
+        let resolution = argument_resolution(Some(analysis), &role);
+        role.location.snapshot = self.snapshot();
+        for location in &mut role.spelling {
+          location.snapshot = self.snapshot();
+        }
+        roles
+          .entry(range)
+          .and_modify(|(old, previous)| {
+            old.join(&role);
+            match (previous.as_mut(), &resolution) {
+              (Some(left), Some(right)) => left.join(right),
+              _ => *previous = None,
+            }
+          })
+          .or_insert((role, resolution));
+      }
     }
-    for role in arguments.into_values() {
+    for role in self.argument_roles() {
+      roles
+        .entry((role.location.bytes.start, role.location.bytes.end))
+        .or_insert_with(|| (role.clone(), None));
+    }
+    let mut spans = Vec::new();
+    for (role, resolution) in roles.into_values() {
       let Some(kind) = role.kind else {
         continue;
       };
@@ -160,11 +193,6 @@ impl Document {
           SemanticKind::Variable
         }
         ArgumentKind::Command { .. } => {
-          let resolution = analysis.and_then(|analysis| {
-            analysis
-              .summarize(UseSite::argument(&role.location))
-              .resolution
-          });
           command_kind(resolution.as_ref(), &mut modifiers)
         }
       };
@@ -211,6 +239,26 @@ impl Document {
       _ => return None,
     })
   }
+}
+
+fn resolved(
+  inputs: &[(&Document, &Analysis)],
+  index: usize,
+) -> Option<Resolution> {
+  inputs
+    .iter()
+    .filter_map(|(document, analysis)| {
+      analysis
+        .summarize(UseSite::Syntax(OccurrenceId {
+          snapshot: document.snapshot(),
+          index,
+        }))
+        .resolution
+    })
+    .reduce(|mut left, right| {
+      left.join(&right);
+      left
+    })
 }
 
 fn command_kind(

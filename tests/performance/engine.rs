@@ -6,9 +6,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use shellsmith::interface::application::engine::{
-  AnalysisInputs, AnalysisRequest, DependencyState, Document, DocumentId,
-  Error, InitialEnvironment, InputQuery, InputResult, Revision, Snapshot,
-  SourceDocument, SourceInput, Value, ValueIssue, Workspace,
+  AnalysisInputs, AnalysisLimits, AnalysisRequest, DependencyState, Document,
+  DocumentId, Error, InitialEnvironment, InputQuery, InputResult, Revision,
+  Snapshot, SourceDocument, SourceInput, Value, ValueIssue, Workspace,
 };
 
 #[derive(Default)]
@@ -39,7 +39,9 @@ fn main() {
   if args.is_empty() {
     measure_documents();
   }
-  println!("case\tsize\tanalysis_ms\tcontexts\tuses\tcandidate_edges\tgaps");
+  println!(
+    "case\tsize\tparse_ms\tindex_ms\tanalysis_ms\tcontexts\tuses\tcandidate_edges\tgaps"
+  );
   if args.len() == 2 {
     let size = args[1].parse().expect("positive fixture size");
     assert!(size > 0, "fixture size must be positive");
@@ -52,6 +54,9 @@ fn main() {
       "branches",
       "loops",
       "calls",
+      "uncalled",
+      "uncalled_body",
+      "uncalled_branches",
       "documents",
       "values",
       "arithmetic",
@@ -64,6 +69,8 @@ fn main() {
       measure("loop_chain", size);
       measure("branch_sum", size);
       measure("branch_concat", size);
+      measure("branch_merges", size);
+      measure("branch_loop", size);
     }
   }
 }
@@ -141,6 +148,51 @@ fn snapshot(id: u64, revision: u64) -> Snapshot {
   }
 }
 
+fn branch_merges(size: usize, repeated: bool) -> String {
+  let mut source = String::new();
+  let mut expression = String::from("0");
+  for index in 0..size {
+    writeln!(source, "if condition; then a{index}=1; b{index}=1; else a{index}=2; b{index}=2; fi").unwrap();
+    write!(expression, "+a{index}-b{index}").unwrap();
+  }
+  source.push_str("read unknown\n");
+  if repeated {
+    source.push_str("while condition; do\nunrelated=1\n");
+  }
+  source.push_str(&": \"${unknown:-default}\"\n".repeat(size));
+  if repeated {
+    source.push_str("done\n");
+  }
+  writeln!(source, "x=$(({expression}))").unwrap();
+  source
+}
+
+fn uncalled_source(case: &str, size: usize) -> String {
+  let mut source = String::new();
+  if case != "uncalled" {
+    source.push_str("idle() {\n");
+  }
+  for index in 0..size {
+    match case {
+      "uncalled" => writeln!(
+        source,
+        "f{index}() {{ if :; then a() {{ :; }}; else a() {{ :; }}; fi; a; }}"
+      )
+      .unwrap(),
+      "uncalled_branches" => writeln!(
+        source,
+        "if unknown; then v{index}=one; else v{index}=two; fi"
+      )
+      .unwrap(),
+      _ => writeln!(source, "v{index}=one; unknown").unwrap(),
+    }
+  }
+  if case != "uncalled" {
+    source.push_str("}\n");
+  }
+  source
+}
+
 fn fixture(
   case: &str,
   size: usize,
@@ -150,6 +202,9 @@ fn fixture(
 ) -> String {
   let mut source = String::from("x=0\n");
   match case {
+    "branch_merges" | "branch_loop" => {
+      source.push_str(&branch_merges(size, case == "branch_loop"));
+    }
     "branch_sum" | "branch_concat" => {
       let mut expression = String::new();
       for index in 0..size {
@@ -205,6 +260,9 @@ fn fixture(
       source.push_str("f() { : \"$x\"; }\n");
       source.push_str(&"f\n".repeat(size));
     }
+    "uncalled" | "uncalled_body" | "uncalled_branches" => {
+      source.push_str(&uncalled_source(case, size));
+    }
     "values" => {
       writeln!(source, "x='{}'", "v".repeat(64 * 1024)).unwrap();
       source.push_str(&": \"$x\"\n".repeat(size));
@@ -242,9 +300,16 @@ fn measure(case: &str, size: usize) {
   let mut workspace = Workspace::default();
   let mut inputs = Inputs::default();
   let source = fixture(case, size, &mut workspace, &mut inputs, &cancelled);
+  let start = Instant::now();
   workspace
     .update(snapshot(1, 1), source.as_bytes(), &cancelled)
     .unwrap();
+  let parse = start.elapsed().as_secs_f64() * 1000.0;
+  let start = Instant::now();
+  workspace
+    .index_document(DocumentId(1), AnalysisLimits::default(), &cancelled)
+    .unwrap();
+  let index = start.elapsed().as_secs_f64() * 1000.0;
   let mut request = AnalysisRequest::new(snapshot(1, 1));
   request.initial = InitialEnvironment::empty();
   let start = Instant::now();
@@ -255,7 +320,7 @@ fn measure(case: &str, size: usize) {
     .map(|site| site.resolution.candidates.len())
     .sum();
   println!(
-    "{case}\t{size}\t{elapsed:.3}\t{}\t{}\t{edges}\t{}",
+    "{case}\t{size}\t{parse:.3}\t{index:.3}\t{elapsed:.3}\t{}\t{}\t{edges}\t{}",
     analysis.contexts().len(),
     analysis.uses().count(),
     analysis.gaps().len()

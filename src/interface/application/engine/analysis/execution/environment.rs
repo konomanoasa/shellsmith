@@ -157,8 +157,7 @@ impl Names {
     self.fallback.join(&other.fallback);
   }
 
-  /// Makes the bindings that `pattern`, or any name when it is absent, may
-  /// name unknown, except the explicit bindings of `kept` names.
+  /// No pattern means all names; explicit `kept` bindings survive.
   fn invalidate(
     &mut self,
     pattern: Option<Value>,
@@ -340,8 +339,7 @@ impl CommandFailure {
 }
 
 impl Environment {
-  /// Makes the state that `target` names unknown. Definite readonly variables
-  /// keep their bindings, and unchanged state keeps its branch choices.
+  /// Preserves definite readonly bindings and unchanged branch choices.
   pub(in crate::interface::application::engine::analysis) fn invalidate(
     &mut self,
     target: EffectTarget,
@@ -448,8 +446,7 @@ impl Environment {
     names.invalidate(pattern, kept, issue, value_issue);
   }
 
-  /// Makes `name` unknown and forgets its branch choices unless it is
-  /// definitely readonly, returning whether its value may change.
+  /// Definite readonly bindings survive; returns whether the value may change.
   fn taint_variable(
     &mut self,
     name: &[u8],
@@ -466,8 +463,7 @@ impl Environment {
     true
   }
 
-  /// Assigns `value` from `definition` to `name` unless it is definitely
-  /// readonly, keeping the previous binding while it may be readonly.
+  /// Retains the previous binding wherever the variable may be readonly.
   pub(in crate::interface::application::engine::analysis) fn assign(
     &mut self,
     name: &[u8],
@@ -501,8 +497,6 @@ impl Environment {
     }
   }
 
-  /// Records unknown changes to the writable variables that `pattern`, or
-  /// any name when it is absent, may name.
   fn variables_changed(&mut self, pattern: Option<&Value>) {
     for name in [b"OPTIND".as_slice(), b"PWD", b"OLDPWD"] {
       if pattern.is_none_or(|pattern| pattern.can_equal(name))
@@ -616,7 +610,18 @@ impl Environment {
   }
 
   pub fn join(&mut self, other: &Self) {
-    self.alternatives.clear();
+    let alternatives = Alternatives::joined(self, other);
+    self.join_values(other);
+    self.alternatives = alternatives;
+  }
+
+  /// Converges repeated execution without introducing a new path choice.
+  pub fn widen(&mut self, other: &Self) {
+    self.alternatives.retain_common(&other.alternatives);
+    self.join_values(other);
+  }
+
+  fn join_values(&mut self, other: &Self) {
     self.failure.join(other.failure);
     if self.option_cursor != other.option_cursor {
       self.option_cursor = None;
@@ -688,7 +693,6 @@ impl Environment {
     }
   }
 
-  /// The exit status that `$?` expands to.
   pub fn status(&self) -> Value {
     self.parameter(b"?").0
   }
@@ -753,12 +757,6 @@ impl Environment {
       }
       None => AttributeState::Unknown,
     }
-  }
-
-  pub fn join_branches(&mut self, other: &Self) {
-    let alternatives = Alternatives::joined(self, other);
-    self.join(other);
-    self.alternatives = alternatives;
   }
 
   pub fn uncertain_variable(&self, name: &[u8]) -> bool {
@@ -942,8 +940,6 @@ impl Flow {
     self.0.values_mut()
   }
 
-  /// Joins the environments of every transfer, as a boundary that every
-  /// transfer leaves sees them.
   pub fn merged(self) -> Option<Environment> {
     self.0.into_values().reduce(|mut left, right| {
       left.join(&right);
@@ -963,7 +959,7 @@ impl Flow {
     self
       .0
       .entry(transfer)
-      .and_modify(|old| old.join_branches(&environment))
+      .and_modify(|old| old.join(&environment))
       .or_insert(environment);
   }
 

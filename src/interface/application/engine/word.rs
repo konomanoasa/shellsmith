@@ -25,7 +25,7 @@ pub(in crate::interface::application::engine) fn literal(
   word
 }
 
-/// The value of a word without expansions, which fields never split.
+/// Does not expand or split fields.
 pub(in crate::interface::application::engine) fn literal_value(
   node: Node<'_>,
   source: &[u8],
@@ -52,7 +52,6 @@ pub(in crate::interface::application::engine) fn has_guaranteed_field(
   })
 }
 
-/// Whether a quoted expansion forms exactly one field.
 fn single_field_expansion(node: Node<'_>, source: &[u8]) -> bool {
   node.child_by_field_name("operator").is_none()
     && node
@@ -60,9 +59,8 @@ fn single_field_expansion(node: Node<'_>, source: &[u8]) -> bool {
       .is_none_or(|parameter| lexical(parameter, source) != b"@")
 }
 
-/// The field that `node` forms when its expansions are unknown, and whether
-/// its syntax makes this the only field for any expansion values, IFS and
-/// directory contents.
+/// The field with unknown expansions; the flag guarantees exactly one field
+/// regardless of expansion values, IFS or directory contents.
 pub(in crate::interface::application::engine) fn syntax_field(
   node: Node<'_>,
   source: &[u8],
@@ -242,8 +240,7 @@ impl Word {
     }
   }
 
-  /// Whether an unquoted backslash directly precedes quoted text, even an
-  /// empty one, which leaves its pattern meaning unspecified.
+  /// An unquoted backslash before even empty quotes has unspecified pattern meaning.
   pub fn backslash_before_quote(&self) -> bool {
     let mut backslash = false;
     for fragment in &self.fragments {
@@ -351,8 +348,7 @@ impl Word {
     }
   }
 
-  /// The single field that the word forms where fields are not split; the
-  /// fields of an unquoted `$*` keep their unquoted separator.
+  /// Unquoted `$*` separators stay unquoted even when field splitting is disabled.
   fn joined(&self) -> Field {
     let mut field = Field::default();
     let mut breaks = self.breaks.iter().peekable();
@@ -656,8 +652,7 @@ impl<'a, 's> Parts<'a, 's> {
     }
   }
 }
-/// Removes the tabs that begin each line of a `<<-` here-document body, where
-/// `start` tells whether `bytes` begins a line.
+/// `start` indicates whether this chunk begins a line of a `<<-` body.
 pub(in crate::interface::application::engine) fn strip_leading_tabs(
   bytes: &mut Vec<u8>,
   mut start: bool,
@@ -965,8 +960,7 @@ impl Pattern {
         }))
   }
 
-  /// Whether `text` can match only by a bracket expression matching its
-  /// leading period, which POSIX leaves unspecified.
+  /// POSIX leaves leading-dot matches by bracket expressions unspecified.
   pub(in crate::interface::application) fn ambiguous_dot(
     &self,
     text: &[char],

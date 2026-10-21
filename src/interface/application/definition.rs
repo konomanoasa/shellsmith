@@ -10,37 +10,53 @@ impl Application {
     offset: usize,
     cancelled: &AtomicBool,
   ) -> Result<Vec<Location>, Error> {
-    self.analyze_document(id, cancelled)?;
-    let snapshot = self
+    let path = self
+      .path(id)
+      .ok_or(super::engine::Error::UnknownDocument(id))?
+      .to_path_buf();
+    let previous = self
+      .workspace
+      .shared_document(id)
+      .ok_or(super::engine::Error::UnknownDocument(id))?;
+    let analyses = self.prepare_analysis(&path, cancelled)?;
+    let document = self
       .workspace
       .document(id)
-      .ok_or(super::engine::Error::UnknownDocument(id))?
-      .snapshot();
-    let resolution = self.workspace.resolution_at(snapshot, offset)?;
-    check_cancelled(cancelled)?;
-    let Some(resolution) = resolution else {
-      return Ok(Vec::new());
-    };
-    if !resolution.issues.is_empty() || !resolution.alternatives.is_empty() {
-      return Ok(Vec::new());
+      .ok_or(super::engine::Error::UnknownDocument(id))?;
+    if document.snapshot() != previous.snapshot()
+      && document.source() != previous.source()
+    {
+      return Err(Error::Superseded);
     }
+    let snapshot = document.snapshot();
+    let resolution =
+      super::engine::AnalysisResults::new(analyses.entries.values())
+        .resolution_at(snapshot, offset)?;
+    check_cancelled(cancelled)?;
     let mut locations = BTreeMap::new();
-    for candidate in resolution.candidates {
-      check_cancelled(cancelled)?;
-      let Some(location) = self
-        .workspace
-        .symbol(candidate)
-        .and_then(|symbol| self.workspace.definition_location(symbol))
-      else {
-        return Ok(Vec::new());
-      };
-      let Some(path) = self.path(location.snapshot.document) else {
-        return Ok(Vec::new());
-      };
-      locations.insert(
-        (path.to_path_buf(), location.bytes.start, location.bytes.end),
-        location,
-      );
+    if let Some(resolution) = resolution.filter(|result| {
+      result.compatible
+        && result.issues.is_empty()
+        && result.alternatives.is_empty()
+    }) {
+      for location in resolution.definitions {
+        check_cancelled(cancelled)?;
+        let Some(location) = location else {
+          locations.clear();
+          break;
+        };
+        let Some(path) = self.path(location.snapshot.document) else {
+          locations.clear();
+          break;
+        };
+        locations.insert(
+          (path.to_path_buf(), location.bytes.start, location.bytes.end),
+          location,
+        );
+      }
+    }
+    if !self.analysis_inputs_current(&analyses, cancelled)? {
+      return Err(Error::Superseded);
     }
     Ok(locations.into_values().collect())
   }

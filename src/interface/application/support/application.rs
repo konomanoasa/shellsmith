@@ -1,17 +1,15 @@
-use super::{collection::Collection, files, names::NameCollection};
-use crate::interface::application::engine;
-use engine::{
-  AnalysisInputs, AnalysisRequest, Document, InputQuery, InputResult, Snapshot,
-  SourceDocument, SourceInput, check_cancelled,
+use super::{
+  analysis::AnalysisCollection, discovery::Discovery, files,
+  inputs::InputCache, names::NameCollection,
 };
+use crate::interface::application::engine;
+use engine::{Snapshot, check_cancelled};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use engine::{
-  AnalysisLimits, DocumentId, InitialBinding, InitialEnvironment, Workspace,
-};
+use engine::{AnalysisLimits, DocumentId, InitialEnvironment, Workspace};
 
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -95,26 +93,20 @@ impl From<std::io::Error> for Error {
   }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct InputCache {
-  pub(super) loaded: BTreeMap<PathBuf, Result<Arc<Document>, String>>,
-  pub(super) paths: BTreeMap<SourceInput, Result<PathBuf, String>>,
-  pub(super) evaluated: BTreeMap<engine::InputQuery, engine::InputResult>,
-  pub(super) frozen: bool,
-}
-
 #[derive(Clone, Debug)]
 pub struct Application {
   pub(super) settings: Settings,
   pub(in crate::interface::application) workspace: Workspace,
-  entries: BTreeMap<PathBuf, Snapshot>,
+  pub(super) entries: BTreeMap<PathBuf, Snapshot>,
   pub(super) opened: BTreeMap<PathBuf, Arc<str>>,
   inputs: BTreeSet<PathBuf>,
   pub(super) failures: Vec<Failure>,
-  documents: Arc<files::Documents>,
-  pub(super) collection: Arc<Collection>,
+  pub(super) documents: Arc<files::Documents>,
+  pub(super) discovery: Arc<Discovery>,
   pub(super) cache: InputCache,
   pub(super) names: Option<Arc<NameCollection>>,
+  pub(in crate::interface::application) analyses:
+    Option<Arc<AnalysisCollection>>,
 }
 
 impl Application {
@@ -127,9 +119,10 @@ impl Application {
       inputs: BTreeSet::new(),
       failures: Vec::new(),
       documents: Arc::default(),
-      collection: Arc::default(),
+      discovery: Arc::default(),
       cache: InputCache::default(),
       names: None,
+      analyses: None,
     })
   }
 
@@ -149,6 +142,7 @@ impl Application {
   fn invalidate_inputs(&mut self) {
     self.cache = InputCache::default();
     self.names = None;
+    self.analyses = None;
     self.workspace.clear_analysis();
   }
 
@@ -173,13 +167,12 @@ impl Application {
     files::absolute(&self.settings.cwd, path)
   }
 
-  /// The identity of a document whose path names a regular file or nothing.
+  /// Accepts regular files and missing paths; rejects other file types.
   pub(super) fn document_path(&self, path: &Path) -> Result<PathBuf, Error> {
     files::ordinary(&self.settings.cwd.join(path), true)?;
     Ok(self.absolute(path))
   }
 
-  /// Records or discards the unsaved text of the document `path`.
   pub(super) fn set_overlay(
     &mut self,
     path: PathBuf,
@@ -190,23 +183,16 @@ impl Application {
       self.opened.insert(path, source);
     } else {
       self.opened.remove(&path);
-      self.collection.changed(std::slice::from_ref(&path));
+      self.discovery.changed(std::slice::from_ref(&path));
     }
   }
 
-  pub(super) fn resolve_source(
-    &self,
-    input: &SourceInput,
-  ) -> Result<PathBuf, String> {
-    files::resolve(input, &self.opened, &self.entries)
-  }
-
-  /// Inputs keep the given path and follow its symbolic links at each
-  /// collection. Returns whether the inputs changed.
+  /// Retains the given path; symlinks are resolved anew at each collection.
   pub fn add_input(&mut self, path: &Path) -> bool {
     let added = self.inputs.insert(self.settings.cwd.join(path));
     if added {
       self.names = None;
+      self.analyses = None;
     }
     added
   }
@@ -215,7 +201,8 @@ impl Application {
     let removed = self.inputs.remove(&self.settings.cwd.join(path));
     if removed {
       self.names = None;
-      self.collection.remove(&self.absolute(path));
+      self.analyses = None;
+      self.discovery.remove(&self.absolute(path));
     }
     removed
   }
@@ -225,7 +212,7 @@ impl Application {
       .iter()
       .map(|path| self.settings.cwd.join(path))
       .collect();
-    self.collection.changed(&paths);
+    self.discovery.changed(&paths);
     self.invalidate_inputs();
   }
 
@@ -314,14 +301,14 @@ impl Application {
     result
   }
 
-  /// Makes `bytes` the text that analyses load for `path`, without adding it
-  /// to the workspace.
+  /// Overrides analysis input without adding a workspace document.
   pub(super) fn stage(
     &mut self,
     path: &Path,
     bytes: &[u8],
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
+    self.analyses = None;
     let document =
       self
         .documents
@@ -336,54 +323,34 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     let bytes = files::read(path, &self.opened);
-    match bytes {
-      Ok(bytes) => self.replace(path, &bytes, cancelled),
+    let result = match &bytes {
+      Ok(bytes) => self.replace(path, bytes, cancelled),
       Err(error) => {
         self.discard(path);
-        Err(error)
+        Err(error.clone())
       }
+    };
+    if result.is_err() {
+      self.cache.failed_inputs.insert(
+        path.to_path_buf(),
+        bytes.map(Arc::from).map_err(|error| error.to_string()),
+      );
     }
+    result
   }
 
   /// Individual file errors go to `failures`; they do not fail the whole refresh.
   pub fn refresh(&mut self, cancelled: &AtomicBool) -> Result<(), Error> {
-    self.collection.invalidate();
-    let selected = self.refresh_for(None, cancelled)?;
-    self.analyze_entries(&selected, cancelled)
-  }
-
-  /// Analyzes the loaded `entries` and keeps the source targets that all of
-  /// them agree on.
-  fn analyze_entries(
-    &mut self,
-    entries: &BTreeSet<PathBuf>,
-    cancelled: &AtomicBool,
-  ) -> Result<(), Error> {
-    let mut states: BTreeMap<_, engine::DependencyState> = BTreeMap::new();
-    for path in entries {
-      let Some(id) = self.document_id(path) else {
-        continue;
-      };
-      self.analyze_document(id, cancelled)?;
-      let result = self.workspace.analysis().expect("completed analysis");
-      let references: BTreeSet<_> =
-        result.source_inputs().map(|(id, _, _)| id).collect();
-      for reference in references {
-        if let Some(state) = result.source_bindings().get(&reference) {
-          states
-            .entry(reference)
-            .and_modify(|old| {
-              if old != state {
-                *old = engine::DependencyState::Unresolved(
-                  "Source target differs between entries".into(),
-                );
-              }
-            })
-            .or_insert_with(|| state.clone());
-        }
-      }
+    self.discovery.invalidate();
+    self.refresh_for(None, cancelled)?;
+    let analyses = self.prepare_workspace_analysis(cancelled)?;
+    if let Some(workspace) = analyses.entries.values().next_back() {
+      self.workspace = workspace.clone();
     }
-    for (reference, state) in states {
+    self.restore_analysis_documents(cancelled)?;
+    for (reference, state) in
+      engine::AnalysisResults::new(analyses.entries.values()).dependencies()
+    {
       if self.workspace.reference_state(reference) != Some(&state) {
         self.workspace.set_reference(reference, state)?;
       }
@@ -391,8 +358,6 @@ impl Application {
     Ok(check_cancelled(cancelled)?)
   }
 
-  /// Reloads the inputs of `document`, or of the workspace when it is absent,
-  /// returning the selected entries.
   pub(super) fn refresh_for(
     &mut self,
     document: Option<&Path>,
@@ -401,6 +366,7 @@ impl Application {
     check_cancelled(cancelled)?;
     self.failures.clear();
     self.names = None;
+    self.analyses = None;
     self.cache = InputCache::default();
     let selected = if let Some(path) = document {
       BTreeSet::from([self.absolute(path)])
@@ -437,14 +403,14 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<(BTreeSet<PathBuf>, Vec<Failure>), Error> {
     selected.extend(self.opened.keys().cloned());
-    let inputs = self.collection_inputs();
+    let inputs = self.discovery_inputs();
     let (collected, failures) =
-      self.collection.collect(&inputs, false, cancelled)?;
+      self.discovery.collect(&inputs, false, cancelled)?;
     selected.extend(collected);
     Ok((selected, failures))
   }
 
-  fn collection_inputs(&self) -> BTreeSet<PathBuf> {
+  fn discovery_inputs(&self) -> BTreeSet<PathBuf> {
     self
       .inputs
       .iter()
@@ -453,18 +419,17 @@ impl Application {
       .collect()
   }
 
-  pub(in crate::interface::application) fn verify_collection(
+  pub(in crate::interface::application) fn verify_discovery(
     &self,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     self
-      .collection
-      .collect(&self.collection_inputs(), true, cancelled)?;
+      .discovery
+      .collect(&self.discovery_inputs(), true, cancelled)?;
     Ok(())
   }
 
-  /// Lets analyses load the workspace documents without reading them again.
-  fn share_workspace_documents(&mut self) {
+  pub(super) fn share_workspace_documents(&mut self) {
     for document in self.workspace.shared_documents() {
       if let Some(path) = self.path(document.snapshot().document) {
         self
@@ -486,153 +451,5 @@ impl Application {
     for path in removed {
       self.discard(&path);
     }
-  }
-
-  fn initial_environment(
-    &self,
-    id: DocumentId,
-  ) -> Result<engine::InitialEnvironment, Error> {
-    let cwd = self
-      .path(id)
-      .and_then(Path::parent)
-      .ok_or(engine::Error::UnknownDocument(id))?;
-    let mut initial = self.settings.initial.clone();
-    initial.cwd = Some(cwd.as_os_str().as_encoded_bytes().to_vec());
-    initial
-      .values
-      .entry(b"PWD".to_vec())
-      .or_insert_with(|| cwd.as_os_str().as_encoded_bytes().to_vec());
-    for (name, binding) in [
-      (b"LINENO".as_slice(), InitialBinding::External),
-      (b"PPID", InitialBinding::External),
-      (b"PS1", InitialBinding::Unknown),
-      (b"PS2", InitialBinding::Unknown),
-      (b"PS4", InitialBinding::Unknown),
-    ] {
-      if !initial.environment.contains_key(name)
-        && !initial.values.contains_key(name)
-      {
-        initial.variables.entry(name.to_vec()).or_insert(binding);
-      }
-    }
-    Ok(initial)
-  }
-}
-
-struct Inputs<'a> {
-  opened: &'a BTreeMap<PathBuf, Arc<str>>,
-  documents: &'a files::Documents,
-  entries: &'a mut BTreeMap<PathBuf, Snapshot>,
-  failures: &'a mut Vec<Failure>,
-  cache: &'a mut InputCache,
-  cancelled: &'a AtomicBool,
-}
-
-fn engine_error(error: Error) -> engine::Error {
-  match error {
-    Error::Engine(error) => error,
-    other => engine::Error::Input(other.to_string()),
-  }
-}
-
-impl AnalysisInputs for Inputs<'_> {
-  fn source(
-    &mut self,
-    input: &SourceInput,
-  ) -> Result<SourceDocument, engine::Error> {
-    check_cancelled(self.cancelled)?;
-    if self.cache.frozen && !self.cache.paths.contains_key(input) {
-      return Ok(SourceDocument::Failed(
-        "Source lookup differs from the captured inputs".into(),
-      ));
-    }
-    let path = match self
-      .cache
-      .paths
-      .entry(input.clone())
-      .or_insert_with(|| files::resolve(input, self.opened, self.entries))
-    {
-      Ok(path) => path.clone(),
-      Err(message) => return Ok(SourceDocument::Unresolved(message.clone())),
-    };
-    if !self.cache.loaded.contains_key(&path) {
-      if self.cache.frozen {
-        return Ok(SourceDocument::Failed(
-          "Source was not part of the captured inputs".into(),
-        ));
-      }
-      let loaded = files::read(&path, self.opened).and_then(|bytes| {
-        self
-          .documents
-          .parse_entry(self.entries, &path, &bytes, self.cancelled)
-      });
-      check_cancelled(self.cancelled)?;
-      if let Err(error) = &loaded {
-        self.failures.push(Failure {
-          path: path.clone(),
-          message: error.to_string(),
-        });
-      }
-      self
-        .cache
-        .loaded
-        .insert(path.clone(), loaded.map_err(|error| error.to_string()));
-    }
-    Ok(match &self.cache.loaded[&path] {
-      Ok(document) => SourceDocument::Resolved(document.clone()),
-      Err(message) => SourceDocument::Failed(message.clone()),
-    })
-  }
-
-  fn evaluate(
-    &mut self,
-    query: &InputQuery,
-  ) -> Result<InputResult, engine::Error> {
-    if let Some(value) = self.cache.evaluated.get(query) {
-      return Ok(value.clone());
-    }
-    if self.cache.frozen {
-      return Ok(InputResult::Unknown(engine::ValueIssue::Dynamic));
-    }
-    let value = files::evaluate(query, self.cancelled).map_err(engine_error)?;
-    self.cache.evaluated.insert(query.clone(), value.clone());
-    Ok(value)
-  }
-}
-
-impl Application {
-  pub(in crate::interface::application) fn analyze_document(
-    &mut self,
-    id: DocumentId,
-    cancelled: &AtomicBool,
-  ) -> Result<(), Error> {
-    check_cancelled(cancelled)?;
-    let snapshot = self
-      .workspace
-      .document(id)
-      .ok_or(engine::Error::UnknownDocument(id))?
-      .snapshot();
-    let initial = self.initial_environment(id)?;
-    if self.workspace.analysis().is_some_and(|result| {
-      result.request().entry == snapshot && result.request().initial == initial
-    }) {
-      return Ok(());
-    }
-    self.share_workspace_documents();
-    let mut request = AnalysisRequest::new(snapshot);
-    request.initial = initial;
-    request.limits = self.settings.limits;
-    let mut inputs = Inputs {
-      opened: &self.opened,
-      documents: &self.documents,
-      entries: &mut self.entries,
-      failures: &mut self.failures,
-      cache: &mut self.cache,
-      cancelled,
-    };
-    let result = self.workspace.analyze(request, &mut inputs, cancelled)?;
-    self.workspace.publish_analysis(result)?;
-    self.failures.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(())
   }
 }

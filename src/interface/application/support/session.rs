@@ -12,9 +12,11 @@ use crate::interface::application::engine::check_cancelled;
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RequestScope {
   Analysis(PathBuf),
+  Results(PathBuf),
   Document(PathBuf),
   Names(PathBuf),
   Workspace,
+  WorkspaceAnalysis,
 }
 
 struct State {
@@ -23,11 +25,41 @@ struct State {
   jobs: Vec<Weak<AtomicBool>>,
   preparations: BTreeMap<RequestScope, Arc<Preparation>>,
   background: Option<tokio::task::AbortHandle>,
+  updates: tokio::sync::watch::Sender<()>,
 }
 
 impl State {
+  fn accept<T>(
+    &mut self,
+    request: &Request,
+    result: Result<T, Error>,
+  ) -> Result<T, Error> {
+    if !Arc::ptr_eq(&request.generation, &self.generation) {
+      return Err(Error::Superseded);
+    }
+    check_cancelled(&request.cancellation.0)?;
+    if matches!(result, Err(Error::Superseded)) {
+      self.invalidate();
+    }
+    result
+  }
+
+  fn publish(&mut self, application: &Application) {
+    if let Some(analyses) = &application.analyses
+      && self
+        .application
+        .analyses
+        .as_ref()
+        .is_none_or(|previous| !Arc::ptr_eq(previous, analyses))
+    {
+      self.application.analyses = Some(analyses.clone());
+      self.updates.send_replace(());
+    }
+  }
+
   fn invalidate(&mut self) {
     self.generation = Arc::default();
+    self.application.analyses = None;
     if let Some(task) = self.background.take() {
       task.abort();
     }
@@ -44,6 +76,13 @@ pub struct Session {
   state: Arc<Mutex<State>>,
   workers: Arc<tokio::sync::Semaphore>,
   index_worker: Arc<tokio::sync::Semaphore>,
+  analysis_worker: Arc<tokio::sync::Semaphore>,
+}
+
+struct Request {
+  subscription: Subscription,
+  generation: Arc<()>,
+  cancellation: Cancellation,
 }
 
 struct Preparation {
@@ -51,18 +90,38 @@ struct Preparation {
   cancelled: Arc<AtomicBool>,
   subscribers: AtomicUsize,
   retain_completed: bool,
+  prerequisite: Option<Arc<Subscription>>,
 }
 
-struct Subscription(Arc<Preparation>);
+struct Subscription {
+  job: Arc<Preparation>,
+  active: AtomicBool,
+}
+
+impl Subscription {
+  fn new(job: Arc<Preparation>) -> Self {
+    Self {
+      job,
+      active: AtomicBool::new(true),
+    }
+  }
+
+  fn release(&self) {
+    if self.active.swap(false, Ordering::AcqRel)
+      && self.job.subscribers.fetch_sub(1, Ordering::AcqRel) == 1
+      && !self.job.retains_result()
+    {
+      self.job.cancelled.store(true, Ordering::Release);
+      if let Some(prerequisite) = &self.job.prerequisite {
+        prerequisite.release();
+      }
+    }
+  }
+}
 
 impl Drop for Subscription {
   fn drop(&mut self) {
-    if self.0.subscribers.fetch_sub(1, Ordering::AcqRel) == 1
-      && !(self.0.retain_completed
-        && self.0.result.peek().is_some_and(Result::is_ok))
-    {
-      self.0.cancelled.store(true, Ordering::Release);
-    }
+    self.release();
   }
 }
 
@@ -96,12 +155,14 @@ impl Session {
         jobs: Vec::new(),
         preparations: BTreeMap::new(),
         background: None,
+        updates: tokio::sync::watch::channel(()).0,
       })),
       workers: Arc::new(tokio::sync::Semaphore::new(
         std::thread::available_parallelism()
           .map_or(1, |count| count.get().saturating_sub(1).max(1)),
       )),
       index_worker: Arc::new(tokio::sync::Semaphore::new(1)),
+      analysis_worker: Arc::new(tokio::sync::Semaphore::new(1)),
     })
   }
 
@@ -139,14 +200,14 @@ impl Session {
 
   pub fn invalidate(&self) -> Result<(), Error> {
     let mut state = lock(&self.state)?;
-    state.application.collection.invalidate();
+    state.application.discovery.invalidate();
     state.invalidate();
     Ok(())
   }
 
   pub fn set_watching(&self, enabled: bool) -> Result<(), Error> {
     let mut state = lock(&self.state)?;
-    state.application.collection.watching(enabled);
+    state.application.discovery.watching(enabled);
     state.invalidate();
     Ok(())
   }
@@ -158,29 +219,42 @@ impl Session {
     Ok(())
   }
 
-  /// Indexing errors are returned by workspace requests.
+  pub fn updates(&self) -> Result<tokio::sync::watch::Receiver<()>, Error> {
+    Ok(lock(&self.state)?.updates.subscribe())
+  }
+
+  /// Indexes syntax, then analyzes each entry.
   pub fn start_index(&self) -> Result<(), Error> {
+    let mut state = lock(&self.state)?;
+    if state
+      .background
+      .as_ref()
+      .is_some_and(|task| !task.is_finished())
     {
-      let state = lock(&self.state)?;
-      if state
-        .background
-        .as_ref()
-        .is_some_and(|task| !task.is_finished())
-        || state
-          .preparations
-          .get(&RequestScope::Workspace)
-          .is_some_and(|job| job.result.peek().is_some_and(Result::is_ok))
-      {
-        return Ok(());
-      }
+      return Ok(());
     }
-    let (subscription, _, guard) = self.subscribe(RequestScope::Workspace)?;
+    if let Some(application) = state
+      .preparations
+      .get(&RequestScope::WorkspaceAnalysis)
+      .and_then(|job| job.result.peek())
+      .and_then(|result| result.as_ref().ok())
+      .cloned()
+    {
+      state.publish(&application);
+      return Ok(());
+    }
+    let request =
+      self.subscribe_current(&mut state, RequestScope::WorkspaceAnalysis);
+    let shared = self.state.clone();
     let task = tokio::spawn(async move {
-      let _ = subscription.0.result.clone().await;
-      drop(subscription);
-      drop(guard);
+      let result = request.subscription.job.result.clone().await;
+      if let Ok(mut state) = lock(&shared)
+        && let Ok(application) = state.accept(&request, result)
+      {
+        state.publish(&application);
+      }
     });
-    lock(&self.state)?.background = Some(task.abort_handle());
+    state.background = Some(task.abort_handle());
     Ok(())
   }
 
@@ -197,19 +271,25 @@ impl Session {
     let prepared = self.subscribe(scope);
     let state = self.state.clone();
     async move {
-      let (subscription, generation, guard) = prepared?;
-      let result = subscription.0.result.clone().await;
-      validate(&state, &generation, &guard.0)?;
-      let application = result?;
+      let request = prepared?;
+      let result = request.subscription.job.result.clone().await;
+      let (application, analyses) = {
+        let mut state = lock(&state)?;
+        let application = state.accept(&request, result)?;
+        state.publish(&application);
+        (application, state.application.analyses.clone())
+      };
+      let failed_inputs = !application.failures().is_empty();
       let permit = workers
         .acquire_owned()
         .await
         .map_err(|error| Error::Message(error.to_string()))?;
-      let flag = guard.0.clone();
+      let flag = request.cancellation.0.clone();
       let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         check_cancelled(&flag)?;
         let mut application = application.as_ref().clone();
+        application.analyses = analyses.or(application.analyses);
         let output = operation(&mut application, &flag)?;
         check_cancelled(&flag)?;
         Ok::<_, Error>(output)
@@ -217,88 +297,119 @@ impl Session {
       .await
       .map_err(|error| worker_error(&error))?;
       let mut state = lock(&state)?;
-      current(&state, &generation, &guard.0)?;
-      if matches!(result, Err(Error::Superseded)) {
-        state.invalidate();
+      let result = state.accept(&request, result);
+      if result.is_err() && failed_inputs {
+        state
+          .preparations
+          .retain(|_, job| !Arc::ptr_eq(job, &request.subscription.job));
       }
-      let output = result?;
-      drop(subscription);
-      Ok(output)
+      result
     }
   }
 
   fn workers_for(&self, scope: &RequestScope) -> Arc<tokio::sync::Semaphore> {
-    if matches!(scope, RequestScope::Workspace | RequestScope::Names(_)) {
-      self.index_worker.clone()
-    } else {
-      self.workers.clone()
+    match scope {
+      RequestScope::WorkspaceAnalysis => &self.analysis_worker,
+      RequestScope::Workspace | RequestScope::Names(_) => &self.index_worker,
+      _ => &self.workers,
     }
+    .clone()
   }
 
-  fn subscribe(
-    &self,
-    scope: RequestScope,
-  ) -> Result<(Subscription, Arc<()>, Cancellation), Error> {
+  fn subscribe(&self, mut scope: RequestScope) -> Result<Request, Error> {
     let mut state = lock(&self.state)?;
-    let scope = match scope {
-      RequestScope::Analysis(path) => {
-        RequestScope::Analysis(state.application.document_path(&path)?)
+    match &mut scope {
+      RequestScope::Analysis(path)
+      | RequestScope::Results(path)
+      | RequestScope::Document(path)
+      | RequestScope::Names(path) => {
+        *path = state.application.document_path(path)?;
       }
-      RequestScope::Document(path) => {
-        RequestScope::Document(state.application.document_path(&path)?)
-      }
-      RequestScope::Names(path) => {
-        RequestScope::Names(state.application.document_path(&path)?)
-      }
-      RequestScope::Workspace => RequestScope::Workspace,
-    };
+      RequestScope::Workspace | RequestScope::WorkspaceAnalysis => {}
+    }
+    Ok(self.subscribe_current(&mut state, scope))
+  }
+
+  fn subscribe_current(
+    &self,
+    state: &mut State,
+    scope: RequestScope,
+  ) -> Request {
     state
       .preparations
       .retain(|_, job| !job.cancelled.load(Ordering::Acquire));
-    let job = if let Some(job) = state.preparations.get(&scope)
-      && job
-        .subscribers
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-          (count != 0
-            || (job.retain_completed
-              && job.result.peek().is_some_and(Result::is_ok)))
-          .then(|| count.checked_add(1))
-          .flatten()
-        })
-        .is_ok()
-    {
-      job.clone()
-    } else {
-      let job = Arc::new(Preparation::new(
-        state.application.clone(),
-        scope.clone(),
-        self.workers_for(&scope),
-      ));
-      state.preparations.insert(scope, job.clone());
-      job
-    };
+    let subscription = self.prepare(state, scope);
     let flag = Arc::new(AtomicBool::new(false));
     state.jobs.retain(|job| job.strong_count() != 0);
     state.jobs.push(Arc::downgrade(&flag));
-    Ok((
-      Subscription(job),
-      state.generation.clone(),
-      Cancellation(flag),
-    ))
+    Request {
+      subscription,
+      generation: state.generation.clone(),
+      cancellation: Cancellation(flag),
+    }
+  }
+
+  fn prepare(&self, state: &mut State, scope: RequestScope) -> Subscription {
+    if let Some(job) = state.preparations.get(&scope)
+      && job
+        .subscribers
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+          (count != 0 || job.retains_result())
+            .then(|| count.checked_add(1))
+            .flatten()
+        })
+        .is_ok()
+    {
+      return Subscription::new(job.clone());
+    }
+    let prerequisite = match &scope {
+      RequestScope::WorkspaceAnalysis => {
+        Some(self.prepare(state, RequestScope::Workspace))
+      }
+      RequestScope::Names(_) | RequestScope::Results(_) => {
+        Some(self.prepare(state, RequestScope::WorkspaceAnalysis))
+      }
+      _ => None,
+    };
+    let job = Arc::new(Preparation::new(
+      state.application.clone(),
+      scope.clone(),
+      self.workers_for(&scope),
+      prerequisite,
+    ));
+    state.preparations.insert(scope, job.clone());
+    Subscription::new(job)
   }
 }
 
 impl Preparation {
+  fn retains_result(&self) -> bool {
+    self.retain_completed && self.result.peek().is_some_and(Result::is_ok)
+  }
+
   fn new(
     mut application: Application,
     scope: RequestScope,
     workers: Arc<tokio::sync::Semaphore>,
+    prerequisite: Option<Subscription>,
   ) -> Self {
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = cancelled.clone();
-    let retain_completed =
-      matches!(scope, RequestScope::Workspace | RequestScope::Names(_));
+    let retain_completed = matches!(
+      scope,
+      RequestScope::Workspace
+        | RequestScope::WorkspaceAnalysis
+        | RequestScope::Names(_)
+        | RequestScope::Results(_)
+    );
+    let prerequisite = prerequisite.map(Arc::new);
+    let dependency = prerequisite.clone();
     let result = async move {
+      if let Some(prerequisite) = dependency {
+        let result = prerequisite.job.result.clone().await;
+        prerequisite.release();
+        application = result?.as_ref().clone();
+      }
       let permit = workers
         .acquire_owned()
         .await
@@ -314,6 +425,9 @@ impl Preparation {
             })?;
             application.analyze_document(id, &flag)?;
           }
+          RequestScope::Results(path) => {
+            application.prepare_analysis(path, &flag)?;
+          }
           RequestScope::Document(path) => {
             application.refresh_for(Some(path), &flag)?;
           }
@@ -322,6 +436,9 @@ impl Preparation {
           }
           RequestScope::Workspace => {
             application.refresh_for(None, &flag)?;
+          }
+          RequestScope::WorkspaceAnalysis => {
+            application.prepare_workspace_analysis(&flag)?;
           }
         }
         check_cancelled(&flag)?;
@@ -337,32 +454,13 @@ impl Preparation {
       cancelled,
       subscribers: AtomicUsize::new(1),
       retain_completed,
+      prerequisite,
     }
   }
 }
 
 fn worker_error(error: &tokio::task::JoinError) -> Error {
   Error::Message(format!("Analysis worker failed: {error}"))
-}
-
-fn current(
-  state: &State,
-  generation: &Arc<()>,
-  flag: &AtomicBool,
-) -> Result<(), Error> {
-  if !Arc::ptr_eq(generation, &state.generation) {
-    return Err(Error::Superseded);
-  }
-  Ok(check_cancelled(flag)?)
-}
-
-fn validate(
-  state: &Mutex<State>,
-  generation: &Arc<()>,
-  flag: &AtomicBool,
-) -> Result<(), Error> {
-  let state = lock(state)?;
-  current(&state, generation, flag)
 }
 
 impl Drop for Session {

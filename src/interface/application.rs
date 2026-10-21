@@ -2,6 +2,7 @@ mod definition;
 mod document_links;
 mod document_symbol;
 pub mod engine;
+mod references;
 mod rename;
 mod semantic_tokens;
 mod support;

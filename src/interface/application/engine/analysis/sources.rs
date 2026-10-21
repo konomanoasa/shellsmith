@@ -3,7 +3,7 @@ use super::execution::Environment;
 use super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
   self, DependencyState, Error, ExecutionContextId, ExecutionKind, ReferenceId,
-  ResolutionIssue, Snapshot, Value, ValueIssue, check_cancelled,
+  ResolutionIssue, Snapshot, Value, ValueIssue,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -109,6 +109,12 @@ impl<'a> Resolver<'a> {
   }
 
   pub(super) fn finish_sources(&mut self) {
+    self.result.non_sources = self
+      .sources
+      .non_sources
+      .iter()
+      .map(|(reference, _)| *reference)
+      .collect();
     let used: BTreeSet<_> = self
       .result
       .source_inputs
@@ -319,8 +325,7 @@ impl<'a> Resolver<'a> {
       });
   }
 
-  /// Replaces a leading `~` or `~/` with the initial HOME, which must be an
-  /// absolute path.
+  /// Uses the initial HOME; relative paths are rejected.
   fn annotation_path(&self, path: &[u8]) -> Option<Vec<u8>> {
     let Some(rest) = path
       .strip_prefix(b"~")
@@ -367,45 +372,6 @@ fn source_input(
   .normalized()
 }
 
-/// The source references of `document` whose search inputs are invariant.
-fn deferred_sources(
-  document: &engine::Document,
-) -> impl Iterator<Item = (&engine::SourceReference, SourceInput)> {
-  document
-    .references()
-    .iter()
-    .filter(|reference| {
-      matches!(reference.value, Value::Literal(_))
-        || reference.annotation.is_some()
-    })
-    .filter_map(|reference| {
-      let node = document.command_at(&reference.command)?;
-      let input = deferred_source_input(node, document.source().as_bytes())?;
-      Some((reference, input))
-    })
-}
-
-fn deferred_source_input(node: Node<'_>, source: &[u8]) -> Option<SourceInput> {
-  let command = engine::workspace::parser::command_word(node)?;
-  if node.has_error()
-    || engine::word::literal_value(command, source)
-      != Value::Literal(b".".to_vec())
-  {
-    return None;
-  }
-  let args = super::command::syntax_arguments(node, source);
-  source_operand(&args)?;
-  Some(
-    SourceInput {
-      operand: source_value(&args),
-      annotation: None,
-      cwd: Some(Value::Unknown(ValueIssue::Dynamic)),
-      search_path: Some(Value::Unknown(ValueIssue::Dynamic)),
-    }
-    .normalized(),
-  )
-}
-
 fn source_value(args: &[super::expansion::Argument<'_>]) -> Value {
   let first = operand_index(args);
   match args.get(first) {
@@ -433,84 +399,6 @@ fn source_operand<'a, 'b>(
 }
 
 impl Resolver<'_> {
-  pub(super) fn collect_deferred_sources(&mut self) -> Result<(), Error> {
-    let mut pending: BTreeSet<_> = self
-      .result
-      .contexts
-      .iter()
-      .map(|context| context.location.snapshot)
-      .chain(
-        self
-          .result
-          .derived
-          .bodies
-          .values()
-          .flat_map(|body| body.documents.keys().copied()),
-      )
-      .collect();
-    let mut visited = BTreeSet::new();
-    let mut excluded =
-      self.result.derived.incomplete_bodies(Some(&self.result));
-    let mut observed: BTreeSet<_> = self
-      .result
-      .source_inputs
-      .keys()
-      .map(|(id, _)| *id)
-      .chain(self.sources.non_sources.iter().map(|(id, _)| *id))
-      .collect();
-    while let Some(snapshot) = pending.pop_first() {
-      if !visited.insert(snapshot) || excluded.contains(&snapshot) {
-        continue;
-      }
-      check_cancelled(self.cancelled)?;
-      let document = self
-        .workspace
-        .workspace
-        .shared_document(snapshot.document)
-        .ok_or(Error::UnknownDocument(snapshot.document))?;
-      for (reference, mut input) in deferred_sources(&document) {
-        if !observed.insert(reference.id) {
-          continue;
-        }
-        check_cancelled(self.cancelled)?;
-        self.annotate_source(reference.id, &mut input);
-        self
-          .result
-          .source_operands
-          .insert(reference.id, reference.operand.clone());
-        self
-          .result
-          .source_inputs
-          .insert((reference.id, None), input.clone());
-        let target = self.load_source(reference.id, &input)?;
-        if let Some(target) = target {
-          if visited.contains(&target) {
-            continue;
-          }
-          pending.insert(target);
-          let mut derived = std::mem::take(&mut self.result.derived);
-          derived.collect(
-            self.workspace.workspace,
-            [target].into(),
-            Some(&self.result),
-            self.result.request.limits.value_bytes,
-            self.cancelled,
-          )?;
-          pending.extend(
-            derived
-              .bodies
-              .values()
-              .flat_map(|body| body.documents.keys().copied())
-              .filter(|snapshot| !visited.contains(snapshot)),
-          );
-          self.result.derived = derived;
-          excluded = self.result.derived.incomplete_bodies(Some(&self.result));
-        }
-      }
-    }
-    Ok(())
-  }
-
   pub(super) fn commit_sources(&mut self) -> Result<(), Error> {
     for (id, state) in &self.sources.states {
       self.workspace.workspace.set_reference(*id, state.clone())?;

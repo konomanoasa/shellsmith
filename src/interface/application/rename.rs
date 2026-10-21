@@ -4,9 +4,9 @@ use super::engine::{
   check_cancelled, optional_reserved_word, reserved_word, special_builtin,
   valid_name,
 };
-use super::support::{EntryNames, NameCollection};
+use super::support::NameCollection;
 use super::{Application, Error};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -51,9 +51,9 @@ impl Application {
     offset: usize,
     cancelled: &AtomicBool,
   ) -> Result<Option<RenameTarget>, Error> {
-    self.verify_collection(cancelled)?;
+    self.verify_discovery(cancelled)?;
     let names = self.prepare_names(path, cancelled)?;
-    self.check_name_inputs(&names, cancelled)?;
+    self.check_rename_inputs(&names, cancelled)?;
     self
       .rename_selection(&names, path, offset, cancelled)
       .map(|selection| selection.map(|selection| selection.target))
@@ -66,9 +66,9 @@ impl Application {
     new_name: &str,
     cancelled: &AtomicBool,
   ) -> Result<Vec<RenameEdit>, Error> {
-    self.verify_collection(cancelled)?;
+    self.verify_discovery(cancelled)?;
     let names = self.prepare_names(path, cancelled)?;
-    self.check_name_inputs(&names, cancelled)?;
+    self.check_rename_inputs(&names, cancelled)?;
     let selection = self
       .rename_selection(&names, path, offset, cancelled)?
       .ok_or_else(|| {
@@ -87,7 +87,7 @@ impl Application {
     let mut edits = BTreeMap::new();
     for &(entry, site) in &selection.sites {
       check_cancelled(cancelled)?;
-      let location = names.entries[entry].relations.occurrences[site]
+      let location = names.results.entries[entry].relations.occurrences[site]
         .spelling
         .editable()
         .ok_or_else(|| {
@@ -111,8 +111,20 @@ impl Application {
     }
     let after = self.reanalyze_names(&names, &changed, cancelled)?;
     verify(&names, &after, &selection, &mapping, new_name, cancelled)?;
-    self.check_name_inputs(&names, cancelled)?;
+    self.check_rename_inputs(&names, cancelled)?;
     Ok(edits.into_values().collect())
+  }
+
+  fn check_rename_inputs(
+    &mut self,
+    names: &NameCollection,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    self.check_name_inputs(names, cancelled)?;
+    if !self.failures().is_empty() {
+      return Err(refused("Some workspace inputs could not be read"));
+    }
+    Ok(())
   }
 
   fn rename_selection(
@@ -133,28 +145,26 @@ impl Application {
     if !document.source().is_char_boundary(offset) {
       return Err(engine::Error::InvalidPosition.into());
     }
-    let mut candidates = Vec::new();
-    let mut width = usize::MAX;
-    for (entry, result) in names.entries.iter().enumerate() {
-      for (index, site) in result.relations.at(document.snapshot(), offset) {
-        if site.names.is_empty() {
-          continue;
-        }
-        let location = site.spelling.editable().expect("selected spelling");
-        if location.bytes.len() < width {
-          candidates.clear();
-          width = location.bytes.len();
-        }
-        if location.bytes.len() == width {
-          candidates.push((entry, index));
-        }
-      }
-    }
-    let Some(&(entry, index)) = candidates.first() else {
+    let candidates =
+      names
+        .results
+        .at(document.snapshot(), offset, true, cancelled)?;
+    let candidates: Vec<_> = candidates
+      .into_iter()
+      .filter(|site| !names.results.occurrence(*site).names.is_empty())
+      .collect();
+    let Some(&(entry, index)) = candidates.iter().find(|site| {
+      names
+        .results
+        .occurrence(**site)
+        .spelling
+        .editable()
+        .is_some()
+    }) else {
       return Ok(None);
     };
-    let first = &names.entries[entry].relations.occurrences[index];
-    let name = &names.entries[entry].relations.names
+    let first = &names.results.entries[entry].relations.occurrences[index];
+    let name = &names.results.entries[entry].relations.names
       [first.names.first().expect("selected name").0];
     if !valid_name(&name.text) || reserved(name.kind, &name.text) {
       return Ok(None);
@@ -173,9 +183,11 @@ impl Application {
       sites: BTreeSet::new(),
       members: BTreeSet::new(),
     };
-    selection.expand(names, candidates, cancelled)?;
+    let related = names.results.related_occurrences(candidates, cancelled)?;
+    selection.sites = related.sites;
+    selection.members = related.members;
     if !selection.members.iter().any(|(entry, id)| {
-      !names.entries[*entry].relations.names[id.0]
+      !names.results.entries[*entry].relations.names[id.0]
         .definitions
         .is_empty()
     }) {
@@ -187,64 +199,11 @@ impl Application {
 }
 
 impl Selection {
-  fn expand(
-    &mut self,
-    names: &NameCollection,
-    candidates: Vec<Site>,
-    cancelled: &AtomicBool,
-  ) -> Result<(), Error> {
-    let mut by_name: BTreeMap<Member, Vec<Site>> = BTreeMap::new();
-    let mut by_source: BTreeMap<SourceRange, Vec<Site>> = BTreeMap::new();
-    for (entry, result) in names.entries.iter().enumerate() {
-      for (index, site) in result.relations.occurrences.iter().enumerate() {
-        check_cancelled(cancelled)?;
-        for id in &site.names {
-          by_name
-            .entry((entry, *id))
-            .or_default()
-            .push((entry, index));
-        }
-        for location in
-          std::iter::once(&site.location).chain(site.spelling.editable())
-        {
-          if let Ok(range) = source_range(names, location) {
-            by_source.entry(range).or_default().push((entry, index));
-          }
-        }
-      }
-    }
-    let mut expanded_sources = BTreeSet::new();
-    let mut pending: VecDeque<_> = candidates.into();
-    while let Some((entry, index)) = pending.pop_front() {
-      check_cancelled(cancelled)?;
-      if !self.sites.insert((entry, index)) {
-        continue;
-      }
-      let site = &names.entries[entry].relations.occurrences[index];
-      for id in &site.names {
-        if self.members.insert((entry, *id)) {
-          pending
-            .extend(by_name.get(&(entry, *id)).into_iter().flatten().copied());
-        }
-      }
-      for location in
-        std::iter::once(&site.location).chain(site.spelling.editable())
-      {
-        if let Ok(range) = source_range(names, location)
-          && expanded_sources.insert(range.clone())
-        {
-          pending.extend(by_source.get(&range).into_iter().flatten().copied());
-        }
-      }
-    }
-    Ok(())
-  }
-
   fn validate(&self, collection: &NameCollection) -> Result<(), Error> {
     for &(entry, index) in &self.sites {
-      let result = &collection.entries[entry];
+      let result = &collection.results.entries[entry];
       let site = &result.relations.occurrences[index];
-      if result.damaged {
+      if collection.entries[entry].damaged {
         return Err(refused("Related input contains incomplete syntax"));
       }
       if !site.compatible
@@ -274,7 +233,7 @@ impl Selection {
       }
     }
     for &(entry, id) in &self.members {
-      let result = &collection.entries[entry];
+      let result = &collection.results.entries[entry];
       let name = &result.relations.names[id.0];
       if matches!(name.environment, NameEnvironment::Caller(_)) {
         return Err(refused(
@@ -314,7 +273,7 @@ impl Selection {
   }
 }
 
-fn uncertain_name(entry: &EntryNames, name: &Name) -> bool {
+fn uncertain_name(entry: &engine::EntryNames, name: &Name) -> bool {
   entry.relations.effects.iter().any(|effect| {
     entry
       .relations
@@ -465,13 +424,18 @@ fn verify(
     }
     let previous = relationships(
       before,
-      old,
+      &before.results.entries[index],
       |id| selection.members.contains(&(index, id)).then_some(new_name),
       |range| mapping.translate(range),
       cancelled,
     )?;
-    let current =
-      relationships(after, new, |_| None, |range| range, cancelled)?;
+    let current = relationships(
+      after,
+      &after.results.entries[index],
+      |_| None,
+      |range| range,
+      cancelled,
+    )?;
     if previous != current {
       return Err(refused(
         "The new name would change bindings or capture another reference",
@@ -483,7 +447,7 @@ fn verify(
 
 fn relationships<'a>(
   collection: &NameCollection,
-  entry: &EntryNames,
+  entry: &engine::EntryNames,
   renamed: impl Fn(NameId) -> Option<&'a str>,
   map: impl Fn(SourceRange) -> SourceRange,
   cancelled: &AtomicBool,

@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
-pub(super) struct Collection {
+pub(super) struct Discovery {
   state: Mutex<State>,
   scan: Mutex<()>,
 }
@@ -32,7 +32,7 @@ struct Root {
   failures: Vec<Failure>,
 }
 
-impl Collection {
+impl Discovery {
   pub(super) fn watching(&self, enabled: bool) {
     let mut state = self.state.lock().expect("collection state");
     if state.watching != enabled {
@@ -314,5 +314,5 @@ fn collect_failure(
 }
 
 #[cfg(test)]
-#[path = "../../../../tests/implementation/collection.rs"]
+#[path = "../../../../tests/implementation/discovery.rs"]
 mod tests;

@@ -110,7 +110,6 @@ fn shell(source: &[u8], path: &Path) -> bool {
   path.extension().is_some_and(|extension| extension == "sh")
 }
 
-/// The path whose entry is the document `id`.
 pub(super) fn entry_path(
   entries: &BTreeMap<PathBuf, Snapshot>,
   id: DocumentId,
@@ -185,8 +184,7 @@ fn resolve_file(
   Ok(identity)
 }
 
-/// Whether each directory that a `..` component leaves exists, as pathname
-/// resolution requires even when an unsaved document replaces the file.
+/// Even unsaved files require existing directories before each `..`.
 fn parents_exist(path: &Path) -> bool {
   let mut prefix = PathBuf::new();
   path.components().all(|component| {
@@ -577,8 +575,6 @@ struct ParsedFile {
 }
 
 impl Documents {
-  /// Parses `bytes` as the next revision of the document at `path` and makes
-  /// it the entry of `path`.
   pub(super) fn parse_entry(
     &self,
     entries: &mut BTreeMap<PathBuf, Snapshot>,

@@ -115,7 +115,6 @@ pub(super) struct CommandOptions {
   pub standard: bool,
 }
 
-/// Parses every option of `command`, or returns why they are unknown.
 pub(super) fn command_options(
   args: &[Argument<'_>],
 ) -> Result<CommandOptions, ResolutionIssue> {
@@ -636,8 +635,7 @@ impl<'a> Resolver<'a> {
     }
   }
 
-  /// Search for a simple command name, which POSIX leaves unspecified where
-  /// an implementation may recognize the name as a reserved word.
+  /// POSIX leaves optional reserved words unspecified in command position.
   pub(super) fn name_search(
     command: Node<'_>,
     source: &[u8],
@@ -1058,7 +1056,6 @@ const RESERVED: &[&[u8]] = &[
   b"for", b"if", b"in", b"then", b"until", b"while",
 ];
 
-/// Words that an implementation may recognize as reserved words.
 const OPTIONAL_RESERVED: &[&[u8]] =
   &[b"[[", b"]]", b"function", b"namespace", b"select", b"time"];
 
@@ -1072,14 +1069,12 @@ pub fn optional_reserved_word(word: &[u8]) -> bool {
   OPTIONAL_RESERVED.contains(&word)
 }
 
-/// Whether POSIX reserves `word` for ending in a colon; the `:` utility is
-/// specified separately.
+/// POSIX reserves colon-suffixed names except the `:` utility.
 fn colon_word(word: &[u8]) -> bool {
   word.len() > 1 && word.ends_with(b":")
 }
 
-/// Whether the prefix assignments of a command named `name`, which is not a
-/// definite special built-in, may persist after it.
+/// Definite special built-ins are handled by the caller.
 fn prefix_may_persist(name: &Value, resolution: &Resolution) -> bool {
   !resolution.candidates.is_empty()
     || !resolution.issues.is_empty()
@@ -1116,8 +1111,7 @@ const INTRINSIC: &[&[u8]] = &[
   b"jobs", b"kill", b"read", b"type", b"ulimit", b"umask", b"unalias", b"wait",
 ];
 
-/// Modeled regular built-ins, for which a PATH search may find an external
-/// implementation.
+/// PATH may select external implementations of these built-ins.
 const REGULAR: &[&[u8]] = &[
   b"[", b"echo", b"false", b"newgrp", b"printf", b"pwd", b"test", b"true",
 ];
@@ -1277,7 +1271,6 @@ pub(super) enum Search {
   Standard,
 }
 
-/// Whether `name` is definitely the name of a special built-in.
 pub(super) fn special_name(name: &Value) -> bool {
   matches!(name, Value::Literal(name) if special_builtin(name))
 }

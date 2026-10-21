@@ -5,7 +5,7 @@ mod effects;
 mod redirections;
 
 pub(in crate::interface::application::engine) use arguments::invariant_arguments;
-pub(super) use arguments::{operand_index, syntax_arguments};
+pub(super) use arguments::operand_index;
 pub(in crate::interface::application::engine) use effects::{
   UnattemptedCommand, unattempted_command,
 };

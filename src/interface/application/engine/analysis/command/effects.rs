@@ -52,8 +52,7 @@ impl<'a> Resolver<'a> {
     targets
   }
 
-  /// Adds the state that `node` itself may write, apart from the commands
-  /// it contains.
+  /// Excludes writes by nested commands.
   fn node_writes(
     &self,
     node: Node<'_>,
@@ -234,7 +233,6 @@ impl Resolver<'_> {
     }
   }
 
-  /// Runs a command whose effects on the shell state are unknown.
   pub(in crate::interface::application::engine::analysis) fn opaque(
     &mut self,
     node: Node<'_>,
@@ -526,7 +524,6 @@ pub(super) fn argument_target(
   }
 }
 
-/// The readonly attributes that a declaration of `target` may set.
 pub(super) fn attribute_target(target: &EffectTarget) -> EffectTarget {
   match target {
     EffectTarget::Variable(name) => EffectTarget::Attribute(name.clone()),

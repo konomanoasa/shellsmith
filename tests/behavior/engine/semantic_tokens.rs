@@ -26,6 +26,148 @@ mod classification {
   }
 
   #[test]
+  fn entry_aggregation_preserves_reached_roles() {
+    for (source, first, second, spelling, agreed, mixed) in [
+      (
+        "a() { :; }; b() { a; }",
+        ". /lib; b",
+        ". /lib; unset -f a; b",
+        "a;",
+        SemanticKind::Function,
+        SemanticKind::Command,
+      ),
+      (
+        "a() { :; }; b() { command -v a; }",
+        ". /lib; b",
+        ". /lib; unset -f a; b",
+        "a;",
+        SemanticKind::Function,
+        SemanticKind::Command,
+      ),
+      (
+        "b() { \"$1\" 7; }",
+        ". /lib; b shift",
+        ". /lib; b echo",
+        "7",
+        SemanticKind::Number,
+        SemanticKind::String,
+      ),
+      (
+        "a() { :; }; b() { \"$1\" -v a; }",
+        ". /lib; b command",
+        ". /lib; b echo",
+        "a;",
+        SemanticKind::Function,
+        SemanticKind::String,
+      ),
+    ] {
+      assert_entry_classification(
+        source, first, second, spelling, agreed, mixed,
+      );
+    }
+  }
+
+  #[test]
+  fn entry_aggregation_projects_embedded_bodies() {
+    for (source, first, second, spelling, agreed, mixed) in [
+      (
+        "a() { :; }; b() { trap 'a' EXIT; }",
+        ". /lib; b",
+        ". /lib; unset -f a; b",
+        "a'",
+        SemanticKind::Function,
+        SemanticKind::Command,
+      ),
+      (
+        "a() { :; }; b() { \"$1\" 'a' EXIT; }",
+        ". /lib; b trap",
+        ". /lib; b echo",
+        "a'",
+        SemanticKind::Function,
+        SemanticKind::String,
+      ),
+      (
+        "a() { :; }; b() { trap \"trap 'a' EXIT\" EXIT; }",
+        ". /lib; b",
+        ". /lib; unset -f a; b",
+        "a'",
+        SemanticKind::Function,
+        SemanticKind::Command,
+      ),
+      (
+        "a() { :; }; b() { trap '\"$cmd\" \"a\" EXIT' EXIT; }",
+        ". /lib; cmd=trap; b",
+        ". /lib; cmd=echo; b",
+        "a\"",
+        SemanticKind::Function,
+        SemanticKind::String,
+      ),
+      (
+        "a() { :; }; b() { trap \"a$1\" EXIT; }",
+        ". /lib; b ''",
+        ". /lib; read unknown; b \"$unknown\"",
+        "a$1",
+        SemanticKind::Function,
+        SemanticKind::String,
+      ),
+    ] {
+      assert_entry_classification(
+        source, first, second, spelling, agreed, mixed,
+      );
+    }
+  }
+
+  fn assert_entry_classification(
+    source: &str,
+    first: &str,
+    second: &str,
+    spelling: &str,
+    agreed: SemanticKind,
+    mixed: SemanticKind,
+  ) {
+    let base = workspace(source);
+    let entry = |id, text| {
+      let mut entry = Workspace::default();
+      let caller = support::parse(id, 1, text);
+      let mut request = AnalysisRequest::new(caller.snapshot());
+      request.initial = InitialEnvironment::empty();
+      entry.insert(caller).unwrap();
+      let mut inputs =
+        support::Inputs::sources([("/lib", support::parse(1, 1, source))]);
+      let analysis = entry
+        .analyze(request, &mut inputs, &AtomicBool::new(false))
+        .unwrap();
+      entry.publish_analysis(analysis).unwrap();
+      entry
+    };
+    let first = entry(2, first);
+    let second = entry(3, second);
+    let offset = source.rfind(spelling).unwrap();
+    for (entries, expected) in [
+      (vec![&first], agreed),
+      (vec![&first, &second], mixed),
+      (vec![&second, &first], mixed),
+    ] {
+      let spans = base.semantic_spans_with(DocumentId(1), &entries).unwrap();
+      let actual = spans
+        .iter()
+        .rev()
+        .filter(|span| span.location.bytes.contains(&offset))
+        .min_by_key(|span| (span.location.bytes.len(), !span.semantic))
+        .unwrap();
+      assert_eq!(actual.kind, expected, "{source}: {spans:?}");
+    }
+    let mut revised = base;
+    revised.insert(support::parse(1, 2, source)).unwrap();
+    assert_eq!(
+      revised
+        .semantic_spans_with(DocumentId(1), &[&first, &second])
+        .unwrap(),
+      revised.semantic_spans(DocumentId(1)).unwrap()
+    );
+  }
+
+  #[test]
   fn only_required_posix_utilities_receive_default_library() {
     let required = [
       ":", ".", "break", "continue", "eval", "exec", "exit", "export",
@@ -87,6 +229,72 @@ mod classification {
       .find(|span| span.location.bytes.start == source.rfind("f\n").unwrap())
       .unwrap();
     assert_eq!(call.kind, SemanticKind::Command);
+  }
+
+  #[test]
+  fn function_uses_and_name_operands_require_a_calling_context() {
+    for body in ["a() { :; }", "if :; then a() { :; }; else a() { :; }; fi"] {
+      for (command, syntax_kind) in [
+        ("", SemanticKind::Command),
+        ("unset -f ", SemanticKind::Function),
+        ("command -v ", SemanticKind::String),
+      ] {
+        for call in ["", "idle\n"] {
+          let source =
+            format!("idle() {{ {body}; {command}a # target\n}}\n{call}");
+          let workspace = workspace(&source);
+          let snapshot = workspace.document(DocumentId(1)).unwrap().snapshot();
+          let offset = source.find("a # target").unwrap();
+          let resolution = workspace.resolution_at(snapshot, offset).unwrap();
+          if call.is_empty() {
+            assert_eq!(resolution, None, "{source}");
+          } else {
+            let resolution = resolution.unwrap();
+            assert_eq!(
+              resolution.candidates,
+              workspace
+                .symbols_named(b"a")
+                .map(|symbol| symbol.id)
+                .collect(),
+              "{source}"
+            );
+            assert!(resolution.is_complete(), "{source}");
+          }
+          let spans = workspace.semantic_spans(DocumentId(1)).unwrap();
+          assert_eq!(
+            spans
+              .iter()
+              .find(|span| span.location.bytes.start == offset)
+              .unwrap()
+              .kind,
+            if call.is_empty() {
+              syntax_kind
+            } else {
+              SemanticKind::Function
+            },
+            "{source}"
+          );
+          let names =
+            workspace.name_relations(&AtomicBool::new(false)).unwrap();
+          let sites = names.at(snapshot, offset);
+          if call.is_empty() {
+            assert!(
+              sites.iter().all(|(_, site)| site.context.is_none()
+                && site.resolution.is_none()
+                && site.identity.is_none()),
+              "{source}"
+            );
+            assert_eq!(workspace.analysis().unwrap().contexts().len(), 1);
+          } else {
+            assert!(!sites.is_empty(), "{source}");
+            assert!(
+              sites.iter().all(|(_, site)| site.context.is_some()),
+              "{source}"
+            );
+          }
+        }
+      }
+    }
   }
 
   #[test]
@@ -597,7 +805,7 @@ mod classification {
         .iter()
         .filter(|span| span.kind == SemanticKind::Function)
         .count(),
-      2
+      1
     );
     assert_eq!(
       spans
@@ -614,7 +822,6 @@ mod classification {
     let source = "f() { :; }\nf\n";
     let document = support::parse(1, 1, source);
     let snapshot = document.snapshot();
-    let definition = document.symbols()[0].id;
     let mut workspace = Workspace::default();
     workspace.insert(document).unwrap();
     let at = source.rfind('f').unwrap();
@@ -622,11 +829,29 @@ mod classification {
     workspace.semantic_spans(DocumentId(1)).unwrap();
     let after = workspace.resolution_at(snapshot, at).unwrap();
     for resolution in [before, after] {
-      assert_eq!(
-        resolution.map(|resolution| resolution.candidates),
-        Some([definition].into())
-      );
+      assert_eq!(resolution, None);
     }
+    let mut request = AnalysisRequest::new(snapshot);
+    request.initial = InitialEnvironment::empty();
+    let analysis = workspace
+      .analyze(
+        request,
+        &mut support::Inputs::default(),
+        &AtomicBool::new(false),
+      )
+      .unwrap();
+    workspace.publish_analysis(analysis).unwrap();
+    assert_eq!(
+      workspace
+        .resolution_at(snapshot, at)
+        .unwrap()
+        .unwrap()
+        .candidates,
+      workspace
+        .symbols_named(b"f")
+        .map(|symbol| symbol.id)
+        .collect()
+    );
   }
 
   #[test]

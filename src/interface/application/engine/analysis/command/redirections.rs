@@ -110,24 +110,12 @@ impl<'a> Resolver<'a> {
     };
     let source = self.workspace.source(frame.snapshot.document);
     let fd = descriptor(node, source);
-    let strip = node
-      .child_by_field_name("operator")
-      .is_some_and(|op| word::lexical(op, source) == b"<<-");
-    let body = document.child_by_field_name("body");
-    let quoted =
-      body.is_some_and(|body| body.kind() == "quoted_here_document_body");
     // Damaged syntax outside the body ends the here-document content.
     let rest = damage_outside(document, &["body"]);
-    let task = match body {
-      Some(body) if !quoted => self.expand_here(body, strip, env, frame),
-      _ => Task::expanded(super::super::expansion::Expansion {
-        word: word::Word::value(
-          Value::Literal(
-            body
-              .map_or_else(Vec::new, |body| source[body.byte_range()].to_vec()),
-          ),
-          true,
-        ),
+    let task = match document.child_by_field_name("body") {
+      Some(body) => self.expand_start(body, false, env, frame),
+      None => Task::expanded(super::super::expansion::Expansion {
+        word: word::Word::value(Value::Literal(Vec::new()), true),
         env,
       }),
     };
@@ -138,12 +126,7 @@ impl<'a> Resolver<'a> {
       }
       if fd == 0 {
         let input = match result.word.scalar() {
-          Value::Literal(mut bytes) => {
-            if strip && quoted {
-              word::strip_leading_tabs(&mut bytes, true);
-            }
-            Ok((std::sync::Arc::new(bytes), 0))
-          }
+          Value::Literal(bytes) => Ok((std::sync::Arc::new(bytes), 0)),
           value => Err(value.issue().expect("unknown input")),
         };
         result.env.io.connect_input(input);
@@ -162,6 +145,7 @@ pub(in crate::interface::application::engine::analysis) fn index_heredocs<
 >(
   document: &'a Document,
   output: &mut BTreeMap<(Snapshot, usize), Node<'a>>,
+  stripped: &mut BTreeMap<(Snapshot, usize), usize>,
   cancelled: &AtomicBool,
 ) -> Result<(), Error> {
   let mut headers: BTreeMap<usize, Vec<Node<'a>>> = BTreeMap::new();
@@ -195,6 +179,7 @@ pub(in crate::interface::application::engine::analysis) fn index_heredocs<
         .map(|child| (child, owner)),
     );
   }
+  let mut bodies = Vec::new();
   for (owner, mut headers) in headers {
     if let Some(mut documents) = documents.remove(&owner)
       && headers.len() == documents.len()
@@ -202,8 +187,26 @@ pub(in crate::interface::application::engine::analysis) fn index_heredocs<
       headers.sort_by_key(Node::start_byte);
       documents.sort_by_key(Node::start_byte);
       for (header, here) in headers.into_iter().zip(documents) {
+        if header
+          .child_by_field_name("operator")
+          .is_some_and(|operator| {
+            word::lexical(operator, document.source().as_bytes()) == b"<<-"
+          })
+          && let Some(body) = here.child_by_field_name("body")
+        {
+          bodies.push(body.byte_range());
+        }
         output.insert((document.snapshot(), header.start_byte()), here);
       }
+    }
+  }
+  // Bodies nest or are disjoint, so the outermost ones cover the rest.
+  bodies.sort_by_key(|body| body.start);
+  let mut covered = 0;
+  for body in bodies {
+    if body.start >= covered {
+      covered = body.end;
+      stripped.insert((document.snapshot(), body.start), body.end);
     }
   }
   Ok(())
@@ -232,18 +235,22 @@ pub(in crate::interface::application::engine::analysis) struct Redirections {
   input: Option<usize>,
   stdout: Option<bool>,
   stderr: Option<bool>,
+  /// Redirections that may also persist leave their descriptors unknown.
+  may_persist: bool,
 }
 impl Redirections {
   pub(in crate::interface::application::engine::analysis) fn new(
     nodes: &[Node<'_>],
     source: &[u8],
     env: &mut Environment,
+    may_persist: bool,
   ) -> Self {
     let mut pending = nodes.to_vec();
     let mut saved = Self {
       input: None,
       stdout: None,
       stderr: None,
+      may_persist,
     };
     while let Some(node) = pending.pop() {
       if matches!(node.kind(), "io_here" | "io_file") {
@@ -268,12 +275,21 @@ impl Redirections {
     for env in flow.environments_mut() {
       if let Some(input) = self.input {
         env.io.restore_input(input);
+        if self.may_persist {
+          env.io.input = Err(ValueIssue::Dynamic);
+        }
       }
       if let Some(stdout) = self.stdout {
         env.io.stdout_redirected = stdout;
+        if self.may_persist
+          && let Some(output) = &mut env.io.output
+        {
+          output.fail(ValueIssue::Dynamic);
+        }
       }
       if let Some(stderr) = self.stderr {
-        env.io.stderr_captured = stderr;
+        env.io.stderr_captured =
+          stderr || (self.may_persist && env.io.stderr_captured);
       }
     }
   }

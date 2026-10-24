@@ -31,14 +31,15 @@ async fn workspace_and_rename_requests_share_the_completed_collection() {
     Ok(snapshot(app))
   });
   let (workspace, names) = tokio::join!(workspace, names);
-  let workspace = workspace.unwrap();
-  assert!(Arc::ptr_eq(&workspace, &names.unwrap()));
+  let workspace = workspace.result.unwrap();
+  assert!(Arc::ptr_eq(&workspace, &names.result.unwrap()));
   let renamed = session
     .request(RequestScope::Names(path.clone()), move |app, cancel| {
       assert_eq!(app.rename(&path, 0, "value", cancel)?.len(), 2);
       Ok(snapshot(app))
     })
     .await
+    .result
     .unwrap();
   assert!(Arc::ptr_eq(&workspace, &renamed));
 }
@@ -181,7 +182,7 @@ fn linked_directory_changes_update_the_collected_alias_and_retargeting_discards_
 
 #[cfg(unix)]
 #[test]
-fn physical_target_changes_reconsider_unselected_links_and_deleted_parent_directories()
+fn physical_target_changes_reconsider_unselected_links_and_deleted_or_restored_parent_directories()
  {
   let fixture = Fixture::new();
   let external = Fixture::new();
@@ -208,9 +209,42 @@ fn physical_target_changes_reconsider_unselected_links_and_deleted_parent_direct
   );
   let removed = external.root.join("libraries");
   std::fs::remove_dir_all(&removed).unwrap();
-  discovery.changed(&[removed]);
+  discovery.changed(std::slice::from_ref(&removed));
   let (paths, failures) = discovery.collect(&roots, false, &cancel).unwrap();
   assert_eq!(paths, BTreeSet::from([external.root.join("files/runner")]));
   assert_eq!(failures.len(), 1);
   assert_eq!(failures[0].path, fixture.root.join("library"));
+  let restored = external.write("libraries/one/lib.sh", "library=2\n");
+  discovery.changed(&[removed]);
+  assert_eq!(
+    discovery.collect(&roots, false, &cancel).unwrap(),
+    (
+      BTreeSet::from([restored, external.root.join("files/runner")]),
+      vec![]
+    )
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn links_through_a_missing_directory_to_its_parent_recover_when_it_is_created()
+{
+  let fixture = Fixture::new();
+  let main = fixture.write("main.sh", "main=1\n");
+  let alias = fixture.root.join("upper");
+  std::os::unix::fs::symlink("missing/..", &alias).unwrap();
+  let discovery = Discovery::default();
+  let roots = BTreeSet::from([fixture.root.clone()]);
+  let cancel = AtomicBool::new(false);
+  let (paths, failures) = discovery.collect(&roots, false, &cancel).unwrap();
+  assert_eq!(paths, BTreeSet::from([main.clone()]));
+  assert_eq!(failures.len(), 1);
+  assert_eq!(failures[0].path, alias);
+  let created = fixture.root.join("missing");
+  std::fs::create_dir(&created).unwrap();
+  discovery.changed(&[created]);
+  assert_eq!(
+    discovery.collect(&roots, false, &cancel).unwrap(),
+    (BTreeSet::from([main]), vec![])
+  );
 }

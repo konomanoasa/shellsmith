@@ -27,6 +27,8 @@ pub(super) struct Frame {
   pub(super) loops: u32,
   pub(super) dynamic_loops: bool,
   pub(super) returnable: bool,
+  /// Function calls entered since the entry.
+  pub(super) functions: u32,
 }
 
 impl Frame {
@@ -37,6 +39,7 @@ impl Frame {
       loops: 0,
       dynamic_loops: false,
       returnable: false,
+      functions: 0,
     }
   }
 
@@ -353,6 +356,9 @@ impl Resolver<'_> {
   ) {
     if variable.is_some_and(|name| env.uncertain_variable(name)) {
       resolution.issues.insert(ResolutionIssue::EvaluationOrder);
+      resolution.origins.insert(engine::BindingOrigin::Context(
+        self.result.binding_context(context),
+      ));
     }
     self
       .result
@@ -390,6 +396,8 @@ impl Resolver<'_> {
         && (frame.dynamic_loops || (boundary && frame.loops > 0)),
       returnable: !matches!(kind, ExecutionKind::Deferred(_))
         && (boundary || frame.returnable),
+      functions: frame.functions
+        + u32::from(matches!(kind, ExecutionKind::Function(_))),
       ..frame
     };
     let key = ContextKey {
@@ -433,6 +441,7 @@ pub(super) struct Index<'a> {
   definitions: BTreeMap<OccurrenceId, SymbolId>,
   functions: BTreeMap<SymbolId, Node<'a>>,
   heredocs: BTreeMap<(Snapshot, usize), Node<'a>>,
+  stripped: BTreeMap<(Snapshot, usize), usize>,
   sources: BTreeMap<(Snapshot, usize, usize), ReferenceId>,
   damaged: BTreeSet<(Snapshot, usize)>,
 }
@@ -469,6 +478,25 @@ impl<'a> Index<'a> {
     self.heredocs.get(&(snapshot, node.start_byte())).copied()
   }
 
+  /// A `<<-` here-document removes leading tabs from every line of its body,
+  /// including lines inside nested words and here-documents.
+  pub fn strips_tabs(
+    &self,
+    snapshot: Snapshot,
+    node: Node<'_>,
+    source: &[u8],
+  ) -> bool {
+    let range = node.byte_range();
+    source[range.clone()].contains(&b'\t')
+      && self
+        .stripped
+        .range(..=(snapshot, range.start))
+        .next_back()
+        .is_some_and(|(&(document, _), &end)| {
+          document == snapshot && range.end <= end
+        })
+  }
+
   pub fn source(
     &self,
     snapshot: Snapshot,
@@ -490,6 +518,7 @@ impl<'a> Index<'a> {
       definitions: BTreeMap::new(),
       functions: BTreeMap::new(),
       heredocs: BTreeMap::new(),
+      stripped: BTreeMap::new(),
       sources: BTreeMap::new(),
       damaged: BTreeSet::new(),
     };
@@ -506,7 +535,12 @@ impl<'a> Index<'a> {
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
-    super::command::index_heredocs(document, &mut self.heredocs, cancelled)?;
+    super::command::index_heredocs(
+      document,
+      &mut self.heredocs,
+      &mut self.stripped,
+      cancelled,
+    )?;
     self.index_damage(document, cancelled)?;
     for reference in document.references() {
       self.sources.insert(
@@ -568,9 +602,7 @@ impl<'a> Index<'a> {
     let mut pending = vec![(document.tree.root_node(), None)];
     while let Some((node, mut owner)) = pending.pop() {
       check_cancelled(cancelled)?;
-      if matches!(node.kind(), "command" | "function_body")
-        || engine::workspace::parser::subshell(node.kind())
-      {
+      if engine::workspace::parser::damage_unit(node.kind()) {
         owner = Some(node.id());
       }
       if engine::workspace::parser::damaged(node)

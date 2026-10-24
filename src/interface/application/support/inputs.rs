@@ -1,3 +1,4 @@
+use super::application::InputSelection;
 use super::{Error, Failure, files};
 use crate::interface::application::engine::{
   self, AnalysisInputs, Document, InputQuery, InputResult, Snapshot,
@@ -10,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct InputCache {
+  pub(super) selection: Option<InputSelection>,
   pub(super) loaded: BTreeMap<PathBuf, Result<Arc<Document>, String>>,
   failed_inputs: BTreeMap<PathBuf, Result<Arc<[u8]>, String>>,
   pub(super) paths: BTreeMap<SourceInput, Result<PathBuf, String>>,
@@ -61,9 +63,13 @@ impl AnalysisInputs for Inputs<'_> {
       }
       let bytes = files::read(&path, self.opened);
       let loaded = bytes.as_ref().map_err(Clone::clone).and_then(|bytes| {
-        self
-          .documents
-          .parse_entry(self.entries, &path, bytes, self.cancelled)
+        self.documents.parse_entry(
+          self.entries,
+          &path,
+          bytes,
+          false,
+          self.cancelled,
+        )
       });
       check_cancelled(self.cancelled)?;
       if let Err(error) = &loaded {

@@ -349,14 +349,15 @@ mod lsp {
   }
 
   #[tokio::test]
-  async fn references_log_unreadable_inputs_and_fail_for_unavailable_requested_documents()
+  async fn requests_log_read_failures_on_success_and_on_operation_or_preparation_errors()
    {
     let fixture = Fixture::new();
     let path = fixture.write("main.sh", "value=1; : \"$value\"");
-    std::fs::write(fixture.root.join("broken.sh"), [0xff]).unwrap();
+    let broken = fixture.root.join("broken.sh");
+    std::fs::write(&broken, [0xff]).unwrap();
     let uri = Url::from_file_path(path).unwrap().to_string();
     let mut server = Client::new(Settings::new(fixture.root.clone()));
-    server.request("initialize", json!({"rootUri":Url::from_file_path(&fixture.root).unwrap(),"capabilities":{}})).await;
+    server.request("initialize", json!({"rootUri":Url::from_file_path(&fixture.root).unwrap(),"capabilities":{"textDocument":{"semanticTokens":{"requests":{"full":true},"formats":["relative"],"tokenTypes":["variable"],"tokenModifiers":[]}}}})).await;
     server.notify("initialized", json!({})).await;
     let response = server.request("textDocument/references", json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0},"context":{"includeDeclaration":false}})).await;
     assert_eq!(
@@ -371,9 +372,62 @@ mod lsp {
         .unwrap()
         .contains("broken.sh")
     );
-    let uri = Url::from_file_path(fixture.root.join("missing.sh")).unwrap();
-    let response = server.request("textDocument/references", json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0},"context":{"includeDeclaration":false}})).await;
-    assert!(response.get("error").is_some(), "{response}");
+    let response = server.request("textDocument/rename", json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0},"newName":"renamed"})).await;
+    assert_eq!(response["error"]["code"], -32803, "{response}");
+    let message = log_message(&mut server).await;
+    assert!(
+      message["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(broken.to_str().unwrap())
+    );
+
+    for path in [broken.clone(), fixture.root.join("missing.sh")] {
+      let uri = Url::from_file_path(&path).unwrap();
+      for method in [
+        "textDocument/documentSymbol",
+        "textDocument/semanticTokens/full",
+        "textDocument/definition",
+        "textDocument/references",
+        "textDocument/rename",
+      ] {
+        let response = server.request(method, json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0},"context":{"includeDeclaration":false},"newName":"renamed"})).await;
+        assert!(response.get("error").is_some(), "{method}: {response}");
+        let expected = if path == broken
+          || matches!(
+            method,
+            "textDocument/documentSymbol" | "textDocument/semanticTokens/full"
+          ) {
+          1
+        } else {
+          2
+        };
+        let mut messages = server.take_messages();
+        while messages
+          .iter()
+          .filter(|message| message["method"] == "window/logMessage")
+          .count()
+          < expected
+        {
+          messages.push(server.receive().await);
+        }
+        let failures: Vec<_> = messages
+          .iter()
+          .filter(|message| message["method"] == "window/logMessage")
+          .map(|message| message["params"]["message"].as_str().unwrap())
+          .collect();
+        assert_eq!(failures.len(), expected, "{method}: {failures:?}");
+        assert_eq!(
+          failures
+            .iter()
+            .filter(|message| message.contains(path.to_str().unwrap()))
+            .count(),
+          1,
+          "{method} {}: {response}; {failures:?}",
+          path.display()
+        );
+      }
+    }
   }
 
   #[tokio::test]
@@ -667,6 +721,40 @@ mod lsp {
       )
       .await;
     assert_eq!(response["result"]["placeholder"], "z");
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn changes_and_close_address_the_document_opened_before_its_path_became_a_link()
+   {
+    let fixture = Fixture::new();
+    let path = fixture.write("lib.sh", "disk=1");
+    let other = fixture.write("other.sh", "other=1");
+    let uri = Url::from_file_path(&path).unwrap().to_string();
+    let other_uri = Url::from_file_path(&other).unwrap().to_string();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    initialize(&mut server, false).await;
+    server.notify("textDocument/didOpen", json!({"textDocument":{"uri":uri,"languageId":"sh","version":1,"text":"opened=1"}})).await;
+    let response =
+      request(&mut server, "textDocument/documentSymbol", &uri).await;
+    assert_eq!(response["result"][0]["name"], "opened");
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&other, &path).unwrap();
+    server.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"edited=1"}]})).await;
+    let response =
+      request(&mut server, "textDocument/documentSymbol", &other_uri).await;
+    assert_eq!(response["result"].as_array().unwrap().len(), 1);
+    assert_eq!(response["result"][0]["name"], "other");
+    server
+      .notify("textDocument/didClose", json!({"textDocument":{"uri":uri}}))
+      .await;
+    let response = server
+      .request("workspace/symbol", json!({"query":""}))
+      .await;
+    assert_eq!(response["result"], json!([]));
+    let response =
+      request(&mut server, "textDocument/documentSymbol", &uri).await;
+    assert_eq!(response["result"][0]["name"], "other");
   }
 
   #[tokio::test]
@@ -1460,13 +1548,21 @@ mod lsp {
     let explicit = fixture.write("first/explicit.txt", "explicit=3");
     let first_folder = json!({"uri":Url::from_file_path(first.parent().unwrap()).unwrap(),"name":"first"});
     let second_folder = json!({"uri":Url::from_file_path(second.parent().unwrap()).unwrap(),"name":"second"});
+    let virtual_folder = json!({"uri":"untitled:folder","name":"virtual"});
     let mut server = Client::new(Settings::new(fixture.root.clone()));
-    server
+    let initialized = server
       .request(
         "initialize",
-        json!({"capabilities":{},"workspaceFolders":[first_folder]}),
+        json!({"capabilities":{},"workspaceFolders":[virtual_folder,first_folder]}),
       )
       .await;
+    assert!(initialized["result"]["capabilities"].is_object());
+    assert!(
+      log_message(&mut server).await["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Expected a file URI")
+    );
     server.notify("initialized", json!({})).await;
     let result = server
       .request("workspace/symbol", json!({"query":""}))
@@ -1487,7 +1583,6 @@ mod lsp {
       Url::from_file_path(&first).unwrap().as_str(),
     )
     .await;
-    let virtual_folder = json!({"uri":"untitled:folder","name":"virtual"});
     server
       .notify(
         "workspace/didChangeWorkspaceFolders",

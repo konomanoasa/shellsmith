@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use super::super::{Frame, Resolver};
-use super::alternatives::StateKey;
+use super::alternatives::{Alternatives, StateKey};
 use super::environment::{
   Binding, CommandFailure, Environment, Flow, Transfer, alternative,
   definition, merge_value,
@@ -51,7 +51,7 @@ impl<'a> Resolver<'a> {
       {
         names.insert(StateKey::Positionals);
       }
-      if let Some(states) = env.alternatives.select(&env, &names) {
+      if env.alternatives.choice(&names).is_some() {
         if node.kind() == "assignment_word"
           || node.kind() == "word" && node.child_by_field_name("name").is_some()
         {
@@ -64,11 +64,9 @@ impl<'a> Resolver<'a> {
             }
           }
         }
-        return self.each_alternative(
-          states,
-          Flow::default(),
-          move |_, env| Task::eval(node, env, frame),
-        );
+        return self.each_alternative(env, names, move |_, env| {
+          Task::eval(node, env, frame)
+        });
       }
     }
     self.eval_syntax(node, env, frame)
@@ -84,6 +82,9 @@ impl<'a> Resolver<'a> {
     while let Some(child) = pending.pop() {
       if parser::subshell(child.kind()) {
         continue;
+      }
+      if child.kind() == "io_here" {
+        pending.extend(self.index.heredoc(frame.snapshot, child));
       }
       if let Some(site) = self
         .site(child, frame)
@@ -110,19 +111,27 @@ impl<'a> Resolver<'a> {
     names
   }
 
+  /// Runs `step` on each side of the choices that `names` depend on and joins
+  /// the results on the same choices.
   pub(in crate::interface::application::engine::analysis) fn each_alternative(
     &mut self,
-    mut states: super::alternatives::AlternativeStates,
-    mut output: Flow,
-    step: impl Fn(&mut Self, Environment) -> Task<'a> + 'a,
+    env: Environment,
+    names: BTreeSet<StateKey>,
+    step: impl Fn(&mut Self, Environment) -> Task<'a> + Clone + 'a,
   ) -> Task<'a> {
-    let Some(env) = states.next() else {
-      return Task::Done(output);
+    let Some(choice) = env.alternatives.choice(&names) else {
+      return step(self, env);
     };
-    step(self, env).then(move |resolver, flow| {
-      output.join(flow);
-      resolver.each_alternative(states, output, step)
-    })
+    let (left, split) = Alternatives::split(env, choice);
+    let (right_names, right_step) = (names.clone(), step.clone());
+    self
+      .each_alternative(left, names, step)
+      .then(move |resolver, flow| {
+        let (right, join) = split.resume(flow);
+        resolver
+          .each_alternative(right, right_names, right_step)
+          .then(move |_, right| Task::Done(join(right)))
+      })
   }
 
   fn eval_syntax(
@@ -290,6 +299,7 @@ impl<'a> Resolver<'a> {
       &redirects.into_iter().collect::<Vec<_>>(),
       source,
       &mut env,
+      false,
     );
     Task::sequence(redirects.into_iter().chain(body).collect(), env, frame)
       .then(move |_, mut flow| {

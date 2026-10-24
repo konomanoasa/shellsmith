@@ -371,7 +371,9 @@ pub(super) struct ReadOptions {
   pub delimiter: bool,
 }
 
-/// Returns `None` if options leave operand positions uncertain.
+/// Returns `None` if options leave operand positions uncertain or no var
+/// operand follows them (XCU read requires one; shells accepting none choose
+/// the variables they assign).
 pub(super) fn read_options(args: &[Argument<'_>]) -> Option<ReadOptions> {
   let mut options = ReadOptions {
     operands: 0,
@@ -410,7 +412,7 @@ pub(super) fn read_options(args: &[Argument<'_>]) -> Option<ReadOptions> {
       }
     }
   }
-  Some(options)
+  (options.operands < args.len()).then_some(options)
 }
 
 fn decimal_operand<'a>(args: &'a [Argument<'_>]) -> Option<&'a [u8]> {

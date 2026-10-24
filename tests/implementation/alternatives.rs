@@ -69,6 +69,37 @@ fn restricting_nested_choices_preserves_unselected_branches_and_shares_results()
 }
 
 #[test]
+fn rejoining_split_sides_restores_ordered_decisions_without_new_choices() {
+  let assign = |env: &mut Environment, name: &[u8], value: &[u8]| {
+    env.assign(
+      name,
+      alternative(Alternative::External),
+      Value::Literal(value.to_vec()),
+    );
+  };
+  let mut env = Environment::new(&InitialEnvironment::empty());
+  let mut other = env.clone();
+  assign(&mut env, b"a", b"1");
+  assign(&mut env, b"d", b"x");
+  assign(&mut other, b"a", b"2");
+  assign(&mut other, b"d", b"y");
+  env.join(&other);
+  let mut replaced = env.clone();
+  assign(&mut replaced, b"d", b"z");
+  env.join(&replaced);
+  let choices = env.alternatives.decisions.borrow().next;
+  let read = BTreeSet::from([StateKey::Variable(b"a".to_vec())]);
+  let choice = env.alternatives.choice(&read).unwrap();
+  let (low, split) = Alternatives::split(env.clone(), choice);
+  assert_eq!(low.alternatives.choice(&read), None);
+  let (high, join) = split.resume(Flow::next(low));
+  assert_eq!(high.alternatives.choice(&read), None);
+  let joined = join(Flow::next(high)).into_iter().next().unwrap().1;
+  assert_eq!(joined.alternatives, env.alternatives);
+  assert_eq!(joined.alternatives.decisions.borrow().next, choices);
+}
+
+#[test]
 fn widening_keeps_shared_decisions_without_creating_choices_and_forgets_replaced_names()
  {
   let mut left = Environment::new(&InitialEnvironment::empty());

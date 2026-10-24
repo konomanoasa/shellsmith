@@ -4,7 +4,7 @@ mod documents {
   use shellsmith::interface::application::engine::{
     DependencyState, Modifier, SemanticKind,
   };
-  use shellsmith::interface::application::{Application, Settings};
+  use shellsmith::interface::application::{Application, Error, Settings};
   use std::sync::atomic::AtomicBool;
 
   #[test]
@@ -481,6 +481,30 @@ mod documents {
     );
   }
 
+  #[cfg(unix)]
+  #[test]
+  fn open_documents_keep_their_identity_after_the_path_becomes_a_link() {
+    let fixture = Fixture::new();
+    let lib = fixture.write("lib.sh", "disk=1\n");
+    let other = fixture.write("other.sh", "other=1\n");
+    let cancel = AtomicBool::new(false);
+    let settings = Settings::new(fixture.root.clone());
+    let mut app = Application::new(settings).unwrap();
+    app.open(&lib, "opened=1\n", &cancel).unwrap();
+    std::fs::remove_file(&lib).unwrap();
+    std::os::unix::fs::symlink(&other, &lib).unwrap();
+    app.change(&lib, "edited=1\n", &cancel).unwrap();
+    assert_eq!(app.workspace().symbols_named(b"edited").count(), 1);
+    app.close(&lib, &cancel).unwrap();
+    let names: Vec<_> = app
+      .workspace()
+      .symbols()
+      .map(|symbol| symbol.name.as_slice())
+      .collect();
+    assert_eq!(names, [b"other".as_slice()]);
+    assert_eq!(app.document_id(&lib), app.document_id(&other));
+  }
+
   #[test]
   fn source_paths_cannot_traverse_files_or_missing_directories() {
     let fixture = Fixture::new();
@@ -556,7 +580,7 @@ mod documents {
     std::fs::remove_file(library).unwrap();
     app.refresh(&cancel).unwrap();
     assert!(
-      matches!(app.document_symbols(removed), Err(shellsmith::interface::application::Error::Engine(shellsmith::interface::application::engine::Error::UnknownDocument(missing))) if missing == removed)
+      matches!(app.document_symbols(removed), Err(Error::Engine(shellsmith::interface::application::engine::Error::UnknownDocument(missing))) if missing == removed)
     );
     assert_eq!(app.workspace_symbols("library").count(), 0);
   }
@@ -592,6 +616,55 @@ mod documents {
       );
     }
     assert_eq!(app.failures(), []);
+  }
+
+  #[test]
+  fn opened_text_replaces_unreadable_files_while_closed_ones_remain_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let main = fixture.write("main.sh", "value=1; : \"$value\"");
+    let locked = fixture.write("locked.sh", "disk=1");
+    let notes = fixture.write("notes", "text");
+    let permissions = std::fs::Permissions::from_mode;
+    for path in [&locked, &notes] {
+      std::fs::set_permissions(path, permissions(0o000)).unwrap();
+    }
+    if std::fs::read(&locked).is_ok() {
+      // Permissions do not restrict this user.
+      return;
+    }
+    let failed = |app: &Application| {
+      app
+        .failures()
+        .iter()
+        .map(|failure| failure.path.clone())
+        .collect::<Vec<_>>()
+    };
+    let cancel = AtomicBool::new(false);
+    let mut app =
+      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    app.add_input(&fixture.root);
+    app.open(&locked, "live=1", &cancel).unwrap();
+    app.refresh(&cancel).unwrap();
+    assert_eq!(failed(&app), [notes.as_path()]);
+    assert!(matches!(
+      app.prepare_rename(&main, 0, &cancel),
+      Err(Error::RenameRefused(_))
+    ));
+    std::fs::set_permissions(&notes, permissions(0o644)).unwrap();
+    app.refresh(&cancel).unwrap();
+    assert_eq!(app.failures(), []);
+    assert_eq!(app.document_id(&notes), None);
+    let id = app.document_id(&locked).unwrap();
+    assert_eq!(app.workspace().document(id).unwrap().source(), "live=1");
+    assert!(app.prepare_rename(&main, 0, &cancel).unwrap().is_some());
+    assert!(app.close(&locked, &cancel).is_err());
+    assert_eq!(app.document_id(&locked), None);
+    assert!(matches!(
+      app.prepare_rename(&main, 0, &cancel),
+      Err(Error::RenameRefused(_))
+    ));
+    assert_eq!(failed(&app), [locked]);
   }
 
   #[test]
@@ -702,6 +775,7 @@ mod documents {
           )
         })
         .await
+        .result
         .unwrap()
     }
 
@@ -1787,9 +1861,159 @@ mod session {
   use shellsmith::interface::application::{
     Error, RequestScope, Session, Settings,
   };
+  use std::path::{Path, PathBuf};
   use std::sync::atomic::Ordering;
   use std::time::Duration;
   use tokio::sync::oneshot;
+
+  #[test]
+  fn position_queries_keep_the_original_text_after_rejected_reload_and_retry() {
+    use shellsmith::interface::application::Application;
+    use std::sync::atomic::AtomicBool;
+    for operation in ["definition", "references", "prepare", "rename"] {
+      let fixture = Fixture::new();
+      let original = "first=1; : $first\n";
+      let path = fixture.write("main.sh", original);
+      let mut app =
+        Application::new(Settings::new(fixture.root.clone())).unwrap();
+      app.add_input(&fixture.root);
+      let cancelled = AtomicBool::new(false);
+      app.refresh(&cancelled).unwrap();
+      let query = |app: &mut Application, offset| match operation {
+        "definition" => app
+          .definitions(app.document_id(&path).unwrap(), offset, &cancelled)
+          .map(|sites| sites.len()),
+        "references" => app
+          .references(&path, offset, true, &cancelled)
+          .map(|sites| sites.len()),
+        "prepare" => app
+          .prepare_rename(&path, offset, &cancelled)
+          .map(|target| usize::from(target.is_some())),
+        _ => app
+          .rename(&path, offset, "renamed", &cancelled)
+          .map(|edits| edits.len()),
+      };
+      assert!(query(&mut app, 0).unwrap() > 0, "{operation}");
+      fixture.write("main.sh", "other=2; first=1; : $first\n");
+      for _ in 0..2 {
+        assert!(
+          matches!(query(&mut app, 0), Err(Error::Superseded)),
+          "{operation}"
+        );
+        assert_eq!(
+          app
+            .workspace()
+            .document(app.document_id(&path).unwrap())
+            .unwrap()
+            .source(),
+          original,
+          "{operation}"
+        );
+      }
+      app.refresh(&cancelled).unwrap();
+      assert!(query(&mut app, 9).unwrap() > 0, "{operation}");
+    }
+  }
+
+  #[tokio::test]
+  async fn position_requests_refresh_other_inputs_and_membership_before_answering()
+   {
+    for (operation, expected) in [
+      ("definition", [1, 1, 1]),
+      ("references", [1, 2, 3]),
+      ("prepare", [1, 1, 1]),
+      ("rename", [2, 3, 4]),
+    ] {
+      let fixture = Fixture::new();
+      let source = ". ./lib.sh\nf\n";
+      let path = fixture.write("main.sh", source);
+      fixture.write("lib.sh", "f() { :; }\n");
+      let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+      session.add_input(&fixture.root).unwrap();
+      let query = || {
+        let path = path.clone();
+        let scope = if operation == "definition" {
+          RequestScope::Results(path.clone())
+        } else {
+          RequestScope::Names(path.clone())
+        };
+        session.request(scope, move |app, cancelled| {
+          let offset = source.rfind('f').unwrap();
+          match operation {
+            "definition" => app
+              .definitions(app.document_id(&path).unwrap(), offset, cancelled)
+              .map(|sites| sites.len()),
+            "references" => app
+              .references(&path, offset, false, cancelled)
+              .map(|sites| sites.len()),
+            "prepare" => app
+              .prepare_rename(&path, offset, cancelled)
+              .map(|target| usize::from(target.is_some())),
+            _ => app
+              .rename(&path, offset, "renamed", cancelled)
+              .map(|edits| edits.len()),
+          }
+        })
+      };
+      assert_eq!(query().await.result.unwrap(), expected[0], "{operation}");
+      fixture.write("lib.sh", "f() { :; }; f\n");
+      assert_eq!(query().await.result.unwrap(), expected[1], "{operation}");
+      fixture.write("added.sh", source);
+      assert_eq!(query().await.result.unwrap(), expected[2], "{operation}");
+    }
+  }
+
+  #[tokio::test]
+  async fn requests_reject_changes_after_preparation_without_reloading_during_the_operation()
+   {
+    let fixture = Fixture::new();
+    let source = ". ./lib.sh\nf\n";
+    let main = fixture.write("main.sh", source);
+    let library = fixture.write("lib.sh", "f() { :; }\n");
+    for scope in [
+      RequestScope::Analysis(main.clone()),
+      RequestScope::Document(main.clone()),
+      RequestScope::Results(main.clone()),
+      RequestScope::Names(main.clone()),
+      RequestScope::Workspace,
+      RequestScope::WorkspaceAnalysis,
+    ] {
+      let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+      session.add_input(&fixture.root).unwrap();
+      let main = main.clone();
+      let library = library.clone();
+      let operation_scope = scope.clone();
+      let outcome = session
+        .request(scope.clone(), move |app, cancelled| {
+          let changed = if matches!(operation_scope, RequestScope::Document(_))
+          {
+            &main
+          } else {
+            &library
+          };
+          let text = std::fs::read_to_string(changed).unwrap();
+          std::fs::write(changed, format!("\n{text}")).unwrap();
+          let id = app.document_id(&main).unwrap();
+          match operation_scope {
+            RequestScope::Analysis(_) => {
+              app.classify(id, cancelled).map(|_| ())
+            }
+            RequestScope::Results(_) => app
+              .definitions(id, source.rfind('f').unwrap(), cancelled)
+              .map(|_| ()),
+            RequestScope::Names(_) => app
+              .references(&main, source.rfind('f').unwrap(), false, cancelled)
+              .map(|_| ()),
+            _ => Ok(()),
+          }
+        })
+        .await;
+      assert!(
+        matches!(outcome.result, Err(Error::Superseded)),
+        "{scope:?}: {outcome:?}"
+      );
+    }
+  }
 
   #[tokio::test]
   async fn changed_inputs_cancel_workers_and_preserve_the_current_overlay() {
@@ -1813,7 +2037,7 @@ mod session {
       .set_overlay(&path, Some("current=2".into()))
       .unwrap();
     release.send(()).unwrap();
-    assert!(matches!(old.await.unwrap(), Err(Error::Superseded)));
+    assert!(matches!(old.await.unwrap().result, Err(Error::Superseded)));
     let current = session
       .request(RequestScope::Workspace, move |application, _| {
         let id = application.document_id(&path).unwrap();
@@ -1827,6 +2051,7 @@ mod session {
         )
       })
       .await
+      .result
       .unwrap();
     assert_eq!(current, "current=2");
   }
@@ -1862,13 +2087,14 @@ mod session {
     assert!(cancelled.await.unwrap_err().is_cancelled());
     release.send(()).unwrap();
     assert!(stop.await.unwrap());
-    assert_eq!(independent.await.unwrap(), 1024);
+    assert_eq!(independent.await.result.unwrap(), 1024);
     assert_eq!(
       session
         .request(RequestScope::Workspace, |application, _| Ok(
           application.settings().limits.value_bytes
         ))
         .await
+        .result
         .unwrap(),
       1024
     );
@@ -1890,7 +2116,7 @@ mod session {
     start.await.unwrap();
     drop(session);
     release.send(()).unwrap();
-    assert!(matches!(task.await.unwrap(), Err(Error::Superseded)));
+    assert!(matches!(task.await.unwrap().result, Err(Error::Superseded)));
   }
 
   #[tokio::test]
@@ -1918,8 +2144,50 @@ mod session {
           Ok(application.workspace().documents().count())
         });
       let (first, second) = tokio::join!(first, second);
-      assert_eq!(first.unwrap(), 1);
-      assert_eq!(second.unwrap(), 1);
+      assert_eq!(first.result.unwrap(), 1);
+      assert_eq!(second.result.unwrap(), 1);
+    }
+  }
+
+  #[tokio::test]
+  async fn rename_verification_keeps_document_revisions_for_later_requests() {
+    let fixture = Fixture::new();
+    let source = "value=1; : \"$value\"\n";
+    let main = fixture.write("main.sh", source);
+    for opened in [false, true] {
+      let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+      if opened {
+        session.set_overlay(&main, Some(source.into())).unwrap();
+      } else {
+        session.add_input(&fixture.root).unwrap();
+      }
+      let analyze = || {
+        let path = main.clone();
+        session.request(
+          RequestScope::Analysis(main.clone()),
+          move |application, cancelled| {
+            let id = application.document_id(&path).unwrap();
+            let document = application.workspace().document(id).unwrap();
+            let snapshot = document.snapshot();
+            application.classify(id, cancelled)?;
+            Ok(snapshot)
+          },
+        )
+      };
+      let before = analyze().await.result.unwrap();
+      let path = main.clone();
+      let edits = session
+        .request(
+          RequestScope::Names(main.clone()),
+          move |application, cancelled| {
+            application.rename(&path, 0, "renamed", cancelled)
+          },
+        )
+        .await
+        .result
+        .unwrap();
+      assert_eq!(edits.len(), 2);
+      assert_eq!(analyze().await.result.unwrap(), before);
     }
   }
 
@@ -1939,12 +2207,13 @@ mod session {
           Err::<(), _>(Error::Message("test operation failure".into()))
         })
         .await;
-      assert!(matches!(result, Err(Error::Message(_))));
+      assert!(matches!(result.result, Err(Error::Message(_))));
       let actual = session
         .request(RequestScope::Workspace, |application, _| {
           Ok(application.settings().limits.value_bytes)
         })
         .await
+        .result
         .unwrap();
       assert_eq!(actual, 1024);
     }
@@ -1961,15 +2230,130 @@ mod session {
       session.request(RequestScope::Analysis(path.clone()), |_, _| Ok(()));
     let (first, second) = tokio::join!(first, second);
     for result in [first, second] {
+      assert_eq!(result.failures.len(), 1);
+      assert_eq!(result.failures[0].path, path);
       assert!(
-        matches!(result, Err(Error::Message(message)) if message.contains("Cannot load"))
+        matches!(result.result, Err(Error::Message(message)) if message.contains("Cannot load"))
       );
     }
     fixture.write("missing.sh", "value=1\n");
     session
       .request(RequestScope::Analysis(path.clone()), |_, _| Ok(()))
       .await
+      .result
       .unwrap();
+  }
+
+  #[tokio::test]
+  async fn requests_after_an_edit_recheck_unwatched_inputs_before_collecting() {
+    let fixture = Fixture::new();
+    let main = fixture.write("main.sh", "f\n");
+    let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+    session.add_input(&fixture.root).unwrap();
+    let definitions = |offset| {
+      let main = main.clone();
+      session.request(
+        RequestScope::Results(main.clone()),
+        move |app, cancelled| {
+          let id = app.document_id(&main).unwrap();
+          let definitions = app.definitions(id, offset, cancelled)?;
+          Ok(
+            definitions
+              .iter()
+              .map(|location| app.path(location.snapshot.document).unwrap())
+              .map(Path::to_path_buf)
+              .collect::<Vec<_>>(),
+          )
+        },
+      )
+    };
+    assert_eq!(definitions(0).await.result.unwrap(), Vec::<PathBuf>::new());
+    let library = fixture.write("lib.sh", "f() { :; }\n");
+    session
+      .set_overlay(&main, Some(". ./lib.sh\nf\n".into()))
+      .unwrap();
+    assert_eq!(definitions(11).await.result.unwrap(), [library]);
+  }
+
+  #[tokio::test]
+  async fn definition_requests_recheck_a_retained_workspace_against_unwatched_changes()
+   {
+    for (name, text, expected) in [
+      ("new.sh", "g() { :; }\n", 0..1),
+      ("lib.sh", "\nf() { :; }\n", 1..2),
+    ] {
+      let fixture = Fixture::new();
+      let main = fixture.write("main.sh", ". ./lib.sh\nf\n");
+      fixture.write("lib.sh", "f() { :; }\n");
+      let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+      session.add_input(&fixture.root).unwrap();
+      session
+        .request(RequestScope::Workspace, |app, _| {
+          Ok(app.workspace_symbols("").count())
+        })
+        .await
+        .result
+        .unwrap();
+      fixture.write(name, text);
+      let path = main.clone();
+      let definitions = session
+        .request(RequestScope::Results(main), move |app, cancelled| {
+          let id = app.document_id(&path).unwrap();
+          Ok(
+            app
+              .definitions(id, 11, cancelled)?
+              .into_iter()
+              .map(|location| location.bytes)
+              .collect::<Vec<_>>(),
+          )
+        })
+        .await;
+      assert_eq!(definitions.result.unwrap(), vec![expected], "{name}");
+    }
+  }
+
+  #[tokio::test]
+  async fn unwatched_changes_found_by_definition_requests_refresh_workspace_symbols()
+   {
+    let fixture = Fixture::new();
+    let main = fixture.write("main.sh", ". ./lib.sh\nf\n");
+    let other = fixture.write("other.sh", ". ./lib.sh\nf\n");
+    fixture.write("lib.sh", "f() { :; }\n");
+    let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+    session.add_input(&fixture.root).unwrap();
+    let symbols = || {
+      session.request(RequestScope::Workspace, |app, _| {
+        Ok(
+          app
+            .workspace_symbols("")
+            .map(|symbol| {
+              String::from_utf8(symbol.symbol.name.clone()).unwrap()
+            })
+            .collect::<Vec<_>>(),
+        )
+      })
+    };
+    let definitions = |path: PathBuf| {
+      session.request(
+        RequestScope::Results(path.clone()),
+        move |app, cancelled| {
+          let id = app.document_id(&path).unwrap();
+          Ok(app.definitions(id, 11, cancelled)?.len())
+        },
+      )
+    };
+    assert_eq!(definitions(main.clone()).await.result.unwrap(), 1);
+    assert_eq!(symbols().await.result.unwrap(), ["f"]);
+    fixture.write("lib.sh", "f() { :; }\ng() { :; }\n");
+    assert_eq!(definitions(main.clone()).await.result.unwrap(), 1);
+    assert_eq!(symbols().await.result.unwrap(), ["f", "g"]);
+    assert_eq!(definitions(main.clone()).await.result.unwrap(), 1);
+    fixture.write("lib.sh", "f() { :; }\nh() { :; }\n");
+    assert_eq!(definitions(other).await.result.unwrap(), 1);
+    assert_eq!(symbols().await.result.unwrap(), ["f", "h"]);
+    fixture.write("lib.sh", "f() { :; }\nk() { :; }\n");
+    assert_eq!(definitions(main).await.result.unwrap(), 1);
+    assert_eq!(symbols().await.result.unwrap(), ["f", "k"]);
   }
 
   #[tokio::test]
@@ -2002,15 +2386,15 @@ mod session {
         assert_eq!(app.workspace().documents().count(), 2);
         assert_eq!(app.failures(), []);
         assert_ne!(app.classify(id, cancelled)?, []);
-        assert_eq!(app.document_links(id, cancelled)?.len(), 1);
         Ok(())
       });
     let result = tokio::time::timeout(Duration::from_secs(5), document).await;
     release.send(()).unwrap();
     result
       .expect("document must finish while the index worker is occupied")
+      .result
       .unwrap();
-    index.await.unwrap().unwrap();
+    index.await.unwrap().result.unwrap();
   }
 }
 
@@ -2138,7 +2522,7 @@ mod sources {
   }
 
   #[test]
-  fn source_annotations_prefer_known_paths_and_do_not_hide_invalid_calls_or_failures()
+  fn source_annotations_follow_cst_boundaries_and_prefer_known_paths_without_hiding_call_failures()
    {
     let fixture = Fixture::new();
     let library = fixture.write("lib.sh", ":\n");
@@ -2152,7 +2536,9 @@ mod sources {
       (". -- ''", None),
       (". $path", None),
       (". \"$@\"", None),
-      (". \"$path\" >", None),
+      (". \"$path\" \"${}\"", None),
+      (". \"$path\" >", Some(&library)),
+      (". \"$path\"; >", Some(&library)),
       ("printf '%s' \"$path\"", None),
       ("\"$command\" \"$path\"", None),
       (". \"$path\"", Some(&library)),
@@ -3995,6 +4381,16 @@ mod references {
   fn references_preserve_namespaces_environments_and_certain_inheritance() {
     for (source, query, expected) in [
       (
+        "value=1; read name; read \"$name\"; value=2 read result <\"$(: \"$value\")\"; : \"$value\"",
+        "value=1",
+        vec![2, 3],
+      ),
+      (
+        "value=1; read name; read \"$name\"; value=2 read result <\"$(: \"$value\")\"; : \"$value\"",
+        "value=2",
+        vec![],
+      ),
+      (
         "value=1; value() { :; }; value; : \"$value\"",
         "value=1",
         vec![3],
@@ -4228,11 +4624,177 @@ mod references {
   }
 
   #[test]
+  fn references_inherit_names_from_unknown_parent_bindings() {
+    for (source, name, query, expected) in [
+      (
+        "value=1; . ./missing.sh; (: \"$value\")",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; . ./missing.sh; ( (: \"$value\") )",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; . ./missing.sh; : \"$(: \"$value\")\"",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; . ./missing.sh; : \"$value\" &",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; . ./missing.sh; : \"$value\" | :",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; if condition; then . ./missing.sh; fi; (: \"$value\")",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; read name; read \"$name\"; (: \"$value\")",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; read name; read \"$name\"; value=2; (: \"$value\")",
+        "value",
+        "value=1",
+        vec![2],
+      ),
+      (
+        ". ./missing.sh; : \"$value\"; (: \"$value\")",
+        "value",
+        "value",
+        vec![0, 1],
+      ),
+      (
+        "work() { :; }; . ./missing.sh; (unset -f work)",
+        "work",
+        "work()",
+        vec![1],
+      ),
+    ] {
+      assert_references(source, name, query, false, &expected);
+    }
+  }
+
+  #[test]
+  fn references_keep_names_whose_reaching_definitions_are_uncertain() {
+    for (source, name, query, expected) in [
+      (
+        "work() { :; }; . ./missing.sh; (work)",
+        "work",
+        "work()",
+        vec![],
+      ),
+      (
+        "value=1; f() { read name; read \"$name\"; (: \"$value\"); }; f",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; f() { read name; read \"$name\"; (: \"$value\"); }; value=2 f; : \"$value\"",
+        "value",
+        "value=1",
+        vec![1, 3],
+      ),
+      (
+        "value=1; f() { read name; read \"$name\"; (: \"$value\"); }; value=2 f; : \"$value\"",
+        "value",
+        "value=2",
+        vec![1, 3],
+      ),
+      (
+        "value=1; . ./missing.sh; (. ./another.sh; : \"$value\"); : \"$value\"",
+        "value",
+        "value=1",
+        vec![2],
+      ),
+      (
+        "value=1; . ./missing.sh; (if condition; then value=2; fi; : \"$value\"); : \"$value\"",
+        "value",
+        "value=1",
+        vec![3],
+      ),
+      (
+        "value=1; (: \"$value\"); . ./missing.sh",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; . ./missing.sh; : \"$value\"",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        ". ./missing.sh; value=2; : \"$value\"",
+        "value",
+        "value=2",
+        vec![1],
+      ),
+      (
+        "read -r name; value=1; read -r \"$name\"; : \"$value\"",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; trap ': \"$value\"' EXIT; value=2",
+        "value",
+        "value=1",
+        vec![1],
+      ),
+      (
+        "value=1; (trap ': \"$value\"' EXIT; value=2)",
+        "value",
+        "value=1",
+        vec![],
+      ),
+      (
+        "value=1; (trap ': \"$value\"' EXIT; value=2)",
+        "value",
+        "value=2",
+        vec![],
+      ),
+      (
+        "work() { :; }; . ./missing.sh; unset -f work; work",
+        "work",
+        "work()",
+        vec![1],
+      ),
+      (
+        "value=1; (. ./missing.sh; : \"$value\"); : \"$value\"",
+        "value",
+        "value=1",
+        vec![2],
+      ),
+    ] {
+      assert_references(source, name, query, false, &expected);
+    }
+  }
+
+  #[test]
   fn references_keep_uses_before_an_unreadable_source_and_refresh_after_repair()
   {
     let fixture = Fixture::new();
-    let path = fixture
-      .write("main.sh", "value=1; : \"$value\"; . ./broken; : \"$value\"");
+    let path =
+      fixture.write("main.sh", "work() { :; }; work; . ./broken; work");
     std::fs::write(fixture.root.join("broken"), [0xff]).unwrap();
     let mut app =
       Application::new(Settings::new(fixture.root.clone())).unwrap();
@@ -4243,16 +4805,30 @@ mod references {
         .iter()
         .map(|location| (location.bytes.start, location.bytes.end))
         .collect::<Vec<_>>(),
-      [(13, 18)]
+      [(15, 19)]
     );
     assert_eq!(app.failures().len(), 1);
     assert_eq!(app.references(&path, 0, false, &cancel).unwrap(), result);
     fixture.write("broken", ":");
-    assert!(matches!(
-      app.references(&path, 0, false, &cancel),
-      Err(Error::Superseded)
-    ));
     assert_eq!(app.references(&path, 0, false, &cancel).unwrap().len(), 2);
+  }
+
+  #[test]
+  fn classification_discards_stale_workspace_results_without_rejecting_preparation_changes()
+   {
+    let fixture = Fixture::new();
+    let main = fixture.write("main.sh", "f() { :; }; f\n");
+    fixture.write("other.sh", "x=1\n");
+    let mut app =
+      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    app.add_input(&fixture.root);
+    let cancel = AtomicBool::new(false);
+    app.refresh(&cancel).unwrap();
+    let id = app.document_id(&main).unwrap();
+    app.definitions(id, 0, &cancel).unwrap();
+    let tokens = app.classify(id, &cancel).unwrap();
+    fixture.write("other.sh", "x=2\n");
+    assert_eq!(app.classify(id, &cancel).unwrap(), tokens);
   }
 
   #[test]
@@ -4275,10 +4851,6 @@ mod references {
       ));
     }
     fixture.write("broken.sh", "other=1");
-    assert!(matches!(
-      app.references(&main, 0, false, &cancel),
-      Err(Error::Superseded)
-    ));
     assert_eq!(app.references(&main, 0, false, &cancel).unwrap().len(), 1);
     assert_eq!(app.failures(), []);
     assert!(
@@ -4904,9 +5476,52 @@ mod rename {
         "value",
         "value=1; unset value; : \"$value\"",
       ),
+      (
+        "fo\\\no=1; : \"$fo\\\no\" ${fo\\\no} $((fo\\\no + 1)); for fo\\\no in a; do :; done; : $foo",
+        "fo\\\no=",
+        "value",
+        "value=1; : \"$value\" ${value} $((value + 1)); for value in a; do :; done; : $value",
+      ),
+      (
+        "f\\\nn() { :; }; f\\\nn; fn",
+        "f\\\nn()",
+        "run",
+        "run() { :; }; run; run",
+      ),
     ] {
       assert_renamed(source, query, new_name, expected);
     }
+  }
+
+  #[test]
+  fn rename_replaces_trap_body_words_only_through_verbatim_source_ranges() {
+    for (source, query, new_name, expected) in [
+      (
+        "xy=1; trap ': \"$x\\\ny\"' EXIT; : \"$xy\"",
+        "xy=1",
+        "value",
+        "value=1; trap ': \"$value\"' EXIT; : \"$value\"",
+      ),
+      (
+        "f\\\nn() { :; }; trap 'f\\\nn' EXIT",
+        "f\\\nn()",
+        "run",
+        "run() { :; }; trap 'run' EXIT",
+      ),
+      (
+        "fun() { :; }; trap 'f\"u\"n' EXIT",
+        "fun()",
+        "run",
+        "run() { :; }; trap 'run' EXIT",
+      ),
+    ] {
+      assert_renamed(source, query, new_name, expected);
+    }
+    assert_rename_refused(
+      "work() { :; }; trap 'wo'\"rk\" EXIT",
+      "work()",
+      "run",
+    );
   }
 
   #[test]
@@ -5049,6 +5664,18 @@ mod rename {
         "y",
         "y=1; n=2; f() { : $((y+$n)); }; f",
       ),
+      (
+        "run() { :; }; cat <<EOF\n$x\\\ny\nEOF\nrun",
+        "run()",
+        "launch",
+        "launch() { :; }; cat <<EOF\n$x\\\ny\nEOF\nlaunch",
+      ),
+      (
+        "run() { :; }; : `x\\\\\ny=2`; run",
+        "run()",
+        "launch",
+        "launch() { :; }; : `x\\\\\ny=2`; launch",
+      ),
     ] {
       assert_renamed(source, query, new_name, expected);
     }
@@ -5190,6 +5817,10 @@ mod rename {
       ("x=1; f() { : $(($(printf x))); }", "x=1", "y"),
       ("x=1; f() { : $((x+$n)); }", "x=1", "y"),
       ("x=1; f() { : `printf '%s' \"$x\"`; }", "x=1", "y"),
+      ("x=1; cat <<EOF\n$x\\\ny\nEOF\n: $x", "x=1", "xy"),
+      ("x=1; cat <<EOF\n$((x\\\ny))\nEOF\n: $x", "x=1", "xy"),
+      ("x=1; : `echo $x\\\\\ny`; : $x", "x=1", "xy"),
+      ("x=1; f() { cat <<EOF\n$x\\\ny\nEOF\n}; : $x", "x=1", "xy"),
       ("x=1; f() { : $x; }", "x=1", "y"),
       ("x=1; f() { read x; }", "x=1", "y"),
       ("x=1; f() { . ./unknown; }", "x=1", "y"),
@@ -5431,6 +6062,83 @@ mod rename {
   }
 
   #[test]
+  fn rename_refuses_unknown_sources_in_other_entries_without_inventing_name_relations()
+   {
+    for (library_text, use_text) in
+      [("value=1\n", ": \"$value\""), ("value() { :; }\n", "value")]
+    {
+      for source in [
+        format!(". ./missing.sh; . ./lib.sh; {use_text}"),
+        format!("read config; . \"$config\"; . ./lib.sh; {use_text}"),
+        format!("read action; \"$action\"; . ./lib.sh; {use_text}"),
+        ". ./missing.sh".into(),
+        "(. ./missing.sh)".into(),
+        ". ./missing.sh &".into(),
+        "read args; idle() { command $args; }".into(),
+        "idle() { . ./missing.sh; }".into(),
+      ] {
+        let fixture = Fixture::new();
+        fixture.write("a.sh", &source);
+        let caller = fixture.write("b.sh", &format!(". ./lib.sh; {use_text}"));
+        let library = fixture.write("lib.sh", library_text);
+        let mut app = application(&fixture);
+        app.add_input(&fixture.root);
+        let cancel = AtomicBool::new(false);
+        let uses = app.references(&library, 0, false, &cancel).unwrap();
+        assert_eq!(uses.len(), 1, "{source}");
+        assert_eq!(app.path(uses[0].snapshot.document), Some(caller.as_path()));
+        assert!(
+          matches!(
+            app.prepare_rename(&library, 0, &cancel),
+            Err(Error::RenameRefused(_))
+          ),
+          "{source}"
+        );
+        assert!(
+          matches!(
+            app.rename(&library, 0, "renamed", &cancel),
+            Err(Error::RenameRefused(_))
+          ),
+          "{source}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn rename_accepts_complete_sources_and_unrelated_state_uncertainty_in_other_entries()
+   {
+    for source in [
+      ". ./other.sh; : \"$value\"",
+      "read value; : \"$value\"",
+      "read key; read \"$key\"",
+      "read directory; cd \"$directory\"",
+      "idle() { : \"$other\"; }",
+      "idle() { command -v .; }",
+      "read tool; \"/bin/$tool\"",
+    ] {
+      let fixture = Fixture::new();
+      fixture.write("a.sh", source);
+      fixture.write("other.sh", "value=other\n");
+      let caller = fixture.write("b.sh", ". ./lib.sh; : \"$value\"");
+      let library = fixture.write("lib.sh", "value=1\n");
+      let mut app = application(&fixture);
+      app.add_input(&fixture.root);
+      let cancel = AtomicBool::new(false);
+      assert!(
+        app.prepare_rename(&library, 0, &cancel).unwrap().is_some(),
+        "{source}"
+      );
+      let edits = app.rename(&library, 0, "renamed", &cancel).unwrap();
+      let paths: Vec<_> = edits
+        .iter()
+        .map(|edit| app.path(edit.location.snapshot.document).unwrap())
+        .collect();
+      assert_eq!(paths, [caller.as_path(), library.as_path()], "{source}");
+    }
+  }
+
+  #[test]
   fn rename_handles_multiple_complete_function_definitions_and_external_sources()
    {
     let fixture = Fixture::new();
@@ -5483,6 +6191,11 @@ mod rename {
     ));
     assert!(matches!(
       app.rename(&path, 0, "y", &cancel),
+      Err(Error::Superseded)
+    ));
+    app.refresh(&cancel).unwrap();
+    assert!(matches!(
+      app.rename(&path, 0, "y", &cancel),
       Err(Error::RenameRefused(_))
     ));
     app.open(&path, "x=1; : $x", &cancel).unwrap();
@@ -5517,9 +6230,9 @@ mod rename {
         })
         .await;
       if repaired {
-        assert_eq!(result.unwrap().len(), 2);
+        assert_eq!(result.result.unwrap().len(), 2);
       } else {
-        assert!(matches!(result, Err(Error::RenameRefused(_))));
+        assert!(matches!(result.result, Err(Error::RenameRefused(_))));
       }
     }
   }
@@ -5710,10 +6423,6 @@ mod rename {
     );
     app.prepare_rename(&library, 0, &cancel).unwrap();
     let added = fixture.write("caller.sh", ". ./lib.sh; : $x");
-    assert!(matches!(
-      app.rename(&library, 0, "y", &cancel),
-      Err(Error::Superseded)
-    ));
     let edits = app.rename(&library, 0, "y", &cancel).unwrap();
     assert_eq!(edits.len(), 3);
     assert!(

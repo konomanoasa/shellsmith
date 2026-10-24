@@ -58,7 +58,6 @@ impl<'a> Resolver<'a> {
     node: Node<'a>,
     env: &Environment,
     frame: Frame,
-    parameter: bool,
     reads: &mut BTreeSet<OccurrenceId>,
   ) -> Result<Option<ValueId>, Error> {
     let Some(id) = self.site(node, frame) else {
@@ -70,8 +69,7 @@ impl<'a> Resolver<'a> {
     let source = self.workspace.source(frame.snapshot.document);
     let name = word::lexical(node, source);
     if !valid_name(&name)
-      || (parameter
-        && env.nounset != Some(false)
+      || (env.nounset != Some(false)
         && env
           .variables
           .get(&name)
@@ -121,7 +119,7 @@ impl<'a> Resolver<'a> {
             return Ok(None);
           };
           let Some(value) =
-            self.conditional_variable(parameter, env, frame, true, reads)?
+            self.conditional_variable(parameter, env, frame, reads)?
           else {
             return Ok(None);
           };
@@ -129,14 +127,14 @@ impl<'a> Resolver<'a> {
             if operator.kind() != "parameter_length_operator" {
               return Ok(None);
             }
-            let Some(width) = env.alternatives.expressions().ascii_width(value)
+            let Some(length) = env
+              .alternatives
+              .expressions()
+              .ascii_length(value, self.cancelled)?
             else {
               return Ok(None);
             };
-            env
-              .alternatives
-              .expressions()
-              .literal(Arc::new(Value::Literal(width.to_string().into_bytes())))
+            length
           } else {
             value
           }
@@ -144,7 +142,7 @@ impl<'a> Resolver<'a> {
         _ => return Ok(None),
       };
       let mut values = env.alternatives.expressions();
-      let Some(combined) = values.concat(result, next) else {
+      let Some(combined) = values.concat(result, next, self.cancelled)? else {
         return Ok(None);
       };
       if values
@@ -179,7 +177,7 @@ impl<'a> Resolver<'a> {
           )))))),
         "arithmetic_variable" => {
           let Some(input) =
-            self.conditional_variable(node, env, frame, false, reads)?
+            self.conditional_variable(node, env, frame, reads)?
           else {
             return Ok(None);
           };

@@ -8,11 +8,20 @@ impl Application {
     id: DocumentId,
     cancelled: &AtomicBool,
   ) -> Result<Vec<engine::SemanticSpan>, Error> {
-    self.analyze_document(id, cancelled)?;
-    if let Some(analyses) = &self.analyses {
-      if !self.analysis_inputs_current(analyses, cancelled)? {
+    if !self.inputs_current(cancelled)? {
+      if self.request_prepared {
+        self.discard_results();
         return Err(Error::Superseded);
       }
+      let path = self
+        .path(id)
+        .ok_or(engine::Error::UnknownDocument(id))?
+        .to_path_buf();
+      self.refresh_for(Some(&path), cancelled)?;
+      self.discard_results();
+    }
+    self.analyze_document(id, cancelled)?;
+    let spans = if let Some(analyses) = &self.analyses {
       let snapshot = self
         .workspace
         .document(id)
@@ -25,6 +34,8 @@ impl Application {
       .map_err(Error::from)
     } else {
       self.workspace.semantic_spans(id).map_err(Error::from)
-    }
+    }?;
+    self.check_inputs(cancelled)?;
+    Ok(spans)
   }
 }

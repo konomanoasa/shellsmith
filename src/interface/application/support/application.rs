@@ -109,6 +109,9 @@ pub struct Application {
   pub(super) opened: BTreeMap<PathBuf, Arc<str>>,
   inputs: BTreeSet<PathBuf>,
   pub(super) failures: Vec<Failure>,
+  /// A recheck found inputs that changed after this state was prepared.
+  pub(super) outdated: bool,
+  pub(in crate::interface::application) request_prepared: bool,
   pub(super) documents: Arc<files::Documents>,
   pub(super) discovery: Arc<Discovery>,
   pub(super) cache: InputCache,
@@ -126,6 +129,8 @@ impl Application {
       opened: BTreeMap::new(),
       inputs: BTreeSet::new(),
       failures: Vec::new(),
+      outdated: false,
+      request_prepared: false,
       documents: Arc::default(),
       discovery: Arc::default(),
       cache: InputCache::default(),
@@ -179,6 +184,22 @@ impl Application {
   pub(super) fn document_path(&self, path: &Path) -> Result<PathBuf, Error> {
     files::ordinary(&self.settings.cwd.join(path), true)?;
     Ok(self.absolute(path))
+  }
+
+  /// Opened documents keep the identity resolved when they were opened.
+  pub(super) fn overlay_path(
+    &self,
+    path: &Path,
+    open: bool,
+  ) -> Result<PathBuf, Error> {
+    let joined = self.settings.cwd.join(path);
+    if self.opened.contains_key(&joined) {
+      Ok(joined)
+    } else if open {
+      self.document_path(path)
+    } else {
+      Ok(self.absolute(path))
+    }
   }
 
   pub(super) fn set_overlay(
@@ -242,7 +263,7 @@ impl Application {
     source: &str,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
-    let path = self.absolute(path);
+    let path = self.overlay_path(path, false)?;
     if !self.opened.contains_key(&path) {
       return Err(Error::Message("Document is not open".into()));
     }
@@ -251,16 +272,21 @@ impl Application {
     self.replace(&path, source.as_bytes(), cancelled)
   }
 
-  /// Discards the overlay even if reloading from disk fails.
+  /// Discards the overlay even if reloading from disk fails. A path that
+  /// now resolves elsewhere is no longer a document identity.
   pub fn close(
     &mut self,
     path: &Path,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
-    let path = self.absolute(path);
+    let path = self.overlay_path(path, false)?;
     self.set_overlay(path.clone(), None);
-    self.load(&path, cancelled)
+    let current = self.absolute(&path);
+    if current != path {
+      self.discard(&path);
+    }
+    self.load(&current, cancelled)
   }
 
   fn discard(&mut self, path: &Path) {
@@ -279,19 +305,20 @@ impl Application {
   ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
     if let Some(id) = self.document_id(path)
-      && self
+      && let Some(document) = self
         .workspace
-        .document(id)
-        .is_some_and(|document| document.source().as_bytes() == bytes)
+        .shared_document(id)
+        .filter(|document| document.source().as_bytes() == bytes)
     {
       self
         .workspace
         .index_document(id, self.settings.limits, cancelled)?;
+      self.cache.loaded.insert(path.to_path_buf(), Ok(document));
       return Ok(());
     }
     let result = self
       .documents
-      .parse_entry(&mut self.entries, path, bytes, cancelled)
+      .parse_entry(&mut self.entries, path, bytes, false, cancelled)
       .and_then(|document| {
         let snapshot = document.snapshot();
         self.workspace.insert_shared(document.clone())?;
@@ -317,10 +344,14 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     self.analyses = None;
-    let document =
-      self
-        .documents
-        .parse_entry(&mut self.entries, path, bytes, cancelled)?;
+    self.names = None;
+    let document = self.documents.parse_entry(
+      &mut self.entries,
+      path,
+      bytes,
+      true,
+      cancelled,
+    )?;
     self.cache.loaded.insert(path.to_path_buf(), Ok(document));
     Ok(())
   }
@@ -338,8 +369,14 @@ impl Application {
         Err(error.clone())
       }
     };
-    if result.is_err() {
+    self.failures.retain(|failure| failure.path != path);
+    if let Err(error) = &result {
       self.cache.record_failure(path.to_path_buf(), bytes);
+      check_cancelled(cancelled)?;
+      self.failures.push(Failure {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+      });
     }
     result
   }
@@ -348,7 +385,7 @@ impl Application {
   pub fn refresh(&mut self, cancelled: &AtomicBool) -> Result<(), Error> {
     self.discovery.invalidate();
     self.refresh_for(None, cancelled)?;
-    let analyses = self.prepare_workspace_analysis(cancelled)?;
+    let analyses = self.collect_analysis(BTreeSet::new(), cancelled)?;
     if let Some(workspace) = analyses.entries.values().next_back() {
       self.workspace = workspace.clone();
     }
@@ -363,11 +400,11 @@ impl Application {
     Ok(check_cancelled(cancelled)?)
   }
 
-  pub(super) fn refresh_for(
+  pub(in crate::interface::application) fn refresh_for(
     &mut self,
     document: Option<&Path>,
     cancelled: &AtomicBool,
-  ) -> Result<BTreeSet<PathBuf>, Error> {
+  ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
     self.failures.clear();
     self.names = None;
@@ -378,16 +415,17 @@ impl Application {
     } else {
       let (selected, failures) =
         self.collect_inputs(BTreeSet::new(), cancelled)?;
+      self.cache.selection = Some(InputSelection {
+        explicit: BTreeSet::new(),
+        paths: selected.clone(),
+        failures: failures.clone(),
+      });
       self.failures = failures;
       selected
     };
     for path in &selected {
       if let Err(error) = self.load(path, cancelled) {
         check_cancelled(cancelled)?;
-        self.failures.push(Failure {
-          path: path.clone(),
-          message: error.to_string(),
-        });
         self
           .cache
           .loaded
@@ -399,7 +437,7 @@ impl Application {
     self.share_workspace_documents();
     self.failures.sort_by(|a, b| a.path.cmp(&b.path));
     check_cancelled(cancelled)?;
-    Ok(selected)
+    Ok(())
   }
 
   fn collect_inputs(
@@ -437,7 +475,7 @@ impl Application {
       .collect()
   }
 
-  pub(in crate::interface::application) fn verify_discovery(
+  pub(super) fn verify_discovery(
     &self,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
@@ -445,6 +483,25 @@ impl Application {
       .discovery
       .collect(&self.discovery_inputs(), true, cancelled)?;
     Ok(())
+  }
+
+  /// Rescans the inputs and compares the files they select now.
+  pub(super) fn selection_current(
+    &self,
+    selection: &InputSelection,
+    cancelled: &AtomicBool,
+  ) -> Result<bool, Error> {
+    self.verify_discovery(cancelled)?;
+    Ok(self.select_inputs(selection.explicit.clone(), cancelled)? == *selection)
+  }
+
+  /// Results collected from inputs that changed without notification are
+  /// collected again by the next request.
+  pub(in crate::interface::application) fn discard_results(&mut self) {
+    self.names = None;
+    self.analyses = None;
+    self.workspace.clear_analysis();
+    self.outdated = true;
   }
 
   pub(super) fn share_workspace_documents(&mut self) {

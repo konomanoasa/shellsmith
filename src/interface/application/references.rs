@@ -12,7 +12,6 @@ impl Application {
     include_declaration: bool,
     cancelled: &AtomicBool,
   ) -> Result<Vec<Location>, Error> {
-    self.verify_discovery(cancelled)?;
     let names = self.prepare_names(path, cancelled)?;
     self.check_name_inputs(&names, cancelled)?;
     let id = self.document_id(path).ok_or_else(|| {

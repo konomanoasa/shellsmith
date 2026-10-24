@@ -3,7 +3,7 @@ mod bindings {
 
   use shellsmith::interface::application::engine::{
     Access, Analysis, AnalysisRequest, OccurrenceKind, ResolvedUse, Value,
-    Workspace,
+    ValueIssue, Workspace,
   };
   use shellsmith::interface::application::engine::{
     Alternative, InitialBinding, InitialEnvironment, Resolution,
@@ -183,9 +183,7 @@ mod bindings {
         if known_variable {
           Value::Literal(b"./lib.sh".to_vec())
         } else {
-          Value::Unknown(
-            shellsmith::interface::application::engine::ValueIssue::Dynamic,
-          )
+          Value::Unknown(ValueIssue::Dynamic)
         },
         "{source}"
       );
@@ -246,9 +244,7 @@ mod bindings {
           Some(if known {
             Value::Literal(b"/workspace".to_vec())
           } else {
-            Value::Unknown(
-              shellsmith::interface::application::engine::ValueIssue::Dynamic,
-            )
+            Value::Unknown(ValueIssue::Dynamic)
           }),
           "{source}"
         );
@@ -390,21 +386,28 @@ mod bindings {
   }
 
   #[test]
-  fn special_builtins_precede_functions_and_function_prefixes_have_uncertain_lifetime()
+  fn special_builtin_function_names_are_rejected_and_function_prefixes_have_uncertain_lifetime()
    {
-    let (workspace, analysis) = analyze(
+    let (workspace, analysis) = support::analyze_damaged(
       "readonly() { x=9; }; readonly x=1; f() { : \"$x\"; }; x=2 f; : \"$x\"",
     );
-    let function = workspace.symbols_named(b"readonly").next().unwrap().id;
-    assert_eq!(analysis.references(function).count(), 0);
-    let ids: Vec<_> = workspace
-      .symbols_named(b"x")
-      .map(|symbol| symbol.id)
-      .collect();
-    for site in reads(&workspace, &analysis, b"x") {
-      assert!(!site.resolution.candidates.contains(&ids[0]));
-      assert!(site.resolution.is_complete());
-    }
+    assert!(workspace.symbols_named(b"readonly").next().is_none());
+    assert!(
+      analysis
+        .gaps()
+        .iter()
+        .any(|gap| gap.issue == ResolutionIssue::Recovery)
+    );
+    let (workspace, analysis) =
+      analyze("readonly x=1; f() { : \"$x\"; }; x=2 f; : \"$x\"");
+    let x = workspace.symbols_named(b"x").next().unwrap().id;
+    assert_eq!(
+      reads(&workspace, &analysis, b"x")
+        .iter()
+        .map(|site| site.resolution.status())
+        .collect::<Vec<_>>(),
+      [ResolutionStatus::Resolved(x), ResolutionStatus::Resolved(x)]
+    );
     let (workspace, analysis) =
       analyze("x=0; f() { : \"$x\"; }; x=1 f; : \"$x\"");
     let ids: Vec<_> = workspace
@@ -518,11 +521,18 @@ mod bindings {
     ] {
       let source = format!("set -- p; n=y; v=$(( $n = 1 )) : >\"${name}\"");
       let (workspace, analysis) = analyze(&source);
+      let mut expected = expected.clone();
+      if name == "x" {
+        use shellsmith::interface::application::engine::BindingOrigin;
+        expected.origins = [BindingOrigin::Context(analysis.contexts()[0].id)]
+          .into_iter()
+          .collect();
+      }
       let resolutions: Vec<_> = reads(&workspace, &analysis, name.as_bytes())
         .iter()
         .map(|site| &site.resolution)
         .collect();
-      assert_eq!(resolutions, [expected], "{source}");
+      assert_eq!(resolutions, [&expected], "{source}");
     }
   }
 
@@ -1150,6 +1160,69 @@ mod bindings {
         Some(&Value::Literal(expected.as_bytes().to_vec())),
         "{entry} with {body:?}"
       );
+    }
+  }
+
+  #[test]
+  fn sourced_files_keep_positional_parameters_only_without_extra_operands() {
+    let literal = |text: &str| Value::Literal(text.as_bytes().to_vec());
+    let unspecified = Value::Unknown(ValueIssue::Unspecified);
+    for (entry, body, one, count) in [
+      (
+        "set -- x; . /lib; : \"$one$count\"",
+        "one=$1; count=$#",
+        literal("x"),
+        literal("1"),
+      ),
+      (
+        "set -- x; . -- /lib; : \"$one$count\"",
+        "one=$1; count=$#",
+        literal("x"),
+        literal("1"),
+      ),
+      (
+        "f() { . /lib \"$@\"; }; set -- x; f; : \"$one$count\"",
+        "one=$1; count=$#",
+        literal(""),
+        literal("0"),
+      ),
+      (
+        "set -- x; . /lib arg; : \"$one$count\"",
+        "one=$1; count=$#",
+        unspecified.clone(),
+        unspecified.clone(),
+      ),
+      (
+        "set -- x; . /lib ''; : \"$one$count\"",
+        "one=$1; count=$#",
+        unspecified.clone(),
+        unspecified.clone(),
+      ),
+      (
+        "set -- x; . /lib arg; one=$1; count=$#; : \"$one$count\"",
+        "set -- changed",
+        unspecified.clone(),
+        unspecified.clone(),
+      ),
+    ] {
+      let root = support::parse(1, 1, entry);
+      let library = support::parse(2, 1, body);
+      let mut request = AnalysisRequest::new(root.snapshot());
+      request.initial = InitialEnvironment::empty();
+      let mut workspace = Workspace::default();
+      workspace.insert(root).unwrap();
+      let mut inputs = support::Inputs::sources([("/lib", library)]);
+      let analysis = workspace
+        .analyze(request, &mut inputs, &AtomicBool::new(false))
+        .unwrap();
+      for (name, expected) in [(b"one".as_slice(), &one), (b"count", &count)] {
+        let read = reads(&workspace, &analysis, name)[0];
+        assert_eq!(
+          analysis.value(read.site.syntax().unwrap(), read.context),
+          Some(expected),
+          "{entry} with {body:?}"
+        );
+      }
     }
   }
 
@@ -2751,6 +2824,100 @@ mod names {
     EffectTarget, NameEnvironment, NameSpelling, SymbolKind, Value,
   };
   use std::sync::atomic::AtomicBool;
+
+  #[test]
+  fn inherited_unknown_bindings_keep_origins_without_resolving_values_or_definitions()
+   {
+    use shellsmith::interface::application::engine::{
+      BindingOrigin, ResolutionStatus, UseSite,
+    };
+    let source = "x=1; . ./missing; (: $x); (. ./other; : $x); : $x";
+    let (mut workspace, analysis) = support::analyze(source);
+    let origins: Vec<_> = analysis
+      .unknown_effects()
+      .map(|effect| {
+        (
+          effect.location.bytes.start,
+          BindingOrigin::Context(effect.context),
+        )
+      })
+      .collect();
+    let parent = origins
+      .iter()
+      .find(|(offset, _)| *offset == source.find(". ./missing").unwrap())
+      .unwrap()
+      .1;
+    let child = origins
+      .iter()
+      .find(|(offset, _)| *offset == source.find(". ./other").unwrap())
+      .unwrap()
+      .1;
+    let offsets: Vec<_> = source
+      .match_indices("$x")
+      .map(|(offset, _)| offset + 1)
+      .collect();
+    for (offset, expected) in
+      offsets
+        .iter()
+        .zip([vec![parent], vec![parent, child], vec![parent]])
+    {
+      let occurrence = workspace
+        .documents()
+        .next()
+        .unwrap()
+        .occurrences()
+        .iter()
+        .find(|site| site.location.bytes.start == *offset)
+        .unwrap();
+      let resolved = analysis
+        .resolutions(UseSite::Syntax(occurrence.id))
+        .next()
+        .unwrap();
+      assert_eq!(resolved.resolution.origins, expected.into_iter().collect());
+      assert_eq!(resolved.resolution.status(), ResolutionStatus::Candidates);
+      assert!(!resolved.resolution.is_complete());
+      assert!(matches!(
+        analysis.value(occurrence.id, resolved.context),
+        Some(Value::Unknown(_))
+      ));
+    }
+    workspace.publish_analysis(analysis).unwrap();
+    let names = workspace.name_relations(&AtomicBool::new(false)).unwrap();
+    let at = |offset| {
+      names
+        .occurrences
+        .iter()
+        .find(|site| site.location.bytes.start == offset)
+        .unwrap()
+    };
+    let parent = at(0).identity.unwrap();
+    assert_eq!(at(offsets[0]).identity, Some(parent));
+    assert_eq!(at(offsets[1]).identity, None);
+    assert_eq!(at(offsets[2]).identity, Some(parent));
+
+    let source =
+      "x=1; change() { read name; read \"$name\"; }; change; change; (: $x)";
+    let (workspace, analysis) = support::analyze(source);
+    let read = workspace
+      .documents()
+      .next()
+      .unwrap()
+      .occurrences()
+      .iter()
+      .find(|site| site.location.bytes.start == source.rfind("$x").unwrap() + 1)
+      .unwrap();
+    let resolution = &analysis
+      .resolutions(UseSite::Syntax(read.id))
+      .next()
+      .unwrap()
+      .resolution;
+    assert_eq!(
+      resolution.origins,
+      [BindingOrigin::Context(analysis.contexts()[0].id)]
+        .into_iter()
+        .collect()
+    );
+  }
 
   #[test]
   fn trap_bodies_keep_redefined_functions_unknown_and_reuse_body_snapshots() {

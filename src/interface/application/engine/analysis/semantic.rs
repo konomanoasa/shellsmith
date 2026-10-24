@@ -1,10 +1,10 @@
-use super::result::{argument_resolution, syntax_resolution};
+use super::result::{argument_resolution, join_resolution, syntax_resolution};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::interface::application::engine::{
   Access, Alternative, Analysis, ArgumentKind, ArgumentRole, AttributeState,
   Classification, Document, Location, OccurrenceId, OccurrenceKind, Resolution,
-  UseSite, Value,
+  UseSite, syntax_spelling,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -63,9 +63,8 @@ impl Document {
       );
     }
     for site in self.occurrences() {
-      if site.kind == OccurrenceKind::Command
-        && matches!(site.name, Value::Unknown(_) | Value::Partial(_))
-      {
+      let spelling = syntax_spelling(self, site);
+      if spelling.is_empty() {
         continue;
       }
       let mut kind = match site.kind {
@@ -114,17 +113,18 @@ impl Document {
       {
         modifiers.insert(Modifier::Environment);
       }
-      let location = site.location.clone();
-      spans.insert(
-        (location.bytes.start, location.bytes.end),
-        SemanticSpan {
-          location,
-          kind,
-          modifiers,
-          readonly,
-          semantic: true,
-        },
-      );
+      for location in spelling {
+        spans.insert(
+          (location.bytes.start, location.bytes.end),
+          SemanticSpan {
+            location,
+            kind,
+            modifiers: modifiers.clone(),
+            readonly,
+            semantic: true,
+          },
+        );
+      }
     }
     for span in self.argument_spans(inputs) {
       spans.insert((span.location.bytes.start, span.location.bytes.end), span);
@@ -150,10 +150,7 @@ impl Document {
           .entry(range)
           .and_modify(|(old, previous)| {
             old.join(&role);
-            match (previous.as_mut(), &resolution) {
-              (Some(left), Some(right)) => left.join(right),
-              _ => *previous = None,
-            }
+            join_resolution(previous, resolution.as_ref());
           })
           .or_insert((role, resolution));
       }

@@ -14,20 +14,11 @@ impl Application {
       .path(id)
       .ok_or(super::engine::Error::UnknownDocument(id))?
       .to_path_buf();
-    let previous = self
-      .workspace
-      .shared_document(id)
-      .ok_or(super::engine::Error::UnknownDocument(id))?;
-    let analyses = self.prepare_analysis(&path, cancelled)?;
+    let analyses = self.prepare_position(&path, cancelled)?;
     let document = self
       .workspace
       .document(id)
       .ok_or(super::engine::Error::UnknownDocument(id))?;
-    if document.snapshot() != previous.snapshot()
-      && document.source() != previous.source()
-    {
-      return Err(Error::Superseded);
-    }
     let snapshot = document.snapshot();
     let resolution =
       super::engine::AnalysisResults::new(analyses.entries.values())
@@ -55,9 +46,7 @@ impl Application {
         );
       }
     }
-    if !self.analysis_inputs_current(&analyses, cancelled)? {
-      return Err(Error::Superseded);
-    }
+    self.check_inputs(cancelled)?;
     Ok(locations.into_values().collect())
   }
 }

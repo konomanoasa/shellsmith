@@ -82,6 +82,15 @@ pub struct Resolution {
   pub candidates: BTreeSet<SymbolId>,
   pub alternatives: BTreeSet<Alternative>,
   pub issues: BTreeSet<ResolutionIssue>,
+  pub origins: imbl::OrdSet<BindingOrigin>,
+}
+
+/// Name owners, independent of the value or definition that reaches a read.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BindingOrigin {
+  Context(ExecutionContextId),
+  Definition(SymbolId),
+  Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +102,22 @@ pub enum ResolutionStatus {
 }
 
 impl Resolution {
+  pub(in crate::interface::application::engine) fn name_definitions(
+    &self,
+  ) -> impl Iterator<Item = SymbolId> + '_ {
+    self
+      .candidates
+      .iter()
+      .copied()
+      .chain(self.origins.iter().filter_map(|origin| {
+        if let BindingOrigin::Definition(id) = origin {
+          Some(*id)
+        } else {
+          None
+        }
+      }))
+  }
+
   pub(in crate::interface::application::engine) fn join(
     &mut self,
     other: &Self,
@@ -100,6 +125,18 @@ impl Resolution {
     self.candidates.extend(&other.candidates);
     self.alternatives.extend(&other.alternatives);
     self.issues.extend(&other.issues);
+    if !other.origins.is_subset(&self.origins) {
+      self.origins.extend(other.origins.iter().copied());
+    }
+  }
+
+  pub(in crate::interface::application::engine) fn in_context(
+    mut self,
+    context: ExecutionContextId,
+  ) -> Self {
+    self.origins.remove(&BindingOrigin::Unknown);
+    self.origins.insert(BindingOrigin::Context(context));
+    self
   }
 
   pub(in crate::interface::application::engine) fn is_environment(
@@ -173,6 +210,8 @@ pub enum EffectTarget {
   Variables,
   Functions,
   Attributes,
+  /// May read source text whose names and dependencies are unknown.
+  Sources,
   /// Includes the PWD and OLDPWD values set by `cd`.
   Directory,
   Positionals,
@@ -449,6 +488,20 @@ impl Analysis {
     environment
   }
 
+  pub(in crate::interface::application::engine) fn binding_context(
+    &self,
+    context: ExecutionContextId,
+  ) -> ExecutionContextId {
+    self
+      .context_ancestors(context)
+      .find(|context| {
+        context.id == context.environment
+          || self.temporary.contains_key(&context.id)
+      })
+      .expect("execution environment")
+      .id
+  }
+
   pub(in crate::interface::application::engine) fn synchronize(
     &mut self,
     workspace: &Workspace,
@@ -528,15 +581,6 @@ impl Analysis {
       .gaps
       .iter()
       .any(|gap| gap.issue == ResolutionIssue::Recursion)
-  }
-
-  #[must_use]
-  pub fn readonly(&self, id: OccurrenceId) -> AttributeState {
-    self
-      .readonly_contexts(id)
-      .map(|(_, state)| state)
-      .reduce(AttributeState::join)
-      .unwrap_or(AttributeState::Unknown)
   }
 
   pub fn readonly_contexts(

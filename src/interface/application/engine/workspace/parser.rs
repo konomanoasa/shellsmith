@@ -340,6 +340,26 @@ pub(in crate::interface::application::engine) fn subshell(kind: &str) -> bool {
   )
 }
 
+/// Syntax that owns the damage inside it.
+pub(in crate::interface::application::engine) fn damage_unit(
+  kind: &str,
+) -> bool {
+  matches!(kind, "command" | "function_body") || subshell(kind)
+}
+
+fn damaged_outside_units(node: Node<'_>) -> bool {
+  let mut pending = vec![node];
+  while let Some(node) = pending.pop() {
+    if damaged(node) {
+      return true;
+    }
+    pending.extend(node.children(&mut node.walk()).filter(|child| {
+      (child.has_error() || child.is_missing()) && !damage_unit(child.kind())
+    }));
+  }
+  false
+}
+
 pub(in crate::interface::application::engine) fn asynchronous(
   node: Node<'_>,
 ) -> bool {
@@ -523,15 +543,8 @@ impl Facts {
       return;
     };
     let damaged_owner = kind != OccurrenceKind::Command
-      && node.parent().is_some_and(|owner| {
-        owner.has_error()
-          && (kind != OccurrenceKind::FunctionDefinition
-            || owner.children(&mut owner.walk()).any(|child| {
-              Some(child) != owner.child_by_field_name("body")
-                && child.has_error()
-            }))
-      });
-    let name = if node.has_error() || node.is_missing() || damaged_owner {
+      && node.parent().is_some_and(damaged_outside_units);
+    let name = if node.has_error() || damaged_owner {
       Value::Unknown(ValueIssue::Recovery)
     } else if state.transformed && word::transformed(node, source) {
       Value::Unknown(ValueIssue::TransformedSource)

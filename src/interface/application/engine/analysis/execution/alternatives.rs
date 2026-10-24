@@ -1,4 +1,4 @@
-use super::environment::{Binding, Environment, Positionals};
+use super::environment::{Binding, Environment, Flow, Positionals};
 use super::values::{ValueId, Values};
 use crate::interface::application::engine::{
   Error, Resolution, check_cancelled,
@@ -221,6 +221,56 @@ impl Decisions {
     }
     cache[&value]
   }
+
+  /// Places `choice` above two diagrams without it, below their later choices.
+  fn ite(
+    &mut self,
+    choice: usize,
+    left: DecisionId,
+    right: DecisionId,
+  ) -> DecisionId {
+    let later = |nodes: &Self, a, b| {
+      nodes
+        .choice(a)
+        .max(nodes.choice(b))
+        .filter(|top| *top > choice)
+    };
+    if later(self, left, right).is_none() {
+      return self.branch(choice, left, right);
+    }
+    let mut results = HashMap::new();
+    let mut sides = HashMap::new();
+    let mut pending = vec![(left, right, false)];
+    while let Some((a, b, visited)) = pending.pop() {
+      if results.contains_key(&(a, b)) {
+        continue;
+      }
+      let Some(top) = later(self, a, b) else {
+        let result = self.branch(choice, a, b);
+        results.insert((a, b), result);
+        continue;
+      };
+      if visited {
+        let (low, high) = sides[&(a, b)];
+        let result = self.branch(top, results[&low], results[&high]);
+        results.insert((a, b), result);
+        continue;
+      }
+      let [low, high] = [false, true].map(|side| {
+        (
+          self.restrict(a, top, side, &mut HashMap::new()),
+          self.restrict(b, top, side, &mut HashMap::new()),
+        )
+      });
+      sides.insert((a, b), (low, high));
+      pending.extend([
+        (a, b, true),
+        (high.0, high.1, false),
+        (low.0, low.1, false),
+      ]);
+    }
+    results[&(left, right)]
+  }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -237,6 +287,30 @@ impl PartialEq for Alternatives {
 }
 
 impl Eq for Alternatives {}
+
+pub(in crate::interface::application::engine::analysis) struct Split {
+  right: Environment,
+  choice: usize,
+  next: usize,
+}
+
+impl Split {
+  pub fn resume(
+    self,
+    mut left: Flow,
+  ) -> (Environment, impl FnOnce(Flow) -> Flow) {
+    let decisions = self.right.alternatives.decisions.clone();
+    // Disjoint paths can reuse new choice numbers without multiplying them.
+    let end = std::mem::replace(&mut decisions.borrow_mut().next, self.next);
+    (self.right, move |right| {
+      let mut nodes = decisions.borrow_mut();
+      nodes.next = nodes.next.max(end);
+      drop(nodes);
+      left.join_choice(Some(self.choice), right);
+      left
+    })
+  }
+}
 
 impl Alternatives {
   pub fn expressions(&self) -> RefMut<'_, Values> {
@@ -338,7 +412,12 @@ impl Alternatives {
     }
   }
 
-  pub fn joined(left: &Environment, right: &Environment) -> Self {
+  /// Joins the two sides of `choice`; `None` introduces a new choice.
+  pub fn joined(
+    left: &Environment,
+    right: &Environment,
+    choice: Option<usize>,
+  ) -> Self {
     if left.alternatives == right.alternatives
       && left.variables == right.variables
       && left.functions == right.functions
@@ -363,13 +442,15 @@ impl Alternatives {
       .collect();
     let decisions = left.alternatives.decisions.clone();
     let mut nodes = decisions.borrow_mut();
-    let choice = nodes.next;
-    nodes.next += 1;
+    let choice = choice.unwrap_or_else(|| {
+      nodes.next += 1;
+      nodes.next - 1
+    });
     let mut values = imbl::OrdMap::new();
     for name in names {
       let a = nodes.value(left, &name);
       let b = nodes.value(right, &name);
-      let value = nodes.branch(choice, a, b);
+      let value = nodes.ite(choice, a, b);
       if !matches!(nodes.nodes[value], Decision::Value(_)) {
         values.insert(name.clone(), value);
       }
@@ -378,28 +459,27 @@ impl Alternatives {
     Self { values, decisions }
   }
 
-  pub fn select(
-    &self,
-    env: &Environment,
-    names: &BTreeSet<StateKey>,
-  ) -> Option<AlternativeStates> {
+  /// The latest choice that the values of `names` depend on.
+  pub fn choice(&self, names: &BTreeSet<StateKey>) -> Option<usize> {
+    let nodes = self.decisions.borrow();
     names
       .iter()
-      .any(|name| self.values.contains_key(name))
-      .then(|| AlternativeStates {
-        pending: vec![env.clone()],
-        names: names.clone(),
-      })
+      .filter_map(|name| nodes.choice(*self.values.get(name)?))
+      .max()
   }
-}
 
-pub(in crate::interface::application::engine::analysis) struct AlternativeStates
-{
-  pending: Vec<Environment>,
-  names: BTreeSet<StateKey>,
-}
+  pub fn split(env: Environment, choice: usize) -> (Environment, Split) {
+    let next = env.alternatives.decisions.borrow().next;
+    (
+      Self::restricted(env.clone(), choice, false),
+      Split {
+        right: Self::restricted(env, choice, true),
+        choice,
+        next,
+      },
+    )
+  }
 
-impl AlternativeStates {
   fn restricted(
     mut env: Environment,
     choice: usize,
@@ -421,30 +501,6 @@ impl AlternativeStates {
     }
     drop(nodes);
     env
-  }
-}
-
-impl Iterator for AlternativeStates {
-  type Item = Environment;
-  fn next(&mut self) -> Option<Self::Item> {
-    let mut env = self.pending.pop()?;
-    loop {
-      let choice = {
-        let nodes = env.alternatives.decisions.borrow();
-        self
-          .names
-          .iter()
-          .filter_map(|name| nodes.choice(*env.alternatives.values.get(name)?))
-          .max()
-      };
-      let Some(choice) = choice else {
-        return Some(env);
-      };
-      self
-        .pending
-        .push(Self::restricted(env.clone(), choice, true));
-      env = Self::restricted(env, choice, false);
-    }
   }
 }
 

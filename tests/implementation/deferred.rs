@@ -16,6 +16,7 @@ fn invariant_history_keeps_one_change_per_name_and_the_first_registration() {
     loops: 0,
     dynamic_loops: false,
     returnable: false,
+    functions: 0,
   };
   let registration = Location {
     snapshot,

@@ -216,12 +216,10 @@ impl<'a> Resolver<'a> {
         },
       );
       let names = self.value_dependencies(needed, call.frame);
-      if let Some(states) = env.alternatives.select(&env, &names) {
-        return self.each_alternative(
-          states,
-          Flow::default(),
-          move |resolver, env| resolver.command_arguments(call.clone(), env),
-        );
+      if env.alternatives.choice(&names).is_some() {
+        return self.each_alternative(env, names, move |resolver, env| {
+          resolver.command_arguments(call.clone(), env)
+        });
       }
       if matches!(usage, ArgumentUse::Command) && !call.arguments.is_empty() {
         let CallArguments {
@@ -301,8 +299,8 @@ impl<'a> Resolver<'a> {
     env.order.extend(affected.iter().cloned());
     let source = self.workspace.source(frame.snapshot.document);
     let search = Self::name_search(command, source, &name, &env);
-    let io = temporary_redirections(&name, &args)
-      .then(|| Redirections::new(&redirects, source, &mut env));
+    let io = redirection_persistence(&name, &args, &env)
+      .save(&redirects, source, &mut env);
     env.io.input_order_unknown |= uncertain_order;
     Task::sequence(redirects, env, frame).then(
       move |resolver, mut redirected| {
@@ -648,8 +646,10 @@ impl<'a> Resolver<'a> {
     let word = word::lexical(word, source);
     let reserved = if word == b"time" {
       // `time` runs the time utility wherever that utility would run.
-      Self::command_resolution(name, env, false)
-        != alternative(Alternative::ExternalCommand)
+      let resolution = Self::command_resolution(name, env, false);
+      !resolution.candidates.is_empty()
+        || !resolution.issues.is_empty()
+        || resolution.alternatives != [Alternative::ExternalCommand].into()
     } else {
       optional_reserved_word(&word)
         || (colon_word(&word)
@@ -686,21 +686,10 @@ impl<'a> Resolver<'a> {
     search: Search,
   ) -> Task<'a> {
     let resolution = Self::search_resolution(name, &env, search);
-    if !resolution.candidates.is_empty()
-      || !resolution.issues.is_empty()
-      || resolution.alternatives != [Alternative::Builtin].into()
-    {
+    if !only_builtin(&resolution) {
       for arg in args {
         self.argument_role(arg, None, frame);
       }
-    }
-    if !resolution.candidates.is_empty()
-      || !resolution.issues.is_empty()
-      || resolution
-        .alternatives
-        .iter()
-        .any(|alternative| *alternative != Alternative::Builtin)
-    {
       self.non_source(node, frame);
     }
     let candidates = resolution
@@ -722,12 +711,8 @@ impl<'a> Resolver<'a> {
           state.alternatives.restore_positionals(&env.alternatives);
         }
         let task = if resolution.alternatives.contains(&Alternative::Builtin) {
-          if let Value::Literal(name) = &name {
-            resolver.utility(node, name, args.clone(), env.clone(), frame)
-          } else {
-            let names = builtin_names(&name, &env, search != Search::Normal);
-            resolver.invoke_builtins(node, names.into_iter(), args.clone(), env.clone(), Flow::default(), frame)
-          }
+          let names = builtin_names(&name, &env, search != Search::Normal);
+          resolver.invoke_builtins(node, names.into_iter(), args.clone(), env.clone(), Flow::default(), frame)
         } else { Task::Done(Flow::default()) };
         task.then(move |resolver, builtin| {
           flow.join(builtin);
@@ -761,9 +746,7 @@ impl<'a> Resolver<'a> {
             );
             flow.add(Transfer::Next, external);
           }
-          if !resolution.issues.is_empty()
-            || resolution.alternatives.contains(&Alternative::External)
-          {
+          if unknown_utility(&resolution) {
             let issue = if resolution.issues
               == [ResolutionIssue::UnresolvedSource].into()
             {
@@ -932,12 +915,7 @@ impl<'a> Resolver<'a> {
         if !verbose {
           output = query_output(&arg.value, &resolution);
         }
-        self.record_argument_use(
-          &arg,
-          Self::command_resolution(&arg.value, &env, false),
-          &env,
-          frame,
-        );
+        self.record_argument_use(&arg, resolution, &env, frame);
         self.argument_role(
           &arg,
           Some(ArgumentKind::Command {
@@ -1076,8 +1054,7 @@ fn colon_word(word: &[u8]) -> bool {
 /// Definite special built-ins are handled by the caller.
 fn prefix_may_persist(name: &Value, resolution: &Resolution) -> bool {
   !resolution.candidates.is_empty()
-    || !resolution.issues.is_empty()
-    || resolution.alternatives.contains(&Alternative::External)
+    || unknown_utility(resolution)
     || SPECIAL.iter().any(|special| name.can_equal(special))
 }
 
@@ -1190,8 +1167,7 @@ fn query_output(name: &Value, resolution: &Resolution) -> Value {
     return output;
   }
   let mut outputs = Vec::new();
-  let unknown = !resolution.issues.is_empty()
-    || resolution.alternatives.contains(&Alternative::External);
+  let unknown = unknown_utility(resolution);
   let bare_builtin = resolution.alternatives.contains(&Alternative::Builtin)
     && (!matches!(name, Value::Literal(_))
       || !resolution
@@ -1240,25 +1216,61 @@ fn query_output(name: &Value, resolution: &Resolution) -> Value {
     .unwrap_or(Value::Unknown(issue))
 }
 
-fn temporary_redirections<'a>(
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Persistence {
+  Temporary,
+  Persistent,
+  Unknown,
+}
+
+impl Persistence {
+  fn save(
+    self,
+    redirects: &[Node<'_>],
+    source: &[u8],
+    env: &mut Environment,
+  ) -> Option<Redirections> {
+    (self != Self::Persistent)
+      .then(|| Redirections::new(redirects, source, env, self == Self::Unknown))
+  }
+}
+
+/// Redirections persist only for `exec`, reached directly or through the
+/// `command` builtin; a `command` that may be a function makes them unknown.
+fn redirection_persistence<'a>(
   mut name: &'a Value,
   mut args: &'a [Argument<'_>],
-) -> bool {
+  env: &Environment,
+) -> Persistence {
+  let mut suppress = false;
+  let mut builtin = true;
   while name == &Value::Literal(b"command".to_vec()) {
+    let resolution = Resolver::command_resolution(name, env, suppress);
+    if !resolution.alternatives.contains(&Alternative::Builtin) {
+      return Persistence::Temporary;
+    }
+    builtin &= only_builtin(&resolution);
     match command_options(args) {
       Ok(options) if !options.query => {
         let Some((command, rest)) = args[options.operands..].split_first()
         else {
-          return true;
+          return Persistence::Temporary;
         };
         name = &command.value;
         args = rest;
+        suppress = true;
       }
-      Err(ResolutionIssue::DynamicName) => return false,
-      Ok(_) | Err(_) => return true,
+      Err(ResolutionIssue::DynamicName) => break,
+      Ok(_) | Err(_) => return Persistence::Temporary,
     }
   }
-  !name.can_equal(b"exec") && !name.can_equal(b"command")
+  if !name.can_equal(b"exec") && !name.can_equal(b"command") {
+    Persistence::Temporary
+  } else if builtin {
+    Persistence::Persistent
+  } else {
+    Persistence::Unknown
+  }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1268,6 +1280,19 @@ pub(super) enum Search {
   Reserved,
   SuppressFunctions,
   Standard,
+}
+
+/// Command search can find nothing but the built-in utility.
+pub(super) fn only_builtin(resolution: &Resolution) -> bool {
+  resolution.candidates.is_empty()
+    && resolution.issues.is_empty()
+    && resolution.alternatives == [Alternative::Builtin].into()
+}
+
+/// Command search may find a utility whose effects are unknown.
+pub(super) fn unknown_utility(resolution: &Resolution) -> bool {
+  !resolution.issues.is_empty()
+    || resolution.alternatives.contains(&Alternative::External)
 }
 
 pub(super) fn special_name(name: &Value) -> bool {

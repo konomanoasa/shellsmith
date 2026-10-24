@@ -1,5 +1,5 @@
 use super::super::execution::{
-  Binding, Environment, Flow, Positionals, StateKey, Transfer, alternative,
+  Binding, Environment, Flow, OptionCursor, StateKey, Transfer, alternative,
 };
 use super::super::expansion::Argument;
 use super::super::{Frame, Resolver, Task};
@@ -54,20 +54,16 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    if ((name == b"shift" && decimal_value::<usize>(&args) != Some(0))
-      || (name == b"getopts" && args.len() == 2))
-      && let Some(states) = env
-        .alternatives
-        .select(&env, &BTreeSet::from([StateKey::Positionals]))
+    if (name == b"shift" && decimal_value::<usize>(&args) != Some(0))
+      || (name == b"getopts" && args.len() == 2)
     {
-      let name = name.to_vec();
-      return self.each_alternative(
-        states,
-        Flow::default(),
-        move |resolver, env| {
+      let names = BTreeSet::from([StateKey::Positionals]);
+      if env.alternatives.choice(&names).is_some() {
+        let name = name.to_vec();
+        return self.each_alternative(env, names, move |resolver, env| {
           resolver.utility(node, &name, args.clone(), env, frame)
-        },
-      );
+        });
+      }
     }
     if name == b"command" {
       return self.forward(node, args.into_iter(), env, frame);
@@ -302,8 +298,7 @@ impl<'a> Resolver<'a> {
         variable.and_then(|variable| self.site(variable, frame));
       let name = if let Some(variable) = variable {
         self.write(variable, &mut env, frame, false, argument.value.clone());
-        self
-          .site(variable, frame)
+        definition
           .and_then(|id| self.workspace.occurrence(id))
           .map(|site| site.name.clone())
       } else if argument.count.boundary().is_ok() {
@@ -447,7 +442,10 @@ impl<'a> Resolver<'a> {
         &mut env.variables
       };
       let before = bindings.get(name).clone();
-      let mut after = Binding::new(alternative(Alternative::Unset));
+      let mut after = Binding::new(
+        alternative(Alternative::Unset)
+          .in_context(self.result.binding_context(frame.context)),
+      );
       if conditional_readonly {
         after.join(&before);
         after
@@ -459,7 +457,10 @@ impl<'a> Resolver<'a> {
       if function_unset {
         env.alternatives.forget_function(name);
         let mut function = env.functions.get(name).clone();
-        function.join(&Binding::new(alternative(Alternative::Unset)));
+        function.join(&Binding::new(
+          alternative(Alternative::Unset)
+            .in_context(self.result.binding_context(frame.context)),
+        ));
         env.functions.values.insert(name.clone(), function);
       }
     }
@@ -606,7 +607,8 @@ impl Resolver<'_> {
             env.variables.values.insert(
               name.to_vec(),
               Binding {
-                resolution: alternative(Alternative::External),
+                resolution: alternative(Alternative::External)
+                  .in_context(self.result.binding_context(frame.context)),
                 value: Arc::new(value),
               },
             );
@@ -855,7 +857,7 @@ impl Resolver<'_> {
     let args = &args[operands.unwrap_or(0)..];
     let computed = operands
       .ok_or_else(|| argument_issue(args).unwrap_or(ValueIssue::Dynamic))
-      .and_then(|_| option_values(args, &env));
+      .and_then(|_| option_values(args, &env, frame.functions));
     let known_prefix = operands.is_some()
       && args.iter().take(2).all(|arg| arg.count.boundary().is_ok());
     if known_prefix
@@ -872,15 +874,16 @@ impl Resolver<'_> {
         name,
         computed.as_ref().map_or_else(
           |issue| Value::Unknown(*issue),
-          |result| {
-            if name == b"OPTIND" {
-              Value::Literal(result.index.to_string().into_bytes())
-            } else {
-              result
-                .argument
-                .clone()
-                .unwrap_or(Value::Literal(Vec::new()))
+          |result| match &result.argument {
+            Some(_) if name == b"OPTIND" => {
+              Value::Literal(result.cursor.index.to_string().into_bytes())
             }
+            // POSIX fixes OPTIND only after an option-argument; the option
+            // cursor keeps the position for the next getopts.
+            None if name == b"OPTIND" => {
+              Value::Unknown(ValueIssue::Unspecified)
+            }
+            argument => argument.clone().unwrap_or(Value::Literal(Vec::new())),
           },
         ),
         &mut env,
@@ -895,9 +898,17 @@ impl Resolver<'_> {
           .as_ref()
           .is_ok_and(|result| result.argument.is_none())
       {
-        binding = Binding::new(alternative(Alternative::Unset));
+        binding = Binding::new(
+          alternative(Alternative::Unset)
+            .in_context(self.result.binding_context(frame.context)),
+        );
       } else if computed.is_err() {
         binding.resolution.alternatives.insert(Alternative::Unset);
+        binding.resolution.origins.insert(
+          super::super::BindingOrigin::Context(
+            self.result.binding_context(frame.context),
+          ),
+        );
       }
       env.variables.values.insert(b"OPTARG".to_vec(), binding);
     }
@@ -934,10 +945,8 @@ impl Resolver<'_> {
       );
     }
     env.options_reset = false;
-    env.option_cursor = computed
-      .as_ref()
-      .ok()
-      .map(|result| (result.arguments.clone(), result.offset));
+    env.option_cursor =
+      computed.as_ref().ok().map(|result| result.cursor.clone());
     env.set_status(
       computed.map_or_else(Value::Unknown, |_| Value::Literal(b"0".to_vec())),
     );
@@ -1110,7 +1119,6 @@ pub(super) fn output(
           !args
             .iter()
             .any(|arg| arg.starts_with(b"-") || arg.starts_with(b"+"))
-            || args.first() == Some(&b"--".as_slice())
         })) =>
     {
       Value::Literal(Vec::new())
@@ -1345,13 +1353,12 @@ fn input_line(
 struct OptionValues {
   option: u8,
   argument: Option<Value>,
-  index: usize,
-  offset: usize,
-  arguments: Positionals,
+  cursor: OptionCursor,
 }
 fn option_values(
   args: &[Argument<'_>],
   env: &Environment,
+  functions: u32,
 ) -> Result<OptionValues, ValueIssue> {
   if args.len() < 2 || args[..2].iter().any(|arg| arg.count.boundary().is_err())
   {
@@ -1384,20 +1391,26 @@ fn option_values(
   } else {
     super::super::expansion::positional_arguments(&args[2..])
   };
-  let index = env.parameter(b"OPTIND").0;
-  let mut index: usize = std::str::from_utf8(index.literal()?)
-    .ok()
-    .and_then(|index| index.parse().ok())
-    .ok_or(ValueIssue::Dynamic)?;
-  let mut offset = if env.options_reset && index == 1 {
-    1
-  } else {
-    let (previous, offset) =
-      env.option_cursor.as_ref().ok_or(ValueIssue::Dynamic)?;
-    if *previous != arguments {
+  let (mut index, mut offset) = if env.options_reset {
+    (1, 1)
+  } else if let Some(cursor) = &env.option_cursor {
+    // POSIX leaves the results unspecified when a caller and its functions
+    // both parse with getopts.
+    if cursor.functions != functions {
+      return Err(ValueIssue::Unspecified);
+    }
+    if cursor.arguments != arguments {
       return Err(ValueIssue::Dynamic);
     }
-    (*offset).max(1)
+    (cursor.index, cursor.offset.max(1))
+  } else {
+    return Err(
+      env
+        .parameter(b"OPTIND")
+        .0
+        .issue()
+        .unwrap_or(ValueIssue::Dynamic),
+    );
   };
   let current =
     arguments.present(index.checked_sub(1).ok_or(ValueIssue::Dynamic)?)?;
@@ -1434,8 +1447,11 @@ fn option_values(
   Ok(OptionValues {
     option,
     argument,
-    index,
-    offset,
-    arguments,
+    cursor: OptionCursor {
+      arguments,
+      index,
+      offset,
+      functions,
+    },
   })
 }

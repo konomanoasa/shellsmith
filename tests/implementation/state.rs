@@ -64,6 +64,7 @@ fn patterned_fallbacks_survive_joins_and_allow_explicit_overwrites() {
   };
   left.restrict(
     Value::partial(b"tmp_".to_vec(), Vec::new(), 4, ValueIssue::Dynamic),
+    BindingOrigin::Unknown,
     ResolutionIssue::DynamicName,
     ValueIssue::Dynamic,
   );
@@ -122,7 +123,7 @@ fn joining_an_explicit_unset_name_keeps_it_separate_from_unknown_fallback() {
     joined.join(other);
     assert_eq!(
       joined.get(b"known").resolution,
-      alternative(Alternative::Unset)
+      alternative(Alternative::Unset).in_context(ExecutionContextId(0))
     );
     assert_eq!(
       joined.get(b"known").value.as_ref(),

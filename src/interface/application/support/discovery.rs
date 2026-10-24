@@ -257,7 +257,7 @@ fn scan(
       if entry.file_type().is_some_and(|kind| kind.is_dir()) {
         result.directories.insert(path.to_path_buf(), resolved);
       } else if entry.file_type().is_some_and(|kind| kind.is_file()) {
-        if entry.depth() == 0 || files::selected_shell(&resolved, path)? {
+        if entry.depth() == 0 || files::selected_shell(&resolved, path) {
           result.files.insert(path.to_path_buf(), resolved);
         }
       } else if entry.depth() == 0 {
@@ -272,20 +272,51 @@ fn scan(
       });
     }
   }
-  result.links.extend(
-    traversal
-      .lock()
-      .expect("collection traversal")
-      .1
-      .iter()
-      .map(|(alias, target)| (alias.clone(), target.clone())),
-  );
+  let traversed =
+    std::mem::take(&mut traversal.lock().expect("collection traversal").1);
+  result
+    .links
+    .extend(result.failures.iter().filter_map(|failure| {
+      dangling_target(&failure.path)
+        .map(|target| (failure.path.clone(), target))
+    }));
+  result.links.extend(traversed);
   result
     .failures
     .sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
   result.failures.dedup();
   check_cancelled(cancelled)?;
   Ok(result)
+}
+
+/// The smallest symbolic link limit among supported kernels.
+const LINK_HOPS: usize = 32;
+
+/// The first missing path in the resolution of a dangling link, so that
+/// creating it is treated as a change of the link.
+fn dangling_target(link: &Path) -> Option<PathBuf> {
+  let mut path = link.to_path_buf();
+  for _ in 0..LINK_HOPS {
+    let Ok(target) = std::fs::read_link(&path) else {
+      return (path != link).then_some(path);
+    };
+    path = unresolved(&path.parent()?.join(target))?;
+  }
+  None
+}
+
+/// Components after a missing one are not resolved, because `..` refers to
+/// the physical parent.
+fn unresolved(path: &Path) -> Option<PathBuf> {
+  let mut resolved = PathBuf::new();
+  for component in path.components() {
+    let next = resolved.join(component);
+    resolved = match next.canonicalize() {
+      Ok(path) => path,
+      Err(_) => return Some(next),
+    };
+  }
+  None
 }
 
 fn collect_failure(

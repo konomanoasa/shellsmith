@@ -7,7 +7,8 @@ use super::arguments::{
   read_options, syntax_argument, syntax_arguments, trap_action, unset_options,
 };
 use super::dispatch::{
-  Search, builtin_candidates, builtin_names, command_options, special_name,
+  Search, builtin_candidates, builtin_names, command_options, only_builtin,
+  special_name, unknown_utility,
 };
 use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
@@ -23,6 +24,7 @@ fn all() -> BTreeSet<EffectTarget> {
     EffectTarget::Variables,
     EffectTarget::Functions,
     EffectTarget::Attributes,
+    EffectTarget::Sources,
     EffectTarget::Directory,
     EffectTarget::Positionals,
     EffectTarget::Options,
@@ -160,10 +162,7 @@ impl Resolver<'_> {
     let mut suppress = false;
     while name == Value::Literal(b"command".to_vec()) {
       let resolution = Self::command_resolution(&name, env, suppress);
-      if resolution.alternatives != [Alternative::Builtin].into()
-        || !resolution.candidates.is_empty()
-        || !resolution.issues.is_empty()
-      {
+      if !only_builtin(&resolution) {
         break;
       }
       let options = command_options(&args).ok()?;
@@ -183,9 +182,7 @@ impl Resolver<'_> {
       Self::name_search(command, source, &name, env)
     };
     let resolution = Self::search_resolution(&name, env, search);
-    if !resolution.issues.is_empty()
-      || resolution.alternatives.contains(&Alternative::External)
-    {
+    if unknown_utility(&resolution) {
       return None;
     }
     for candidate in resolution.candidates {
@@ -229,7 +226,12 @@ impl Resolver<'_> {
       .targets
       .extend(targets.iter().cloned());
     for target in targets {
-      env.invalidate(target, issue, value_issue);
+      env.invalidate(
+        target,
+        self.result.binding_context(frame.context),
+        issue,
+        value_issue,
+      );
     }
   }
 
@@ -318,9 +320,11 @@ fn unattempted_utilities(
           result
             .dependencies
             .extend([EffectTarget::Variables, EffectTarget::Functions]);
-          result
-            .targets
-            .extend([EffectTarget::Variables, EffectTarget::Functions]);
+          result.targets.extend([
+            EffectTarget::Variables,
+            EffectTarget::Functions,
+            EffectTarget::Sources,
+          ]);
           continue;
         };
         let operands = &args[options.operands..];
@@ -342,9 +346,11 @@ fn unattempted_utilities(
             result
               .dependencies
               .extend([EffectTarget::Variables, EffectTarget::Functions]);
-            result
-              .targets
-              .extend([EffectTarget::Variables, EffectTarget::Functions]);
+            result.targets.extend([
+              EffectTarget::Variables,
+              EffectTarget::Functions,
+              EffectTarget::Sources,
+            ]);
           }
         }
       } else {
@@ -363,7 +369,11 @@ fn unattempted_utilities(
         }
         let mut targets = BTreeSet::new();
         if builtin_targets(candidate, args, source, &mut targets).is_none() {
-          targets.extend([EffectTarget::Variables, EffectTarget::Functions]);
+          targets.extend([
+            EffectTarget::Variables,
+            EffectTarget::Functions,
+            EffectTarget::Sources,
+          ]);
         }
         result.dependencies.extend(targets.iter().cloned());
         result.targets.extend(targets);

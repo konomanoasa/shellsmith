@@ -47,7 +47,7 @@ pub(in crate::interface::application::engine) fn has_guaranteed_field(
   source: &[u8],
 ) -> bool {
   Parts::new(node, false, source).any(|part| match part {
-    Part::Fragment(fragment) => fragment.quoted || !fragment.bytes.is_empty(),
+    Part::Fragment(fragment) => fragment.guarantees_field(),
     Part::Expansion(node, true) => single_field_expansion(node, source),
     _ => false,
   })
@@ -104,6 +104,14 @@ pub(in crate::interface::application::engine) struct Fragment {
   pub source: Option<Range<usize>>,
   pub quoted: bool,
   pub split: bool,
+}
+
+impl Fragment {
+  /// Unsplit bytes and quotes keep a field even when every other part of
+  /// the word expands to nothing.
+  fn guarantees_field(&self) -> bool {
+    self.quoted || (!self.split && !self.bytes.is_empty())
+  }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -430,9 +438,7 @@ impl Word {
     for index in range {
       let next = if let Some(count) = self.counts.get(&index) {
         *count
-      } else if self.fragments[index].quoted
-        || !self.fragments[index].bytes.is_empty()
-      {
+      } else if self.fragments[index].guarantees_field() {
         FieldCount::One
       } else {
         continue;
@@ -587,9 +593,7 @@ impl Word {
         let count = if splitting {
           let minimum = usize::from((start..end).any(|index| {
             !self.counts.contains_key(&index)
-              && (self.fragments[index].quoted
-                || (!self.fragments[index].split
-                  && !self.fragments[index].bytes.is_empty()))
+              && self.fragments[index].guarantees_field()
           }));
           FieldCount::Unknown {
             minimum,
@@ -603,9 +607,9 @@ impl Word {
         match part.split(ifs, utf8, usize::MAX) {
           Ok(split) => fields.extend(split),
           Err(issue) => {
-            let minimum = usize::from(part.fragments.iter().any(|part| {
-              part.quoted || (!part.split && !part.bytes.is_empty())
-            }));
+            let minimum = usize::from(
+              part.fragments.iter().any(Fragment::guarantees_field),
+            );
             fields.push(Field::unknown(
               Value::Unknown(issue),
               FieldCount::Unknown {
@@ -839,6 +843,7 @@ enum Piece<'a> {
 }
 
 pub(in crate::interface::application::engine) struct Parts<'a, 's> {
+  node: Node<'a>,
   pending: Vec<Piece<'a>>,
   strip_tabs: bool,
   source: &'s [u8],
@@ -847,6 +852,7 @@ pub(in crate::interface::application::engine) struct Parts<'a, 's> {
 impl<'a, 's> Parts<'a, 's> {
   pub fn new(node: Node<'a>, quoted: bool, source: &'s [u8]) -> Self {
     Self {
+      node,
       pending: vec![Piece::Node(node, quoted)],
       strip_tabs: false,
       source,
@@ -863,6 +869,9 @@ impl<'a, 's> Parts<'a, 's> {
       }
       pieces.push(Piece::Node(child, true));
       start = child.end_byte();
+      if child.kind() == "line_continuation" {
+        start = (start + 1).min(node.end_byte());
+      }
     }
     if start < node.end_byte() {
       pieces.push(Piece::Text(start..node.end_byte(), true));
@@ -900,10 +909,7 @@ impl<'a, 's> Parts<'a, 's> {
   }
 }
 /// `start` indicates whether this chunk begins a line of a `<<-` body.
-pub(in crate::interface::application::engine) fn strip_leading_tabs(
-  bytes: &mut Vec<u8>,
-  mut start: bool,
-) {
+fn strip_leading_tabs(bytes: &mut Vec<u8>, mut start: bool) {
   bytes.retain(|byte| {
     if start && *byte == b'\t' {
       return false;
@@ -919,6 +925,24 @@ impl Parts<'_, '_> {
     self
   }
 
+  fn continued(&self, newline: usize) -> bool {
+    let Some(backslash) = newline
+      .checked_sub(1)
+      .filter(|&backslash| self.source[backslash] == b'\\')
+    else {
+      return false;
+    };
+    let mut scope = Some(self.node);
+    while let Some(node) = scope
+      && !node.byte_range().contains(&backslash)
+    {
+      scope = node.parent();
+    }
+    scope
+      .and_then(|node| node.descendant_for_byte_range(backslash, newline))
+      .is_some_and(|node| node.kind() == "line_continuation")
+  }
+
   fn fragment(&self, mut fragment: Fragment) -> Fragment {
     if self.strip_tabs
       && let Some(range) = &fragment.source
@@ -930,7 +954,9 @@ impl Parts<'_, '_> {
       }
       strip_leading_tabs(
         &mut fragment.bytes,
-        preceding == 0 || self.source[preceding - 1] == b'\n',
+        preceding == 0
+          || (self.source[preceding - 1] == b'\n'
+            && !self.continued(preceding - 1)),
       );
       if fragment.bytes.len() != range.len() {
         fragment.source = None;
@@ -991,7 +1017,9 @@ impl<'a> Iterator for Parts<'a, '_> {
           self.children(node, quoted);
           continue;
         }
-        "here_document_body" | "here_document_sequence" => {
+        "here_document_body"
+        | "quoted_here_document_body"
+        | "here_document_sequence" => {
           self.here_body(node);
           continue;
         }
@@ -1016,13 +1044,13 @@ impl<'a> Iterator for Parts<'a, '_> {
         | "command_substitution"
         | "backquote_substitution"
         | "tilde_expansion" => return Some(Part::Expansion(node, quoted)),
-        "single_quote_content" | "here_document_line_end" => {
-          self.source[node.byte_range()].to_vec()
-        }
+        "here_document_line_end" => self.source[node.byte_range()].to_vec(),
         "literal"
+        | "single_quote_content"
         | "double_quote_text"
         | "dollar_single_quote_text"
-        | "here_document_text" => {
+        | "here_document_text"
+        | "quoted_here_document_text" => {
           self.literal(node, quoted);
           return self
             .ready
@@ -1093,7 +1121,7 @@ fn text(bytes: &[u8], utf8: bool) -> Result<&str, ValueIssue> {
   std::str::from_utf8(bytes).map_err(|_| ValueIssue::Locale)
 }
 
-pub(in crate::interface::application) fn characters(
+pub(in crate::interface::application::engine) fn characters(
   bytes: &[u8],
   utf8: bool,
 ) -> Result<Vec<char>, ValueIssue> {
@@ -1208,18 +1236,31 @@ impl Pattern {
   ) -> bool {
     !self.is_literal()
       && (self.unclosed_bracket
-        || [['.'].as_slice(), &['.', '.']].into_iter().any(|entry| {
-          (self.starts_dot() && self.matches(entry, cancelled))
-            || self.ambiguous_dot(entry, cancelled)
-        }))
+        || [b".".as_slice(), b".."]
+          .into_iter()
+          .any(|entry| self.match_entry(entry, true, cancelled) != Ok(false)))
+  }
+
+  /// A leading period of an entry name is matched only explicitly.
+  pub(in crate::interface::application) fn match_entry(
+    &self,
+    name: &[u8],
+    utf8: bool,
+    cancelled: &AtomicBool,
+  ) -> Result<bool, ValueIssue> {
+    let text = characters(name, utf8)?;
+    if name.starts_with(b".") && !self.starts_dot() {
+      return if self.ambiguous_dot(&text, cancelled) {
+        Err(ValueIssue::Unspecified)
+      } else {
+        Ok(false)
+      };
+    }
+    Ok(self.matches(&text, cancelled))
   }
 
   /// POSIX leaves leading-dot matches by bracket expressions unspecified.
-  pub(in crate::interface::application) fn ambiguous_dot(
-    &self,
-    text: &[char],
-    cancelled: &AtomicBool,
-  ) -> bool {
+  fn ambiguous_dot(&self, text: &[char], cancelled: &AtomicBool) -> bool {
     let start = usize::from(self.atoms.first() == Some(&Atom::Star));
     matches!(self.atoms.get(start), Some(Atom::Class { negated: false, items }) if items.contains(&Item::Character('.')))
       && Self::prefixes(&self.atoms[start..], text, false, cancelled)
@@ -1228,15 +1269,11 @@ impl Pattern {
         .unwrap_or(false)
   }
 
-  pub(in crate::interface::application) fn starts_dot(&self) -> bool {
+  fn starts_dot(&self) -> bool {
     self.atoms.first() == Some(&Atom::Literal('.'))
   }
 
-  pub(in crate::interface::application) fn matches(
-    &self,
-    text: &[char],
-    cancelled: &AtomicBool,
-  ) -> bool {
+  fn matches(&self, text: &[char], cancelled: &AtomicBool) -> bool {
     Self::prefixes(&self.atoms, text, false, cancelled)
       .last()
       .copied()

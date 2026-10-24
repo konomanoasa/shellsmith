@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use super::{Application, Error, Settings};
-use crate::interface::application::engine::check_cancelled;
+use super::{Application, Error, Failure, Settings};
+use crate::interface::application::engine::{self, check_cancelled};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RequestScope {
@@ -17,6 +17,21 @@ pub enum RequestScope {
   Names(PathBuf),
   Workspace,
   WorkspaceAnalysis,
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestOutcome<T> {
+  pub result: Result<T, Error>,
+  pub failures: Vec<Failure>,
+}
+
+impl<T> RequestOutcome<T> {
+  fn failed(error: Error) -> Self {
+    Self {
+      result: Err(error),
+      failures: Vec::new(),
+    }
+  }
 }
 
 struct State {
@@ -45,13 +60,13 @@ impl State {
   }
 
   /// Keeps the most recently collected analyses; reused results may be older.
+  /// A state that found unnotified changes outdates the retained ones.
   fn publish(&mut self, application: &Application) {
+    if application.outdated {
+      self.invalidate();
+    }
     if let Some(analyses) = &application.analyses
-      && self
-        .application
-        .analyses
-        .as_ref()
-        .is_none_or(|previous| previous.collected < analyses.collected)
+      && analyses.supersedes(self.application.analyses.as_deref())
     {
       self.application.analyses = Some(analyses.clone());
       self.updates.send_replace(());
@@ -87,7 +102,7 @@ struct Request {
 }
 
 struct Preparation {
-  result: Shared<BoxFuture<'static, Result<Arc<Application>, Error>>>,
+  result: Shared<BoxFuture<'static, RequestOutcome<Arc<Application>>>>,
   cancelled: Arc<AtomicBool>,
   subscribers: AtomicUsize,
   retain_completed: bool,
@@ -189,11 +204,7 @@ impl Session {
     source: Option<String>,
   ) -> Result<(), Error> {
     let mut state = lock(&self.state)?;
-    let path = if source.is_some() {
-      state.application.document_path(path)?
-    } else {
-      state.application.absolute(path)
-    };
+    let path = state.application.overlay_path(path, source.is_some())?;
     state.application.set_overlay(path, source.map(Arc::from));
     state.invalidate();
     Ok(())
@@ -238,7 +249,7 @@ impl Session {
       .preparations
       .get(&RequestScope::WorkspaceAnalysis)
       .and_then(|job| job.result.peek())
-      .and_then(|result| result.as_ref().ok())
+      .and_then(|outcome| outcome.result.as_ref().ok())
       .cloned()
     {
       state.publish(&application);
@@ -250,7 +261,7 @@ impl Session {
     let task = tokio::spawn(async move {
       let result = request.subscription.job.result.clone().await;
       if let Ok(mut state) = lock(&shared)
-        && let Ok(application) = state.accept(&request, result)
+        && let Ok(application) = state.accept(&request, result.result)
       {
         state.publish(&application);
       }
@@ -267,42 +278,83 @@ impl Session {
     operation: impl FnOnce(&mut Application, &AtomicBool) -> Result<T, Error>
     + Send
     + 'static,
-  ) -> impl Future<Output = Result<T, Error>> + Send + 'static {
+  ) -> impl Future<Output = RequestOutcome<T>> + Send + 'static {
     let workers = self.workers_for(&scope);
-    let prepared = self.subscribe(scope);
+    let prepared = self.subscribe(scope.clone());
     let state = self.state.clone();
     async move {
-      let request = prepared?;
-      let result = request.subscription.job.result.clone().await;
-      let (application, analyses) = {
+      let mut failures = Vec::new();
+      let result = async {
+        let request = prepared?;
+        let outcome = request.subscription.job.result.clone().await;
+        failures = outcome.failures;
+        let (application, published) = {
+          let mut state = lock(&state)?;
+          let application = state.accept(&request, outcome.result)?;
+          (application, state.application.analyses.clone())
+        };
+        let failed_inputs = !application.failures().is_empty();
+        let mut outdated = false;
+        let result =
+          run_blocking(workers, request.cancellation.0.clone(), move |flag| {
+            let mut application = application.as_ref().clone();
+            if let Some(published) = published
+              && published.supersedes(application.analyses.as_deref())
+            {
+              application.analyses = Some(published);
+              application.names = None;
+            }
+            let output = (|| {
+              application.prepare_request(&scope, flag)?;
+              application.request_prepared = true;
+              let output = operation(&mut application, flag);
+              application.request_prepared = false;
+              let output = output?;
+              application.check_inputs(flag)?;
+              Ok(output)
+            })();
+            Ok((output, application))
+          })
+          .await
+          .and_then(|(output, application)| {
+            failures = application.failures().to_vec();
+            outdated = application.outdated;
+            output.map(|output| (output, application))
+          });
         let mut state = lock(&state)?;
-        let application = state.accept(&request, result)?;
+        let result = state.accept(&request, result);
+        if result.is_err()
+          && outdated
+          && Arc::ptr_eq(&request.generation, &state.generation)
+        {
+          state.invalidate();
+        }
+        if result.is_err() && failed_inputs {
+          state
+            .preparations
+            .retain(|_, job| !Arc::ptr_eq(job, &request.subscription.job));
+        }
+        let (output, application) = result?;
         state.publish(&application);
-        (application, state.application.analyses.clone())
-      };
-      let failed_inputs = !application.failures().is_empty();
-      let result =
-        run_blocking(workers, request.cancellation.0.clone(), move |flag| {
-          let mut application = application.as_ref().clone();
-          application.analyses = analyses.or(application.analyses);
-          operation(&mut application, flag)
-        })
-        .await;
-      let mut state = lock(&state)?;
-      let result = state.accept(&request, result);
-      if result.is_err() && failed_inputs {
-        state
-          .preparations
-          .retain(|_, job| !Arc::ptr_eq(job, &request.subscription.job));
+        Ok(output)
       }
-      result
+      .await;
+      if matches!(
+        result,
+        Err(Error::Superseded | Error::Engine(engine::Error::Cancelled))
+      ) {
+        failures.clear();
+      }
+      RequestOutcome { result, failures }
     }
   }
 
   fn workers_for(&self, scope: &RequestScope) -> Arc<tokio::sync::Semaphore> {
     match scope {
-      RequestScope::WorkspaceAnalysis => &self.analysis_worker,
-      RequestScope::Workspace | RequestScope::Names(_) => &self.index_worker,
+      RequestScope::WorkspaceAnalysis | RequestScope::Names(_) => {
+        &self.analysis_worker
+      }
+      RequestScope::Workspace => &self.index_worker,
       _ => &self.workers,
     }
     .clone()
@@ -376,7 +428,11 @@ impl Session {
 
 impl Preparation {
   fn retains_result(&self) -> bool {
-    self.retain_completed && self.result.peek().is_some_and(Result::is_ok)
+    self.retain_completed
+      && self
+        .result
+        .peek()
+        .is_some_and(|outcome| outcome.result.is_ok())
   }
 
   fn new(
@@ -398,38 +454,49 @@ impl Preparation {
     let dependency = prerequisite.clone();
     let result = async move {
       if let Some(prerequisite) = dependency {
-        let result = prerequisite.job.result.clone().await;
+        let outcome = prerequisite.job.result.clone().await;
         prerequisite.release();
-        application = result?.as_ref().clone();
+        match outcome.result {
+          Ok(prepared) => application = prepared.as_ref().clone(),
+          Err(_) => return outcome,
+        }
       }
       run_blocking(workers, flag, move |flag| {
-        match &scope {
-          RequestScope::Analysis(path) => {
-            application.refresh_for(Some(path), flag)?;
-            let id = application.document_id(path).ok_or_else(|| {
-              Error::Message(format!("Cannot load {}", path.display()))
-            })?;
-            application.analyze_document(id, flag)?;
+        let result = (|| {
+          match &scope {
+            RequestScope::Analysis(path) => {
+              application.refresh_for(Some(path), flag)?;
+              let id = application.document_id(path).ok_or_else(|| {
+                Error::Message(format!("Cannot load {}", path.display()))
+              })?;
+              application.analyze_document(id, flag)?;
+            }
+            RequestScope::Results(path) => {
+              application.prepare_analysis(path, flag)?;
+            }
+            RequestScope::Document(path) => {
+              application.refresh_for(Some(path), flag)?;
+            }
+            RequestScope::Names(path) => {
+              application.prepare_names(path, flag)?;
+            }
+            RequestScope::Workspace => {
+              application.refresh_for(None, flag)?;
+            }
+            RequestScope::WorkspaceAnalysis => {
+              application.prepare_workspace_analysis(flag)?;
+            }
           }
-          RequestScope::Results(path) => {
-            application.prepare_analysis(path, flag)?;
-          }
-          RequestScope::Document(path) => {
-            application.refresh_for(Some(path), flag)?;
-          }
-          RequestScope::Names(path) => {
-            application.prepare_names(path, flag)?;
-          }
-          RequestScope::Workspace => {
-            application.refresh_for(None, flag)?;
-          }
-          RequestScope::WorkspaceAnalysis => {
-            application.prepare_workspace_analysis(flag)?;
-          }
-        }
-        Ok(Arc::new(application))
+          Ok(())
+        })();
+        let failures = application.failures().to_vec();
+        Ok(RequestOutcome {
+          result: result.map(|()| Arc::new(application)),
+          failures,
+        })
       })
       .await
+      .unwrap_or_else(RequestOutcome::failed)
     }
     .boxed()
     .shared();
@@ -469,6 +536,48 @@ impl Drop for Session {
     if let Ok(mut state) = self.state.lock() {
       state.invalidate();
     }
+  }
+}
+
+impl Application {
+  fn prepare_request(
+    &mut self,
+    scope: &RequestScope,
+    flag: &AtomicBool,
+  ) -> Result<(), Error> {
+    match scope {
+      RequestScope::Names(path) => {
+        self.prepare_names(path, flag)?;
+      }
+      RequestScope::Results(path) => {
+        self.prepare_position(path, flag)?;
+      }
+      RequestScope::Workspace
+      | RequestScope::Document(_)
+      | RequestScope::Analysis(_) => {
+        if !self.inputs_current(flag)? {
+          let path = match scope {
+            RequestScope::Document(path) | RequestScope::Analysis(path) => {
+              Some(path.as_path())
+            }
+            _ => None,
+          };
+          self.verify_discovery(flag)?;
+          self.refresh_for(path, flag)?;
+          self.outdated = true;
+          if let RequestScope::Analysis(path) = scope {
+            let id = self.document_id(path).ok_or_else(|| {
+              Error::Message(format!("Cannot load {}", path.display()))
+            })?;
+            self.analyze_document(id, flag)?;
+          }
+        }
+      }
+      RequestScope::WorkspaceAnalysis => {
+        self.prepare_workspace_analysis(flag)?;
+      }
+    }
+    Ok(())
   }
 }
 

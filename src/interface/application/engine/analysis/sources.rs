@@ -2,8 +2,8 @@ use super::command::operand_index;
 use super::execution::Environment;
 use super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
-  self, DependencyState, Error, ExecutionContextId, ExecutionKind, ReferenceId,
-  ResolutionIssue, Snapshot, Value, ValueIssue,
+  self, DependencyState, EffectTarget, Error, ExecutionContextId,
+  ExecutionKind, ReferenceId, ResolutionIssue, Snapshot, Value, ValueIssue,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -153,60 +153,68 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let reference = self.index.source(frame.snapshot, node);
-    let input = reference.map(|id| {
-      let mut input = source_input(args, &env);
-      if source_operand(args).is_some() && !node.has_error() {
-        self.annotate_source(id, &mut input);
-      }
-      input
-    });
-    if let Some(reference) = reference {
-      let operand = source_operand(args).map(|arg| frame.location(arg.node));
-      self
-        .result
-        .source_operands
-        .entry(reference)
-        .and_modify(|old| {
-          if *old != operand {
-            *old = None;
-          }
-        })
-        .or_insert(operand);
-    }
-    if let (Some(reference), Some(input)) = (reference, &input) {
-      self
-        .result
-        .source_inputs
-        .entry((reference, Some(frame.context)))
-        .and_modify(|old| old.join(input))
-        .or_insert_with(|| input.clone());
-    }
-    let target = match (reference, input.as_ref()) {
-      (Some(id), Some(input)) => match self.load_source(id, input) {
-        Ok(target) => target.map(|target| (id, target)),
-        Err(error) => {
-          self.error = Some(error);
-          None
-        }
-      },
-      _ => None,
-    };
-    let Some((reference, target)) = target else {
+    let Some(reference) = self.index.source(frame.snapshot, node) else {
       return Task::Done(self.opaque(
         node,
         env,
         frame,
         ResolutionIssue::UnresolvedSource,
-        input.as_ref().and_then(|input| {
-          std::iter::once(&input.operand)
-            .chain(input.cwd.as_ref())
-            .chain(input.search_path.as_ref())
-            .filter_map(Value::issue)
-            .reduce(ValueIssue::combine)
-        }),
+        None,
       ));
     };
+    let operand = source_operand(args);
+    let mut input = source_input(args, &env);
+    if operand.is_some() && !node.has_error() {
+      self.annotate_source(reference, &mut input);
+    }
+    let location = operand.map(|arg| frame.location(arg.node));
+    self
+      .result
+      .source_operands
+      .entry(reference)
+      .and_modify(|old| {
+        if *old != location {
+          *old = None;
+        }
+      })
+      .or_insert(location);
+    self
+      .result
+      .source_inputs
+      .entry((reference, Some(frame.context)))
+      .and_modify(|old| old.join(&input))
+      .or_insert_with(|| input.clone());
+    let target = self.load_source(reference, &input).unwrap_or_else(|error| {
+      self.error = Some(error);
+      None
+    });
+    let Some(target) = target else {
+      let issue = std::iter::once(&input.operand)
+        .chain(input.cwd.as_ref())
+        .chain(input.search_path.as_ref())
+        .filter_map(Value::issue)
+        .reduce(ValueIssue::combine);
+      return Task::Done(self.opaque(
+        node,
+        env,
+        frame,
+        ResolutionIssue::UnresolvedSource,
+        issue,
+      ));
+    };
+    self.source_document(node, args, env, frame, reference, target)
+  }
+
+  /// Evaluates a loaded `.` file in the current environment.
+  fn source_document(
+    &mut self,
+    node: Node<'a>,
+    args: &[super::expansion::Argument<'a>],
+    mut env: Environment,
+    frame: Frame,
+    reference: ReferenceId,
+    target: Snapshot,
+  ) -> Task<'a> {
     if self.sources.active.contains(&target) {
       return Task::Done(self.opaque(
         node,
@@ -232,15 +240,39 @@ impl<'a> Resolver<'a> {
     let root = document.tree.root_node();
     let empty =
       root.child_by_field_name("commands").is_none() && !root.has_error();
+    // XCU dot defines only the file operand. Further operands may replace the
+    // positional parameters (a KornShell extension), and restoring them
+    // afterwards differs between shells.
+    let arguments = args.len() > operand_index(args) + 1;
+    if arguments {
+      self.invalidate(
+        node,
+        &mut env,
+        frame,
+        ResolutionIssue::UnknownEffect,
+        ValueIssue::Unspecified,
+        [EffectTarget::Positionals],
+      );
+    }
     let inner =
       self.execution(node, frame, ExecutionKind::Source(reference), target);
     self.sources.active.push(target);
     Task::eval(root, env, inner).then(move |resolver, flow| {
       resolver.sources.active.pop();
       let mut flow = flow.returned();
-      if empty {
-        for env in flow.environments_mut() {
+      for env in flow.environments_mut() {
+        if empty {
           env.set_status(Value::Literal(b"0".to_vec()));
+        }
+        if arguments {
+          resolver.invalidate(
+            node,
+            env,
+            frame,
+            ResolutionIssue::UnknownEffect,
+            ValueIssue::Unspecified,
+            [EffectTarget::Positionals],
+          );
         }
       }
       Task::Done(flow)

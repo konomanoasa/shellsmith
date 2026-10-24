@@ -26,7 +26,7 @@ tokio = { version = "=1.54.1", features = ["rt-multi-thread", "io-std", "io-util
 tower = { version = "=0.5.3", default-features = false }
 typed-arena = "=2.0.2"
 tree-sitter = "=0.27.1"
-tree-sitter-sh = "=0.21.0"
+tree-sitter-sh = "=0.21.2"
 url = "=2.5.8"
 
 [target.'cfg(unix)'.dependencies]

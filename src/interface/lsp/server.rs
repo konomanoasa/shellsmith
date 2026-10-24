@@ -5,7 +5,7 @@ use super::encoding::{
 };
 use crate::interface::application::engine::DocumentId;
 use crate::interface::application::{
-  Application, Error, Failure, RequestScope, Session,
+  Application, Error, RequestScope, Session,
 };
 use async_lsp::lsp_types::{
   self as lsp, notification as notif, request as req,
@@ -50,15 +50,13 @@ impl Server {
     &mut self,
     params: lsp::InitializeParams,
   ) -> Result<lsp::InitializeResult, ResponseError> {
-    if let Some(folders) = params.workspace_folders {
-      for folder in folders {
-        self
-          .session
-          .add_input(&file_path(&folder.uri)?)
-          .map_err(fault)?;
-      }
-    } else if let Some(root) = params.root_uri {
-      self.session.add_input(&file_path(&root)?).map_err(fault)?;
+    let roots = if let Some(folders) = &params.workspace_folders {
+      self.file_paths(folders.iter().map(|folder| &folder.uri))
+    } else {
+      self.file_paths(params.root_uri.iter())
+    };
+    for root in roots {
+      self.session.add_input(&root).map_err(fault)?;
     }
     let workspace = params.capabilities.workspace;
     self.support.document_changes = workspace
@@ -442,25 +440,23 @@ impl Server {
     + Send
     + 'static,
   ) -> Reply<T> {
-    let job = self.session.request(scope, move |application, cancelled| {
-      let result = operation(application, cancelled)?;
-      Ok((result, application.failures().to_vec()))
-    });
+    let job = self.session.request(scope, operation);
     let client = self.client.clone();
     let session = self.session.clone();
     Box::pin(async move {
-      let result = job.await;
-      if matches!(result, Err(Error::Superseded)) {
+      let outcome = job.await;
+      if outcome.result.is_ok()
+        || matches!(outcome.result, Err(Error::Superseded))
+      {
         let _ = session.start_index();
       }
-      let (result, failures): (T, Vec<Failure>) = result.map_err(fault)?;
-      for failure in failures {
+      for failure in outcome.failures {
         log(
           &client,
           format!("{}: {}", failure.path.display(), failure.message),
         );
       }
-      Ok(result)
+      outcome.result.map_err(fault)
     })
   }
 

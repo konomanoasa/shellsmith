@@ -9,7 +9,6 @@ use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug)]
 pub(in crate::interface::application) struct EntryMetadata {
-  pub path: PathBuf,
   pub dependencies: BTreeSet<(PathBuf, PathBuf)>,
   pub damaged: bool,
 }
@@ -30,12 +29,12 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<Arc<NameCollection>, Error> {
     let path = self.absolute(path);
+    let analyses = self.prepare_position(&path, cancelled)?;
     if let Some(names) = &self.names
       && names.roots.contains(&path)
     {
       return Ok(names.clone());
     }
-    let analyses = self.prepare_analysis(&path, cancelled)?;
     let roots = analyses.entries.keys().cloned().collect();
     let names = Arc::new(self.collect_names(
       roots,
@@ -52,21 +51,6 @@ impl Application {
     selection: InputSelection,
     cancelled: &AtomicBool,
   ) -> Result<NameCollection, Error> {
-    let workspace = std::mem::take(&mut self.workspace);
-    let collection = self.collect_entries(roots, selection, cancelled);
-    self.workspace = workspace;
-    let collection = collection?;
-    self.restore_analysis_documents(cancelled)?;
-    Ok(collection)
-  }
-
-  /// Each root has an independent execution environment.
-  fn collect_entries(
-    &mut self,
-    roots: BTreeSet<PathBuf>,
-    selection: InputSelection,
-    cancelled: &AtomicBool,
-  ) -> Result<NameCollection, Error> {
     let mut collection = NameCollection {
       roots,
       selection,
@@ -75,8 +59,8 @@ impl Application {
     let mut workspaces = Vec::new();
     for path in &collection.roots {
       check_cancelled(cancelled)?;
-      self.workspace = self.analyze_entry(path, cancelled)?;
-      let analysis = self.workspace.analysis().expect("completed analysis");
+      let workspace = self.analyze_entry(path, cancelled)?;
+      let analysis = workspace.analysis().expect("completed analysis");
       let dependencies = analysis
         .source_bindings()
         .iter()
@@ -86,20 +70,17 @@ impl Application {
           };
           Some((
             self
-              .path(
-                self.workspace.source_snapshot(reference.snapshot).document,
-              )?
+              .path(workspace.source_snapshot(reference.snapshot).document)?
               .to_path_buf(),
             self.path(target.document)?.to_path_buf(),
           ))
         })
         .collect();
       collection.entries.push(EntryMetadata {
-        path: path.clone(),
         dependencies,
         damaged: false,
       });
-      for document in self.workspace.documents() {
+      for document in workspace.documents() {
         if let Some(path) = self.path(document.snapshot().document) {
           collection.documents.insert(
             document.snapshot(),
@@ -107,7 +88,7 @@ impl Application {
           );
         }
       }
-      workspaces.push(self.workspace.clone());
+      workspaces.push(workspace);
     }
     collection.results =
       engine::AnalysisResults::new(&workspaces).names(cancelled)?;
@@ -123,6 +104,7 @@ impl Application {
           .is_some_and(engine::Document::has_syntax_errors)
       });
     }
+    self.restore_analysis_documents(cancelled)?;
     Ok(collection)
   }
 
@@ -157,8 +139,7 @@ impl Application {
   ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
     if !self.name_inputs_current(collection, cancelled)? {
-      self.names = None;
-      self.analyses = None;
+      self.discard_results();
       return Err(Error::Superseded);
     }
     Ok(())
@@ -169,11 +150,9 @@ impl Application {
     collection: &NameCollection,
     cancelled: &AtomicBool,
   ) -> Result<bool, Error> {
-    if self.select_inputs(collection.selection.explicit.clone(), cancelled)?
-      != collection.selection
-    {
-      return Ok(false);
-    }
-    self.cache.current(&self.opened, &self.entries, cancelled)
+    Ok(
+      self.selection_current(&collection.selection, cancelled)?
+        && self.cache.current(&self.opened, &self.entries, cancelled)?,
+    )
   }
 }

@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::interface::application::engine::{
-  Alternative, AttributeState, EffectTarget, InitialBinding,
-  InitialEnvironment, Resolution, ResolutionIssue, SymbolId, SymbolKind, Value,
-  ValueIssue,
+  Alternative, AttributeState, BindingOrigin, EffectTarget, ExecutionContextId,
+  InitialBinding, InitialEnvironment, Resolution, ResolutionIssue, SymbolId,
+  SymbolKind, Value, ValueIssue,
 };
 
 pub(super) fn merge_value(into: &mut Arc<Value>, other: &Arc<Value>) {
@@ -30,12 +30,20 @@ pub(in crate::interface::application::engine::analysis) fn alternative(
 ) -> Resolution {
   Resolution {
     alternatives: BTreeSet::from([value]),
+    origins: if matches!(
+      value,
+      Alternative::Environment | Alternative::External | Alternative::Unset
+    ) {
+      [BindingOrigin::Unknown].into_iter().collect()
+    } else {
+      imbl::OrdSet::new()
+    },
     ..Resolution::default()
   }
 }
 
 fn initial(binding: InitialBinding) -> Resolution {
-  match binding {
+  let result = match binding {
     InitialBinding::Absent => alternative(Alternative::Unset),
     InitialBinding::External => alternative(Alternative::External),
     InitialBinding::Unknown => Resolution {
@@ -43,7 +51,8 @@ fn initial(binding: InitialBinding) -> Resolution {
       issues: BTreeSet::from([ResolutionIssue::InitialState]),
       ..Resolution::default()
     },
-  }
+  };
+  result.in_context(ExecutionContextId(0))
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -64,10 +73,14 @@ impl Binding {
         .alternatives
         .is_superset(&other.resolution.alternatives)
       && self.resolution.issues.is_superset(&other.resolution.issues)
+      && other.resolution.origins.is_subset(&self.resolution.origins)
   }
 
   pub fn new(resolution: Resolution) -> Self {
-    let value = if resolution == alternative(Alternative::Unset) {
+    let value = if resolution.candidates.is_empty()
+      && resolution.issues.is_empty()
+      && resolution.alternatives == [Alternative::Unset].into()
+    {
       Value::Literal(Vec::new())
     } else {
       Value::Unknown(ValueIssue::Dynamic)
@@ -83,12 +96,20 @@ impl Binding {
     merge_value(&mut self.value, &other.value);
   }
 
-  pub fn taint(&mut self, issue: ResolutionIssue, value_issue: ValueIssue) {
+  pub fn taint(
+    &mut self,
+    origin: BindingOrigin,
+    issue: ResolutionIssue,
+    value_issue: ValueIssue,
+  ) {
     self
       .resolution
       .alternatives
       .extend([Alternative::External, Alternative::Unset]);
     self.resolution.issues.insert(issue);
+    if !self.resolution.origins.contains(&origin) {
+      self.resolution.origins.insert(origin);
+    }
     self.value = Arc::new(Value::Unknown(
       self
         .value
@@ -163,6 +184,7 @@ impl Names {
     &mut self,
     pattern: Option<Value>,
     kept: impl Fn(&[u8]) -> bool,
+    context: ExecutionContextId,
     issue: ResolutionIssue,
     value_issue: ValueIssue,
   ) {
@@ -172,22 +194,30 @@ impl Names {
         .is_none_or(|pattern| pattern.can_equal(&name))
         && !kept(&name)
       {
-        binding.taint(issue, value_issue);
+        binding.taint(BindingOrigin::Context(context), issue, value_issue);
         self.values.insert(name, binding);
       }
     }
     if let Some(pattern) = pattern {
-      self.restrict(pattern, issue, value_issue);
+      self.restrict(
+        pattern,
+        BindingOrigin::Context(context),
+        issue,
+        value_issue,
+      );
     } else {
       self.patterns.clear();
       self.uncertain = None;
-      self.fallback.taint(issue, value_issue);
+      self
+        .fallback
+        .taint(BindingOrigin::Context(context), issue, value_issue);
     }
   }
 
   pub fn restrict(
     &mut self,
     pattern: Value,
+    origin: BindingOrigin,
     issue: ResolutionIssue,
     value_issue: ValueIssue,
   ) {
@@ -195,7 +225,7 @@ impl Names {
       .uncertain
       .take()
       .unwrap_or_else(|| self.fallback.clone());
-    fallback.taint(issue, value_issue);
+    fallback.taint(origin, issue, value_issue);
     self.uncertain = Some(fallback);
     self.patterns.insert(pattern);
   }
@@ -461,10 +491,21 @@ pub(in crate::interface::application::engine::analysis) struct Environment {
   pub substitution_status: Option<Value>,
   /// Errors in this command's expansions, assignments and redirections.
   pub failure: CommandFailure,
-  pub option_cursor: Option<(Positionals, usize)>,
+  pub option_cursor: Option<OptionCursor>,
   pub options_reset: bool,
   pub io: Io,
   pub directory_variables_modified: bool,
+}
+
+/// The getopts position after the last parsed option.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::interface::application::engine::analysis) struct OptionCursor {
+  pub arguments: Positionals,
+  pub index: usize,
+  pub offset: usize,
+  /// The function call depth of the parse; callers and their functions do not
+  /// share one parse.
+  pub functions: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -509,32 +550,39 @@ impl Environment {
   pub(in crate::interface::application::engine::analysis) fn invalidate(
     &mut self,
     target: EffectTarget,
+    context: ExecutionContextId,
     issue: ResolutionIssue,
     value_issue: ValueIssue,
   ) {
     match target {
       EffectTarget::Variable(name) => {
-        if self.taint_variable(&name, issue, value_issue) {
+        if self.taint_variable(&name, context, issue, value_issue) {
           self.variable_changed(&name, None);
         }
       }
       EffectTarget::VariablePattern(pattern) => {
-        self.invalidate_names(false, Some(pattern), issue, value_issue);
+        self.invalidate_names(
+          false,
+          Some(pattern),
+          context,
+          issue,
+          value_issue,
+        );
       }
       EffectTarget::Variables => {
-        self.invalidate_names(false, None, issue, value_issue);
+        self.invalidate_names(false, None, context, issue, value_issue);
       }
       EffectTarget::Function(name) => {
         self.alternatives.forget_function(&name);
         let mut binding = self.functions.get(&name).clone();
-        binding.taint(issue, value_issue);
+        binding.taint(BindingOrigin::Context(context), issue, value_issue);
         self.functions.values.insert(name, binding);
       }
       EffectTarget::FunctionPattern(pattern) => {
-        self.invalidate_names(true, Some(pattern), issue, value_issue);
+        self.invalidate_names(true, Some(pattern), context, issue, value_issue);
       }
       EffectTarget::Functions => {
-        self.invalidate_names(true, None, issue, value_issue);
+        self.invalidate_names(true, None, context, issue, value_issue);
       }
       EffectTarget::Attribute(name) => {
         if !self.readonly.contains_key(&name) {
@@ -547,10 +595,11 @@ impl Environment {
       EffectTarget::Attributes => {
         self.unknown_attributes.insert(Value::Unknown(value_issue));
       }
+      EffectTarget::Sources => {}
       EffectTarget::Directory => {
         self.cwd = Value::Unknown(value_issue);
         for name in [b"PWD".as_slice(), b"OLDPWD"] {
-          self.taint_variable(name, issue, value_issue);
+          self.taint_variable(name, context, issue, value_issue);
         }
       }
       EffectTarget::Positionals => {
@@ -579,6 +628,7 @@ impl Environment {
     &mut self,
     functions: bool,
     pattern: Option<Value>,
+    context: ExecutionContextId,
     issue: ResolutionIssue,
     value_issue: ValueIssue,
   ) {
@@ -609,13 +659,14 @@ impl Environment {
     } else {
       &mut self.variables
     };
-    names.invalidate(pattern, kept, issue, value_issue);
+    names.invalidate(pattern, kept, context, issue, value_issue);
   }
 
   /// Definite readonly bindings survive; returns whether the value may change.
   fn taint_variable(
     &mut self,
     name: &[u8],
+    context: ExecutionContextId,
     issue: ResolutionIssue,
     value_issue: ValueIssue,
   ) -> bool {
@@ -624,7 +675,7 @@ impl Environment {
     }
     self.alternatives.forget(name);
     let mut binding = self.variables.get(name).clone();
-    binding.taint(issue, value_issue);
+    binding.taint(BindingOrigin::Context(context), issue, value_issue);
     self.variables.values.insert(name.to_vec(), binding);
     true
   }
@@ -705,7 +756,8 @@ impl Environment {
             (
               name.clone(),
               Binding {
-                resolution: alternative(Alternative::Environment),
+                resolution: alternative(Alternative::Environment)
+                  .in_context(ExecutionContextId(0)),
                 value: Arc::new(if value.contains(&0) {
                   Value::Unknown(ValueIssue::Nul)
                 } else {
@@ -718,7 +770,8 @@ impl Environment {
             (
               name.clone(),
               Binding {
-                resolution: alternative(Alternative::External),
+                resolution: alternative(Alternative::External)
+                  .in_context(ExecutionContextId(0)),
                 value: Arc::new(Value::Literal(bytes.clone())),
               },
             )
@@ -780,7 +833,12 @@ impl Environment {
   }
 
   pub fn join(&mut self, other: &Self) {
-    let alternatives = Alternatives::joined(self, other);
+    self.join_choice(None, other);
+  }
+
+  /// Joins the two sides of `choice`; `None` introduces a new choice.
+  pub fn join_choice(&mut self, choice: Option<usize>, other: &Self) {
+    let alternatives = Alternatives::joined(self, other, choice);
     self.join_values(other);
     self.alternatives = alternatives;
   }
@@ -1117,16 +1175,30 @@ impl Flow {
   }
 
   pub fn add(&mut self, transfer: Transfer, environment: Environment) {
+    self.add_choice(None, transfer, environment);
+  }
+
+  fn add_choice(
+    &mut self,
+    choice: Option<usize>,
+    transfer: Transfer,
+    environment: Environment,
+  ) {
     self
       .0
       .entry(transfer)
-      .and_modify(|old| old.join(&environment))
+      .and_modify(|old| old.join_choice(choice, &environment))
       .or_insert(environment);
   }
 
   pub fn join(&mut self, other: Self) {
+    self.join_choice(None, other);
+  }
+
+  /// Joins flows from the two sides of `choice`; `None` introduces new choices.
+  pub fn join_choice(&mut self, choice: Option<usize>, other: Self) {
     for (transfer, environment) in other.0 {
-      self.add(transfer, environment);
+      self.add_choice(choice, transfer, environment);
     }
   }
 }

@@ -64,6 +64,7 @@ pub struct NameOccurrence {
   pub resolution: Option<Resolution>,
   pub compatible: bool,
   pub readonly: AttributeState,
+  origins: BTreeSet<NameId>,
 }
 
 impl NameOccurrence {
@@ -190,9 +191,10 @@ impl NameRelations {
     }
     for site in &mut self.occurrences {
       check_cancelled(cancelled)?;
+      site.names.extend(&site.origins);
       if let Some(resolution) = &site.resolution {
-        for symbol in &resolution.candidates {
-          if let Some(names) = definitions.get(symbol) {
+        for symbol in resolution.name_definitions() {
+          if let Some(names) = definitions.get(&symbol) {
             site.names.extend(names);
           } else {
             site.compatible = false;
@@ -220,15 +222,6 @@ impl NameRelations {
       for (site, targets) in self.occurrences.iter().zip(&bindings) {
         check_cancelled(cancelled)?;
         let Some(targets) = targets else { continue };
-        if !site
-          .resolution
-          .as_ref()
-          .expect("resolved binding")
-          .alternatives
-          .is_empty()
-        {
-          continue;
-        }
         let mut targets = targets.iter().map(|id| identity(&identities, id.0));
         let Some(target) = targets.next() else {
           continue;
@@ -265,11 +258,12 @@ impl NameRelations {
     site: &NameOccurrence,
     definitions: &BTreeMap<SymbolId, BTreeSet<NameId>>,
   ) -> Option<BTreeSet<NameId>> {
-    let name = &self.names[site.name?.0];
+    let local = site.name?;
+    let name = &self.names[local.0];
     let resolution = site.resolution.as_ref()?;
     if !site.compatible
       || site.access == Access::Unknown
-      || !resolution.is_complete()
+      || resolution.origins.contains(&engine::BindingOrigin::Unknown)
       || resolution.alternatives.iter().any(|alternative| {
         !matches!(
           (name.kind, site.access, alternative),
@@ -282,17 +276,27 @@ impl NameRelations {
           ) | (
             SymbolKind::Function,
             Access::NameReference,
-            Alternative::Unset
+            Alternative::External | Alternative::Unset
           )
         )
       })
     {
       return None;
     }
-    let mut targets = BTreeSet::new();
-    for symbol in &resolution.candidates {
+    let mut targets = site.origins.clone();
+    if targets.iter().any(|id| {
+      !self.may_inherit(name.environment, self.names[id.0].environment)
+    }) {
+      return None;
+    }
+    if resolution.origins.is_empty()
+      && (!resolution.is_complete() || !resolution.alternatives.is_empty())
+    {
+      targets.insert(local);
+    }
+    for symbol in resolution.name_definitions() {
       let owners: Vec<_> = definitions
-        .get(symbol)?
+        .get(&symbol)?
         .iter()
         .copied()
         .filter(|id| {
@@ -479,6 +483,17 @@ impl SyntaxNames {
       let own_definition = definitions.get(&occurrence.id).copied();
       if occurrence.kind == OccurrenceKind::Command {
         self.deferred_arguments(document, occurrence, environment);
+      } else if !matches!(occurrence.name, Value::Literal(_)) {
+        self.dependencies.push(NameDependency {
+          environment,
+          location: occurrence.location.clone(),
+          targets: [if occurrence.kind == OccurrenceKind::FunctionDefinition {
+            EffectTarget::Functions
+          } else {
+            EffectTarget::Variables
+          }]
+          .into(),
+        });
       }
       self.names.insert(
         site,
@@ -978,18 +993,7 @@ impl<'a> Relationships<'a> {
         text: text.clone(),
         temporary,
       };
-      let id = *self.keys.entry(key).or_insert_with(|| {
-        let id = NameId(self.result.names.len());
-        self.result.names.push(Name {
-          id,
-          kind,
-          text: text.clone(),
-          environment,
-          temporary,
-          definitions: BTreeSet::new(),
-        });
-        id
-      });
+      let id = self.name(key);
       self.result.names[id.0].definitions.extend(&definitions);
       names.insert(id);
     }
@@ -1000,6 +1004,12 @@ impl<'a> Relationships<'a> {
         .cloned()
         .unwrap_or_default()
     });
+    let origins = names
+      .first()
+      .zip(resolution.as_ref())
+      .map_or_else(BTreeSet::new, |(name, resolution)| {
+        self.binding_origins(*name, resolution)
+      });
     let spans = text
       .as_ref()
       .map_or_else(Vec::new, |_| self.project_spelling(&spelling));
@@ -1021,9 +1031,89 @@ impl<'a> Relationships<'a> {
       resolution,
       compatible,
       readonly,
+      origins,
     };
+    self.undecoded_dependency(&occurrence, kind);
     self.deferred_dependency(&occurrence);
     self.result.occurrences.push(occurrence);
+  }
+
+  fn binding_origins(
+    &mut self,
+    local: NameId,
+    resolution: &Resolution,
+  ) -> BTreeSet<NameId> {
+    let name = &self.result.names[local.0];
+    let kind = name.kind;
+    let text = name.text.clone();
+    let mut origins = BTreeSet::new();
+    for origin in &resolution.origins {
+      let id = match origin {
+        engine::BindingOrigin::Context(context) => {
+          let temporary = (kind == SymbolKind::Variable)
+            .then(|| {
+              self
+                .analysis
+                .context_ancestors(*context)
+                .find_map(|ancestor| {
+                  self
+                    .analysis
+                    .temporary
+                    .get(&ancestor.id)?
+                    .get(&text)
+                    .copied()
+                })
+            })
+            .flatten();
+          self.name(NameKey {
+            environment: NameEnvironment::Execution(
+              self.analysis.name_environment(*context),
+            ),
+            kind,
+            text: text.clone(),
+            temporary,
+          })
+        }
+        engine::BindingOrigin::Unknown => local,
+        engine::BindingOrigin::Definition(_) => continue,
+      };
+      origins.insert(id);
+    }
+    origins
+  }
+
+  fn name(&mut self, key: NameKey) -> NameId {
+    *self.keys.entry(key.clone()).or_insert_with(|| {
+      let id = NameId(self.result.names.len());
+      self.result.names.push(Name {
+        id,
+        kind: key.kind,
+        text: key.text,
+        environment: key.environment,
+        temporary: key.temporary,
+        definitions: BTreeSet::new(),
+      });
+      id
+    })
+  }
+
+  fn undecoded_dependency(
+    &mut self,
+    occurrence: &NameOccurrence,
+    kind: Option<SymbolKind>,
+  ) {
+    if let (Some(context), Some(SymbolKind::Variable)) =
+      (occurrence.context, kind)
+      && occurrence.names.is_empty()
+    {
+      self.result.dependencies.push(NameDependency {
+        environment: NameEnvironment::Execution(
+          self.analysis.name_environment(context),
+        ),
+        location: occurrence.location.clone(),
+        targets: [EffectTarget::Variables].into(),
+      });
+    }
   }
 
   fn deferred_dependency(&mut self, occurrence: &NameOccurrence) {
@@ -1127,7 +1217,7 @@ impl<'a> Relationships<'a> {
         };
         Some(Description {
           kind: Some(kind),
-          text: literal(&occurrence.name),
+          text: occurrence.name.literal().ok().map(<[u8]>::to_vec),
           access: occurrence.access,
           fragments: syntax_spelling(document, occurrence),
           compatible: true,
@@ -1169,9 +1259,11 @@ impl<'a> Relationships<'a> {
             Some(name.clone()),
             Access::NameReference,
           ),
-          Some(ArgumentKind::Command { name }) => {
-            (Some(SymbolKind::Function), literal(name), Access::Read)
-          }
+          Some(ArgumentKind::Command { name }) => (
+            Some(SymbolKind::Function),
+            name.literal().ok().map(<[u8]>::to_vec),
+            Access::Read,
+          ),
           Some(ArgumentKind::ShellBody) => return None,
           Some(ArgumentKind::Number) | None => (None, None, Access::Unknown),
         };
@@ -1227,33 +1319,40 @@ impl<'a> Relationships<'a> {
         return NameSpelling::Exact(exact);
       }
     }
-    if self
-      .workspace
-      .derived_origin(location.snapshot.document)
-      .is_none()
-      && let Some(node) =
-        document.tree.root_node().named_descendant_for_byte_range(
-          location.bytes.start,
-          location.bytes.end,
-        )
+    if let Some(node) = document
+      .tree
+      .root_node()
+      .named_descendant_for_byte_range(location.bytes.start, location.bytes.end)
       && node.byte_range() == location.bytes
-      && engine::word::literal_value(node, document.source().as_bytes())
-        == Value::Literal(name.to_vec())
+      && (engine::word::lexical(node, document.source().as_bytes()) == name
+        || engine::word::literal_value(node, document.source().as_bytes())
+          == Value::Literal(name.to_vec()))
+      && let Some(word) = self.verbatim_source(document, location)
     {
-      return NameSpelling::LiteralWord(location.clone());
+      return NameSpelling::LiteralWord(word);
     }
     NameSpelling::Fragments(projected.to_vec())
   }
-}
 
-fn literal(value: &Value) -> Option<Vec<u8>> {
-  match value {
-    Value::Literal(text) => Some(text.clone()),
-    Value::Unknown(_) | Value::Partial(_) => None,
+  /// The source range that `location` copies byte for byte.
+  fn verbatim_source(
+    &self,
+    document: &Document,
+    location: &Location,
+  ) -> Option<Location> {
+    let [source] =
+      <[Location; 1]>::try_from(self.workspace.project_locations(location)?)
+        .ok()?;
+    (self
+      .workspace
+      .document(source.snapshot.document)?
+      .text(&source)?
+      == document.text(location)?)
+    .then_some(source)
   }
 }
 
-pub(super) fn syntax_spelling(
+pub(in crate::interface::application::engine) fn syntax_spelling(
   document: &super::Document,
   site: &Occurrence,
 ) -> Vec<Location> {

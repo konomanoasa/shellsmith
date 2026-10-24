@@ -67,11 +67,23 @@ impl Values {
     self.entries[id].maximum
   }
 
-  pub fn ascii_width(&self, id: ValueId) -> Option<usize> {
-    self.entries[id]
-      .ascii
-      .then_some(self.entries[id].width)
-      .flatten()
+  /// Character counts of ASCII values; differing widths are counted per path.
+  pub fn ascii_length(
+    &mut self,
+    id: ValueId,
+    cancelled: &AtomicBool,
+  ) -> Result<Option<ValueId>, Error> {
+    let entry = &self.entries[id];
+    if !entry.ascii {
+      return Ok(None);
+    }
+    let count = |width: usize| Value::Literal(width.to_string().into_bytes());
+    if let Some(width) = entry.width {
+      return Ok(Some(self.literal(Arc::new(count(width)))));
+    }
+    self
+      .apply(id, id, |value, _| count(value.known_size()), cancelled)
+      .map(Some)
   }
 
   pub fn choice(&self, id: ValueId) -> Option<usize> {
@@ -108,9 +120,43 @@ impl Values {
     })
   }
 
+  /// Values that cannot be concatenated independently are concatenated per
+  /// path, so each path keeps its exact string.
+  pub fn concat(
+    &mut self,
+    left: ValueId,
+    right: ValueId,
+    cancelled: &AtomicBool,
+  ) -> Result<Option<ValueId>, Error> {
+    if let Some(id) = self.independent_concat(left, right) {
+      return Ok(Some(id));
+    }
+    if self.entries[left].maximum.is_none()
+      || self.entries[right].maximum.is_none()
+    {
+      return Ok(None);
+    }
+    self
+      .apply(
+        left,
+        right,
+        |a, b| {
+          let mut value = a.clone();
+          value.concat(b, usize::MAX);
+          value
+        },
+        cancelled,
+      )
+      .map(Some)
+  }
+
   /// Fixed widths and independent choices let concatenation commute with
   /// projection without introducing strings from incompatible branches.
-  pub fn concat(&mut self, left: ValueId, right: ValueId) -> Option<ValueId> {
+  fn independent_concat(
+    &mut self,
+    left: ValueId,
+    right: ValueId,
+  ) -> Option<ValueId> {
     if self.entries[left].width == Some(0) {
       return Some(right);
     }
@@ -180,7 +226,7 @@ impl Values {
           self.branch(choice, cache[&left], cache[&right])
         }
         Expression::Concat(..) => self
-          .concat(cache[&left], cache[&right])
+          .independent_concat(cache[&left], cache[&right])
           .expect("restricted independent concatenation"),
         Expression::Literal(_) => unreachable!(),
       };

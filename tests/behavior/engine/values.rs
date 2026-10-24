@@ -377,6 +377,10 @@ mod assignments {
       "(x=new) >\"${}\"",
       ": \"$(x=new; : \"${}\")\"",
       "{ x=new; : \"${}\"; } &",
+      "y=$(x=new; : \"${}\")",
+      "y=`x=new; : \"${}\"`",
+      "export y=$(x=new; : \"${}\")",
+      "for item in $(x=new; : \"${}\"); do :; done",
     ] {
       let source = format!("x=old; {body}\n: \"$x\"");
       let (workspace, analysis) = support::analyze_damaged(&source);
@@ -390,6 +394,17 @@ mod assignments {
           .gaps()
           .iter()
           .any(|gap| gap.issue == ResolutionIssue::Recovery),
+        "{source}"
+      );
+    }
+    for source in [
+      "y=$(: \"${}\"); : \"$y\"",
+      "export y=$(: \"${}\"); : \"$y\"",
+    ] {
+      let (workspace, analysis) = support::analyze_damaged(source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"y"),
+        [Value::Unknown(ValueIssue::Recovery)],
         "{source}"
       );
     }
@@ -475,6 +490,10 @@ mod assignments {
       ("command -p printf ignored 1<<'END'\ninput\nEND\n", ""),
       ("exec >output; command -p printf ignored", ""),
       ("command exec >output; command -p printf ignored", ""),
+      (
+        "command() { :; }; command exec >output; unset -f command; command -p printf kept",
+        "kept",
+      ),
       ("f() { exec >output; }; f; command -p printf ignored", ""),
       (
         "{ exec >other; command -p printf ignored; } >output; command -p printf kept",
@@ -505,6 +524,8 @@ mod assignments {
       "command -p printf value | unknown_utility",
       "<input",
       "<input >output",
+      "if read c; then command() { :; }; fi; command exec >output; unset -f command; command -p printf kept",
+      "command() { :; }; command exec <<'EOF'\nabc\nEOF\nunset -f command; read x; command -p printf %s \"$x\"",
     ] {
       let source = format!("out=$({body}); : \"$out\"");
       let (workspace, analysis) = analyze(&source);
@@ -748,7 +769,11 @@ mod assignments {
       ),
       (
         "read -r out <<-END\n\tfoo\\\n\tbar\n\tEND\n: \"$out\"",
-        "foobar",
+        "foo\tbar",
+      ),
+      (
+        "unset v; IFS= read -r out <<-END\n\t${v:-\\\n\tvalue}\n\tEND\n: \"$out\"",
+        "\tvalue",
       ),
       (
         "tab='\tvalue'; IFS= read -r out <<-END\n\t$tab\n\tEND\n: \"$out\"",
@@ -762,11 +787,40 @@ mod assignments {
         "{ IFS= read -r first; IFS= read -r out; } <<-'END'\n\tone\n\t\ttwo\n\tEND\n: \"$out\"",
         "two",
       ),
+      (
+        "unset v; { IFS= read -r first; IFS= read -r out; } <<-END\n\t${v:-one\n\t\ttwo}\n\tEND\n: \"$out\"",
+        "two",
+      ),
+      (
+        "IFS= read -r out <<-END\n\t$({ IFS= read -r first; IFS= read -r second; } <<INNER\n\tone\n\t\ttwo\n\tINNER\n\tcommand -p printf %s \"$second\")\n\tEND\n: \"$out\"",
+        "two",
+      ),
+      (
+        "IFS= read -r out <<-END\n\t$({ IFS= read -r first; IFS= read -r second; } <<'INNER'\n\tone\n\t\ttwo\n\tINNER\n\tcommand -p printf %s \"$second\")\n\tEND\n: \"$out\"",
+        "two",
+      ),
     ] {
       let (workspace, analysis) = analyze(source);
       assert_eq!(
         reads(&workspace, &analysis, b"out"),
         [Value::Literal(expected.as_bytes().to_vec())],
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn here_document_line_continuations_join_lines_inside_nested_words_and_bodies()
+   {
+    for source in [
+      "first=foo; second=bar; read -r out <<END\n$first\\\n$second\nEND\n: \"$out\"",
+      "read -r out <<END\n$(command -p printf %s 'foo\\\nbar')\nEND\n: \"$out\"",
+      "read -r out <<END\n$(read -r inner <<'INNER'\nfoo\\\nbar\nINNER\ncommand -p printf %s \"$inner\")\nEND\n: \"$out\"",
+    ] {
+      let (workspace, analysis) = analyze(source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Literal(b"foobar".to_vec())],
         "{source}"
       );
     }
@@ -793,6 +847,68 @@ mod assignments {
         "{source}: {:?}",
         reads(&workspace, &analysis, b"out")
       );
+    }
+  }
+
+  #[test]
+  fn getopts_sets_optind_only_after_option_arguments_and_keeps_its_position() {
+    for (source, expected) in [
+      (
+        "OPTIND=1; getopts a: option -avalue; out=$OPTIND; : \"$out\"",
+        Value::Literal(b"2".to_vec()),
+      ),
+      (
+        "OPTIND=1; getopts ab: first -ab value; getopts ab: second -ab value; out=$second/$OPTARG/$OPTIND; : \"$out\"",
+        Value::Literal(b"b/value/3".to_vec()),
+      ),
+      (
+        "OPTIND=1; getopts ab first -a -b; getopts ab out -a -b; : \"$out\"",
+        Value::Literal(b"b".to_vec()),
+      ),
+      (
+        "OPTIND=1; getopts ab option -ab; out=$OPTIND; : \"$out\"",
+        Value::Unknown(ValueIssue::Unspecified),
+      ),
+      (
+        "OPTIND=1; getopts a option -a value; out=$OPTIND; : \"$out\"",
+        Value::Unknown(ValueIssue::Unspecified),
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      assert_eq!(reads(&workspace, &analysis, b"out"), [expected], "{source}");
+    }
+  }
+
+  #[test]
+  fn getopts_resumes_only_within_one_function_depth() {
+    for (source, expected) in [
+      (
+        "OPTIND=1; getopts ab first -ab; f() { :; }; f; getopts ab out -ab; : \"$out\"",
+        Value::Literal(b"b".to_vec()),
+      ),
+      (
+        "OPTIND=1; getopts ab first -ab; out=$(getopts ab value -ab; command -p printf %s \"$value\"); : \"$out\"",
+        Value::Literal(b"b".to_vec()),
+      ),
+      (
+        "f() { getopts ab first -ab; getopts ab out -ab; }; OPTIND=1; f; : \"$out\"",
+        Value::Literal(b"b".to_vec()),
+      ),
+      (
+        "OPTIND=1; getopts ab first -ab; f() { getopts ab out -ab; }; f; : \"$out\"",
+        Value::Unknown(ValueIssue::Unspecified),
+      ),
+      (
+        "f() { getopts ab first -ab; }; OPTIND=1; f; getopts ab out -ab; : \"$out\"",
+        Value::Unknown(ValueIssue::Unspecified),
+      ),
+      (
+        "OPTIND=1; getopts ab first -ab; f() { OPTIND=1; getopts ab out -ab; }; f; : \"$out\"",
+        Value::Literal(b"a".to_vec()),
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      assert_eq!(reads(&workspace, &analysis, b"out"), [expected], "{source}");
     }
   }
 
@@ -1483,6 +1599,7 @@ mod assignments {
         false,
         true,
       ),
+      ("read", vec![EffectTarget::Variables], false, true),
       (
         "unset -v -- \"$target\"",
         vec![EffectTarget::Variables],
@@ -1724,6 +1841,8 @@ mod expansion {
       "set -u; unset x; : \"$x\"",
       "set -u; unset x; : \"${#x}\"",
       "set -u; set --; : \"$1\"",
+      "set -u; unset x; : \"$((x))\"",
+      "if condition; then a=1; else a=2; fi; set -u; unset x; y=$((x + a))",
       ": < ''",
       ": > ''",
       "> ''",
@@ -2226,6 +2345,26 @@ mod expansion {
         "if condition; then a=1; b=1; else a=2; b=2; fi; a=3; result=$((a-a)); : \"$result\"",
         "0",
       ),
+      (
+        "if c; then a=1; b=1; else a=2; b=2; fi; f() { :; }; while condition; do f \"$a\"; done; result=$((a-b)); : \"$result\"",
+        "0",
+      ),
+      (
+        "if c; then a=1; b=1; else a=2; b=2; fi; for i in 1 2; do export \"v$a\"; done; result=$((a-b)); : \"$result\"",
+        "0",
+      ),
+      (
+        "if c; then a=1; b=1; else a=2; b=2; fi; f() { :; }; f \"$a\" | :; result=$((a-b)); : \"$result\"",
+        "0",
+      ),
+      (
+        "if c; then a=1; else a=2; fi; f() { if d; then x=$1; y=$1; else x=0; y=0; fi; }; f \"$a\"; result=$((x-y)); : \"$result\"",
+        "0",
+      ),
+      (
+        "if c; then a=1; else a=2; fi; f() { if d; then x=$1; else x=0; fi; }; f \"$a\"; result=$((x*(x-a))); : \"$result\"",
+        "0",
+      ),
     ] {
       assert_eq!(
         last_value(source, InitialEnvironment::empty()),
@@ -2289,11 +2428,31 @@ mod expansion {
     for source in [
       "read unknown; : \"$((unknown ? (a=b=3) : (a=b=4)))\"; result=$((a-b)); : \"$result\"",
       "if condition; then a=1; b=1; else unset a; b=0; fi; read unknown; : \"${unknown:-default}\"; result=$((a-b)); : \"$result\"",
+      "if condition; then a=1; b=1; else a=2; b=2; fi; : <<EOF\n${c=$a}\nEOF\nresult=$((c-b)); : \"$result\"",
     ] {
       assert_eq!(
         last_value(source, InitialEnvironment::empty()),
         Value::Literal(b"0".to_vec()),
         "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn branch_appends_of_different_widths_keep_each_path_exact() {
+    let appends = "if [ -d d ]; then PATH=\"$PATH:d\"; fi\n".repeat(40);
+    for (tail, expected) in [
+      ("n=${#PATH}; result=$(((n - 4) % 2)); : \"$result\"", "0"),
+      (
+        "joined=\"$PATH$PATH\"; n=${#joined}; result=$((n % 4)); : \"$result\"",
+        "0",
+      ),
+    ] {
+      let source = format!("PATH=/bin\n{appends}{tail}");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{tail}"
       );
     }
   }
@@ -2454,6 +2613,14 @@ mod expansion {
       (
         "set -- \\$x$y; command -p echo $#",
         &[ValueIssue::Dynamic, ValueIssue::TransformedSource],
+      ),
+      (
+        "IFS= read -r x <<EOF\n\\\\$y$y\nEOF\ncommand -p printf %s \"$x\"",
+        &[ValueIssue::Dynamic, ValueIssue::TransformedSource],
+      ),
+      (
+        "IFS= read -r x <<'EOF'\na\\\\b\nEOF\ncommand -p printf %s \"$x\"",
+        &[ValueIssue::TransformedSource],
       ),
     ] {
       let source = format!("read y; result=`{body}`; : \"$result\"");
@@ -3239,15 +3406,33 @@ EOF
         "{source}"
       );
     }
-    let mut initial = InitialEnvironment::empty();
-    initial.positional = None;
-    assert_eq!(
-      last_value(
-        "set -- a b \"$@\"; shift; result=$1; : \"$result\"",
-        initial
+    for (body, expected) in [
+      (
+        "set -- a b \"$@\"; shift; result=$1",
+        Value::Literal(b"b".to_vec()),
       ),
-      Value::Literal(b"b".to_vec())
-    );
+      (
+        "x=' '; set -- \"$@\"$x; result=${1+set}",
+        Value::Partial(PartialValue {
+          choices: [b"".as_slice(), b"set"]
+            .into_iter()
+            .map(|choice| ValueConstraint {
+              prefix: choice.to_vec(),
+              suffix: choice.to_vec(),
+              minimum: choice.len(),
+              required: choice.iter().copied().collect(),
+              exact: true,
+            })
+            .collect(),
+          issue: ValueIssue::Dynamic,
+        }),
+      ),
+    ] {
+      let mut initial = InitialEnvironment::empty();
+      initial.positional = None;
+      let source = format!("{body}; : \"$result\"");
+      assert_eq!(last_value(&source, initial), expected, "{source}");
+    }
     for (body, expected) in [
       (
         "set -- $x; result=${1+set}",

@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use super::Error;
-use crate::interface::application::engine::word::{Pattern, characters};
+use crate::interface::application::engine::word::Pattern;
 use crate::interface::application::engine::{
   InputQuery, InputResult, Value, ValueIssue, check_cancelled,
 };
@@ -71,15 +71,14 @@ pub(super) fn read(
   }
 }
 
-pub(super) fn selected_shell(
-  path: &Path,
-  identity: &Path,
-) -> Result<bool, Error> {
+/// Selects files whose prefix cannot be read, so that loading reports them
+/// unless an opened text replaces them.
+pub(super) fn selected_shell(path: &Path, identity: &Path) -> bool {
   let mut prefix = Vec::new();
-  std::fs::File::open(path)?
-    .take(4096)
-    .read_to_end(&mut prefix)?;
-  Ok(shell(&prefix, identity))
+  std::fs::File::open(path)
+    .and_then(|file| file.take(4096).read_to_end(&mut prefix))
+    .is_err()
+    || shell(&prefix, identity)
 }
 
 fn shell(source: &[u8], path: &Path) -> bool {
@@ -440,27 +439,20 @@ fn listed(
     };
     let name = entry.file_name();
     let name = name.as_encoded_bytes();
-    let chars = match characters(name, utf8) {
-      Ok(c) => c,
+    match pattern.match_entry(name, utf8, cancelled) {
+      Ok(true) => {}
+      Ok(false) => continue,
       Err(issue) => return Ok(Err(issue)),
-    };
-    if name.starts_with(b".") && !pattern.starts_dot() {
-      if pattern.ambiguous_dot(&chars, cancelled) {
-        return Ok(Err(ValueIssue::Unspecified));
-      }
-      continue;
     }
-    if pattern.matches(&chars, cancelled) {
-      let mut path = prefix.to_vec();
-      path.extend(name);
-      if !last {
-        if !entry.path().is_dir() {
-          continue;
-        }
-        path.push(b'/');
+    let mut path = prefix.to_vec();
+    path.extend(name);
+    if !last {
+      if !entry.path().is_dir() {
+        continue;
       }
-      matched.push(path);
+      path.push(b'/');
     }
+    matched.push(path);
   }
   Ok(Ok(matched))
 }
@@ -572,18 +564,23 @@ struct ParsedFile {
   id: DocumentId,
   revision: u64,
   document: Option<Arc<Document>>,
+  staged: Option<Arc<Document>>,
 }
 
 impl Documents {
+  /// Shares parses across requests. Staged text replaces an input only
+  /// hypothetically, so its parse stays apart from the input parse until the
+  /// input has that text.
   pub(super) fn parse_entry(
     &self,
     entries: &mut BTreeMap<PathBuf, Snapshot>,
     path: &Path,
     bytes: &[u8],
+    staged: bool,
     cancelled: &AtomicBool,
   ) -> Result<Arc<Document>, Error> {
     let after = entries.get(path).map_or(0, |entry| entry.revision.0);
-    let document = self.parse(path, bytes, after, cancelled)?;
+    let document = self.parse(path, bytes, after, staged, cancelled)?;
     entries.insert(path.to_path_buf(), document.snapshot());
     Ok(document)
   }
@@ -593,6 +590,7 @@ impl Documents {
     path: &Path,
     bytes: &[u8],
     after: u64,
+    staged: bool,
     cancelled: &AtomicBool,
   ) -> Result<Arc<Document>, Error> {
     let file = {
@@ -608,6 +606,7 @@ impl Documents {
             id,
             revision: 0,
             document: None,
+            staged: None,
           }))
         })
         .clone()
@@ -616,11 +615,22 @@ impl Documents {
       .lock()
       .map_err(|error| Error::Message(error.to_string()))?;
     check_cancelled(cancelled)?;
-    if let Some(document) = &file.document
-      && document.snapshot().revision.0 > after
-      && document.source().as_bytes() == bytes
-    {
-      return Ok(document.clone());
+    let reusable = |document: Option<&Arc<Document>>| {
+      document
+        .filter(|document| {
+          document.snapshot().revision.0 > after
+            && document.source().as_bytes() == bytes
+        })
+        .cloned()
+    };
+    if let Some(document) = reusable(file.document.as_ref()) {
+      return Ok(document);
+    }
+    if let Some(document) = reusable(file.staged.as_ref()) {
+      if !staged {
+        file.document = file.staged.take();
+      }
+      return Ok(document);
     }
     file.revision = file.revision.max(after) + 1;
     let document = Arc::new(Document::parse(
@@ -631,7 +641,12 @@ impl Documents {
       bytes,
       cancelled,
     )?);
-    file.document = Some(document.clone());
+    if staged {
+      file.staged = Some(document.clone());
+    } else {
+      file.document = Some(document.clone());
+      file.staged = None;
+    }
     Ok(document)
   }
 }

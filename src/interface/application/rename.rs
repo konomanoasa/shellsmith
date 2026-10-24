@@ -1,5 +1,5 @@
 use super::engine::{
-  self, Access, Alternative, ExecutionContextId, Location, Name,
+  self, Access, Alternative, EffectTarget, ExecutionContextId, Location, Name,
   NameEnvironment, NameId, ResolutionIssue, SymbolId, SymbolKind,
   check_cancelled, optional_reserved_word, reserved_word, special_builtin,
   unspecified_command, valid_name,
@@ -51,7 +51,6 @@ impl Application {
     offset: usize,
     cancelled: &AtomicBool,
   ) -> Result<Option<RenameTarget>, Error> {
-    self.verify_discovery(cancelled)?;
     let names = self.prepare_names(path, cancelled)?;
     self.check_rename_inputs(&names, cancelled)?;
     self
@@ -66,7 +65,6 @@ impl Application {
     new_name: &str,
     cancelled: &AtomicBool,
   ) -> Result<Vec<RenameEdit>, Error> {
-    self.verify_discovery(cancelled)?;
     let names = self.prepare_names(path, cancelled)?;
     self.check_rename_inputs(&names, cancelled)?;
     let selection = self
@@ -205,13 +203,18 @@ impl Application {
     }) {
       return Ok(None);
     }
-    selection.validate(names)?;
+    selection.validate(names, cancelled)?;
     Ok(Some(selection))
   }
 }
 
 impl Selection {
-  fn validate(&self, collection: &NameCollection) -> Result<(), Error> {
+  fn validate(
+    &self,
+    collection: &NameCollection,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    check_sources(collection, cancelled)?;
     for &(entry, index) in &self.sites {
       let result = &collection.results.entries[entry];
       let site = &result.relations.occurrences[index];
@@ -271,7 +274,6 @@ impl Selection {
         ) && matches!(
           gap.issue,
           ResolutionIssue::Recovery
-            | ResolutionIssue::UndecodedSource
             | ResolutionIssue::Recursion
             | ResolutionIssue::UnsupportedControl
         )
@@ -283,6 +285,26 @@ impl Selection {
     }
     Ok(())
   }
+}
+
+fn check_sources(
+  collection: &NameCollection,
+  cancelled: &AtomicBool,
+) -> Result<(), Error> {
+  for entry in &collection.results.entries {
+    check_cancelled(cancelled)?;
+    if entry
+      .relations
+      .effects
+      .iter()
+      .any(|effect| effect.targets.contains(&EffectTarget::Sources))
+    {
+      return Err(refused(
+        "An unknown source may contain related names or references",
+      ));
+    }
+  }
+  Ok(())
 }
 
 fn uncertain_name(entry: &engine::EntryNames, name: &Name) -> bool {
@@ -421,16 +443,11 @@ fn verify(
   new_name: &str,
   cancelled: &AtomicBool,
 ) -> Result<(), Error> {
-  if before.entries.len() != after.entries.len() {
-    return Err(refused("The analysis entries changed after the edit"));
-  }
+  check_sources(after, cancelled)?;
   for (index, (old, new)) in
     before.entries.iter().zip(&after.entries).enumerate()
   {
     check_cancelled(cancelled)?;
-    if old.path != new.path {
-      return Err(refused("The analysis entries changed after the edit"));
-    }
     if new.damaged && !old.damaged || old.dependencies != new.dependencies {
       return Err(refused("The edit changes syntax or source dependencies"));
     }

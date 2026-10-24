@@ -195,14 +195,25 @@ impl NameChanges {
     }
   }
 
-  fn invalidate(&self, names: &mut Names, since: usize, unknown: &Binding) {
+  fn invalidate(
+    &self,
+    names: &mut Names,
+    since: usize,
+    environment: ExecutionContextId,
+  ) {
     for (name, revision) in &self.values {
       if *revision > since {
-        names.values.insert(name.clone(), unknown.clone());
+        names
+          .values
+          .insert(name.clone(), Self::unknown(names.get(name), environment));
       }
     }
     if self.fallback > since {
-      names.fallback = unknown.clone();
+      let mut previous = names.fallback.clone();
+      if let Some(uncertain) = &names.uncertain {
+        previous.join(uncertain);
+      }
+      names.fallback = Self::unknown(&previous, environment);
       names.patterns.clear();
       names.uncertain = None;
     } else {
@@ -210,12 +221,37 @@ impl NameChanges {
         if *revision > since {
           names.restrict(
             pattern.clone(),
+            engine::BindingOrigin::Context(environment),
             ResolutionIssue::UnknownEffect,
             pattern.issue().unwrap_or(ValueIssue::Dynamic),
           );
         }
       }
     }
+  }
+
+  fn unknown(previous: &Binding, environment: ExecutionContextId) -> Binding {
+    let origins = previous
+      .resolution
+      .origins
+      .iter()
+      .copied()
+      .chain(
+        previous
+          .resolution
+          .candidates
+          .iter()
+          .copied()
+          .map(engine::BindingOrigin::Definition),
+      )
+      .chain([engine::BindingOrigin::Context(environment)])
+      .collect();
+    Binding::new(Resolution {
+      alternatives: [Alternative::External, Alternative::Unset].into(),
+      issues: [ResolutionIssue::UnknownEffect].into(),
+      origins,
+      ..Resolution::default()
+    })
   }
 }
 
@@ -359,17 +395,16 @@ impl InvariantInputs {
         || changes.directory_variables > input.revision,
       ..Environment::new(&InitialEnvironment::default())
     };
-    let unknown = Binding::new(Resolution {
-      alternatives: [Alternative::External, Alternative::Unset].into(),
-      issues: [ResolutionIssue::UnknownEffect].into(),
-      ..Resolution::default()
-    });
-    changes
-      .variables
-      .invalidate(&mut env.variables, input.revision, &unknown);
-    changes
-      .functions
-      .invalidate(&mut env.functions, input.revision, &unknown);
+    changes.variables.invalidate(
+      &mut env.variables,
+      input.revision,
+      input.environment,
+    );
+    changes.functions.invalidate(
+      &mut env.functions,
+      input.revision,
+      input.environment,
+    );
     for (name, revision) in &changes.readonly {
       if *revision > input.revision {
         env.readonly.insert(name.clone(), false);

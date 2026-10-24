@@ -14,7 +14,7 @@ async fn preparation_survives_one_cancellation_and_stops_after_the_last_subscrib
   let shared = lock(&session.state).unwrap().preparations[&scope].clone();
   drop(first);
   assert!(!shared.cancelled.load(Ordering::Acquire));
-  second.await.unwrap();
+  second.await.result.unwrap();
   assert!(shared.cancelled.load(Ordering::Acquire));
 
   let abandoned = session.request(scope.clone(), |_, _| Ok(()));
@@ -22,7 +22,11 @@ async fn preparation_survives_one_cancellation_and_stops_after_the_last_subscrib
   assert!(!Arc::ptr_eq(&shared, &job));
   drop(abandoned);
   assert!(job.cancelled.load(Ordering::Acquire));
-  session.request(scope.clone(), |_, _| Ok(())).await.unwrap();
+  session
+    .request(scope.clone(), |_, _| Ok(()))
+    .await
+    .result
+    .unwrap();
 }
 
 #[tokio::test]
@@ -66,15 +70,54 @@ async fn input_changes_cancel_preparation_before_it_runs() {
   session.invalidate().unwrap();
   assert!(job.cancelled.load(Ordering::Acquire));
   let (first, second) = tokio::join!(first, second);
-  assert!(matches!(first, Err(Error::Superseded)));
-  assert!(matches!(second, Err(Error::Superseded)));
+  assert!(matches!(first.result, Err(Error::Superseded)));
+  assert!(matches!(second.result, Err(Error::Superseded)));
   session
     .request(RequestScope::Workspace, |_, _| Ok(()))
     .await
+    .result
     .unwrap();
 }
 
 use super::super::fixtures::Fixture;
+
+#[tokio::test]
+async fn cancelled_or_superseded_requests_discard_collected_read_failures() {
+  let fixture = Fixture::new();
+  let path = fixture.root.join("broken.sh");
+  std::fs::write(&path, [0xff]).unwrap();
+  let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+  for superseded in [false, true] {
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let request = tokio::spawn(session.request(
+      RequestScope::Document(path.clone()),
+      move |app, _| {
+        assert_eq!(app.failures().len(), 1);
+        started.send(()).unwrap();
+        released
+          .recv_timeout(std::time::Duration::from_secs(10))
+          .unwrap();
+        Err::<(), _>(Error::Engine(engine::Error::Cancelled))
+      },
+    ));
+    running.await.unwrap();
+    if superseded {
+      session.invalidate().unwrap();
+    }
+    release.send(()).unwrap();
+    let outcome = request.await.unwrap();
+    if superseded {
+      assert!(matches!(outcome.result, Err(Error::Superseded)));
+    } else {
+      assert!(matches!(
+        outcome.result,
+        Err(Error::Engine(engine::Error::Cancelled))
+      ));
+    }
+    assert_eq!(outcome.failures, []);
+  }
+}
 
 #[tokio::test]
 async fn navigation_and_names_wait_for_shared_workspace_results_while_tokens_remain_available()
@@ -136,6 +179,7 @@ async fn navigation_and_names_wait_for_shared_workspace_results_while_tokens_rem
       },
     )
     .await
+    .result
     .unwrap();
   assert!(tokens.iter().any(|span| span.location.bytes == (17..18)
     && span.kind == SemanticKind::Command));
@@ -148,8 +192,8 @@ async fn navigation_and_names_wait_for_shared_workspace_results_while_tokens_rem
   ));
   drop(held);
   assert_eq!(
-    navigation.await.unwrap().unwrap(),
-    references.await.unwrap().unwrap()
+    navigation.await.unwrap().result.unwrap(),
+    references.await.unwrap().result.unwrap()
   );
 }
 
@@ -210,11 +254,11 @@ async fn concurrent_tokens_links_and_definitions_share_analysis_and_refresh_chan
       },
     );
     let (tokens, links, definitions) = tokio::join!(tokens, links, definitions);
-    let (definitions, definitions_analysis) = definitions.unwrap();
+    let (definitions, definitions_analysis) = definitions.result.unwrap();
     assert_eq!(definitions.len(), 1);
 
-    let (tokens, _) = tokens.unwrap();
-    let (links, links_analysis) = links.unwrap();
+    let (tokens, _) = tokens.result.unwrap();
+    let (links, links_analysis) = links.result.unwrap();
     assert_ne!(tokens, []);
     assert!(links_analysis.is_some());
     assert_eq!(links_analysis, definitions_analysis);
@@ -253,6 +297,7 @@ async fn syntax_requests_share_parsed_documents_and_refresh_the_index_after_edit
         Ok(std::ptr::from_ref(doc).addr())
       })
       .await
+      .result
       .unwrap();
     session.start_index().unwrap();
     let path = main.clone();
@@ -272,6 +317,7 @@ async fn syntax_requests_share_parsed_documents_and_refresh_the_index_after_edit
         Ok(std::ptr::from_ref(doc).addr())
       })
       .await
+      .result
       .unwrap();
     assert_eq!(
       syntax, index,
@@ -289,7 +335,12 @@ async fn references_and_rename_share_name_collection_without_blocking_document_a
   let fixture = Fixture::new();
   let path = fixture.write("main.sh", "x=1; : $x");
   let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
-  let permit = session.index_worker.clone().acquire_owned().await.unwrap();
+  let permit = session
+    .analysis_worker
+    .clone()
+    .acquire_owned()
+    .await
+    .unwrap();
   let request_path = path.clone();
   let names = tokio::spawn(session.request(
     RequestScope::Names(path.clone()),
@@ -308,10 +359,11 @@ async fn references_and_rename_share_name_collection_without_blocking_document_a
       },
     )
     .await
+    .result
     .unwrap();
   assert_ne!(tokens, []);
   drop(permit);
-  let first = names.await.unwrap().unwrap();
+  let first = names.await.unwrap().result.unwrap();
   let request_path = path.clone();
   let prepare = session
     .request(RequestScope::Names(path.clone()), move |app, cancelled| {
@@ -319,6 +371,7 @@ async fn references_and_rename_share_name_collection_without_blocking_document_a
       Ok(Arc::as_ptr(app.names.as_ref().unwrap()).addr())
     })
     .await
+    .result
     .unwrap();
   assert_eq!(first, prepare);
   let second = session
@@ -327,8 +380,36 @@ async fn references_and_rename_share_name_collection_without_blocking_document_a
       Ok(Arc::as_ptr(app.names.as_ref().unwrap()).addr())
     })
     .await
+    .result
     .unwrap();
   assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn workspace_symbols_do_not_wait_for_running_name_requests() {
+  let fixture = Fixture::new();
+  let path = fixture.write("main.sh", "f() { :; }; f\n");
+  let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+  session.add_input(&fixture.root).unwrap();
+  let (started, running) = tokio::sync::oneshot::channel();
+  let (release, released) = std::sync::mpsc::channel::<()>();
+  let names =
+    tokio::spawn(session.request(RequestScope::Names(path), move |_, _| {
+      started.send(()).unwrap();
+      released.recv().unwrap();
+      Ok(())
+    }));
+  running.await.unwrap();
+  let symbols = tokio::time::timeout(
+    std::time::Duration::from_secs(30),
+    session.request(RequestScope::Workspace, |app, _| {
+      Ok(app.workspace_symbols("").count())
+    }),
+  )
+  .await;
+  release.send(()).unwrap();
+  assert_eq!(symbols.unwrap().result.unwrap(), 1);
+  names.await.unwrap().result.unwrap();
 }
 
 #[tokio::test]
@@ -338,7 +419,12 @@ async fn cancelling_one_reference_request_preserves_shared_work_and_updates_supe
   let path = fixture.write("main.sh", "x=1; : $x");
   let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
   let scope = RequestScope::Names(path.clone());
-  let permit = session.index_worker.clone().acquire_owned().await.unwrap();
+  let permit = session
+    .analysis_worker
+    .clone()
+    .acquire_owned()
+    .await
+    .unwrap();
   let first_path = path.clone();
   let abandoned = session.request(scope.clone(), move |app, cancelled| {
     app.references(&first_path, 0, false, cancelled)
@@ -351,17 +437,18 @@ async fn cancelling_one_reference_request_preserves_shared_work_and_updates_supe
   drop(abandoned);
   assert!(!preparation.cancelled.load(Ordering::Acquire));
   drop(permit);
-  assert_eq!(remaining.await.unwrap().len(), 1);
+  assert_eq!(remaining.await.result.unwrap().len(), 1);
   let obsolete = session.request::<()>(scope.clone(), |_, _| {
     panic!("superseded reference request must not run")
   });
   session.set_overlay(&path, Some("x=2".into())).unwrap();
-  assert!(matches!(obsolete.await, Err(Error::Superseded)));
+  assert!(matches!(obsolete.await.result, Err(Error::Superseded)));
   let current = session
     .request(scope, move |app, cancelled| {
       app.references(&path, 0, false, cancelled)
     })
     .await
+    .result
     .unwrap();
   assert_eq!(current, []);
 }
@@ -384,10 +471,10 @@ async fn definition_positions_are_not_reused_after_an_unnotified_document_change
       },
     )
   };
-  assert_eq!(definitions().await.unwrap()[0].bytes, 5..6);
+  assert_eq!(definitions().await.result.unwrap()[0].bytes, 5..6);
   fixture.write("main.sh", "x=é; f() { :; }; f\n");
-  assert!(matches!(definitions().await, Err(Error::Superseded)));
-  assert_eq!(definitions().await.unwrap()[0].bytes, 6..7);
+  assert!(matches!(definitions().await.result, Err(Error::Superseded)));
+  assert_eq!(definitions().await.result.unwrap()[0].bytes, 6..7);
 }
 
 #[tokio::test]
@@ -408,10 +495,10 @@ async fn reused_results_keep_the_newer_shared_analysis_and_its_read_failures() {
       },
     )
   };
-  assert_eq!(failures(main.clone()).await.unwrap(), 1);
+  assert_eq!(failures(main.clone()).await.result.unwrap(), 1);
   fixture.write("broken.sh", "z=1\n");
-  assert_eq!(failures(other).await.unwrap(), 0);
-  assert_eq!(failures(main.clone()).await.unwrap(), 0);
+  assert_eq!(failures(other).await.result.unwrap(), 0);
+  assert_eq!(failures(main.clone()).await.result.unwrap(), 0);
   let tokens = session
     .request(
       RequestScope::Analysis(main.clone()),
@@ -420,7 +507,7 @@ async fn reused_results_keep_the_newer_shared_analysis_and_its_read_failures() {
       },
     )
     .await;
-  assert!(tokens.is_ok(), "{tokens:?}");
+  assert!(tokens.result.is_ok(), "{tokens:?}");
 }
 
 #[tokio::test]
@@ -435,6 +522,7 @@ async fn disk_changes_invalidate_shared_name_collection_and_retry_with_current_i
       app.prepare_rename(&requested, 0, cancelled)
     })
     .await
+    .result
     .unwrap();
   fixture.write("main.sh", "x=1; y=2; : $x");
   let requested = path.clone();
@@ -443,13 +531,13 @@ async fn disk_changes_invalidate_shared_name_collection_and_retry_with_current_i
       app.rename(&requested, 0, "y", cancelled)
     })
     .await;
-  assert!(matches!(changed, Err(Error::Superseded)));
+  assert!(matches!(changed.result, Err(Error::Superseded)));
   let conflict = session
     .request(RequestScope::Names(path.clone()), move |app, cancelled| {
       app.rename(&path, 0, "y", cancelled)
     })
     .await;
-  assert!(matches!(conflict, Err(Error::RenameRefused(_))));
+  assert!(matches!(conflict.result, Err(Error::RenameRefused(_))));
 }
 
 fn token_at(
@@ -501,12 +589,12 @@ async fn workspace_analysis_reclassifies_reached_calls_without_delaying_document
   let call = source.find("a;").unwrap();
   let operand = source.find("a; :").unwrap();
   let variable = source.find("VALUE").unwrap();
-  let initial = classify().await.unwrap();
+  let initial = classify().await.result.unwrap();
   assert_eq!(token_at(&initial, call).kind, SemanticKind::Command);
   assert!(!updates.has_changed().unwrap());
   drop(permit);
   updates.changed().await.unwrap();
-  let complete = classify().await.unwrap();
+  let complete = classify().await.result.unwrap();
   for position in [call, operand] {
     assert_eq!(token_at(&complete, position).kind, SemanticKind::Function);
   }
@@ -527,11 +615,11 @@ async fn workspace_analysis_reclassifies_reached_calls_without_delaying_document
     .await
     .unwrap();
   session.start_index().unwrap();
-  let pending = classify().await.unwrap();
+  let pending = classify().await.result.unwrap();
   assert_eq!(token_at(&pending, call).kind, SemanticKind::Command);
   drop(permit);
   updates.changed().await.unwrap();
-  let conflicting = classify().await.unwrap();
+  let conflicting = classify().await.result.unwrap();
   for position in [call, operand] {
     assert_eq!(token_at(&conflicting, position).kind, SemanticKind::Command);
   }
@@ -545,7 +633,7 @@ async fn workspace_analysis_reclassifies_reached_calls_without_delaying_document
   session.start_index().unwrap();
   updates.changed().await.unwrap();
   assert_eq!(
-    token_at(&classify().await.unwrap(), call).kind,
+    token_at(&classify().await.result.unwrap(), call).kind,
     SemanticKind::Function
   );
   std::fs::remove_file(&main).unwrap();
@@ -553,13 +641,13 @@ async fn workspace_analysis_reclassifies_reached_calls_without_delaying_document
   session.start_index().unwrap();
   updates.changed().await.unwrap();
   assert_eq!(
-    token_at(&classify().await.unwrap(), call).kind,
+    token_at(&classify().await.result.unwrap(), call).kind,
     SemanticKind::Command
   );
 }
 
 #[tokio::test]
-async fn workspace_semantics_reject_unnotified_changes_and_superseded_background_results()
+async fn workspace_semantics_drop_stale_results_and_reject_superseded_background_results()
  {
   use crate::interface::application::engine::SemanticKind;
   let fixture = Fixture::new();
@@ -577,7 +665,10 @@ async fn workspace_semantics_reject_unnotified_changes_and_superseded_background
       app.classify(app.document_id(&path).unwrap(), flag)
     })
     .await;
-  assert!(matches!(stale, Err(Error::Superseded)));
+  assert_eq!(
+    token_at(&stale.result.unwrap(), 18).kind,
+    SemanticKind::Command
+  );
   let permit = session
     .analysis_worker
     .clone()
@@ -600,6 +691,7 @@ async fn workspace_semantics_reject_unnotified_changes_and_superseded_background
       app.classify(app.document_id(&library).unwrap(), flag)
     })
     .await
+    .result
     .unwrap();
   assert_eq!(
     tokens
@@ -624,7 +716,97 @@ async fn rename_reanalyzes_unchanged_entries_when_their_source_dependency_is_edi
       app.rename(&library, 0, "renamed", flag)
     })
     .await
+    .result
     .unwrap();
   assert_eq!(edits.len(), 2);
   assert!(edits.iter().all(|edit| edit.new_text == "renamed"));
+}
+
+#[tokio::test]
+async fn requested_documents_outside_the_inputs_remain_entries_with_newer_shared_results()
+ {
+  let fixture = Fixture::new();
+  fixture.write("workspace/main.sh", ":\n");
+  let first = fixture.write("first.sh", "f() { :; }; f\n");
+  let second = fixture.write("second.sh", "g() { :; }; g\n");
+  let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+  session.add_input(&fixture.root.join("workspace")).unwrap();
+  let definitions = |path: PathBuf| {
+    session.request(
+      RequestScope::Results(path.clone()),
+      move |app, cancelled| {
+        let id = app.document_id(&path).unwrap();
+        let definitions = app.definitions(id, 12, cancelled)?;
+        Ok(
+          definitions
+            .into_iter()
+            .map(|location| (location.bytes.start, location.bytes.end))
+            .collect::<Vec<_>>(),
+        )
+      },
+    )
+  };
+  for path in [first.clone(), second, first] {
+    assert_eq!(definitions(path).await.result.unwrap(), [(0, 1)]);
+  }
+}
+
+#[tokio::test]
+async fn workspace_analysis_reloads_inputs_selected_after_its_workspace_was_loaded()
+ {
+  let fixture = Fixture::new();
+  let main = fixture.write("main.sh", "g\n");
+  let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+  session.add_input(&fixture.root).unwrap();
+  session
+    .request(RequestScope::Workspace, |app, _| {
+      Ok(app.workspace_symbols("").count())
+    })
+    .await
+    .result
+    .unwrap();
+  let created = fixture.write("new.sh", "g() { :; }\n");
+  let path = main.clone();
+  session
+    .request(
+      RequestScope::Analysis(main.clone()),
+      move |app, cancelled| {
+        app.classify(app.document_id(&path).unwrap(), cancelled)
+      },
+    )
+    .await
+    .result
+    .unwrap();
+  let path = main.clone();
+  session
+    .request(
+      RequestScope::Results(main.clone()),
+      move |app, cancelled| {
+        app.definitions(app.document_id(&path).unwrap(), 0, cancelled)
+      },
+    )
+    .await
+    .result
+    .unwrap();
+  let analyses = lock(&session.state).unwrap().application.analyses.clone();
+  let entries: Vec<_> = analyses.unwrap().entries.keys().cloned().collect();
+  assert_eq!(entries, [main, created]);
+}
+
+#[test]
+fn name_input_checks_rescan_inputs_created_without_notification() {
+  let fixture = Fixture::new();
+  let main = fixture.write("main.sh", ". ./lib.sh\nf\n");
+  fixture.write("lib.sh", "f() { :; }\n");
+  let mut application =
+    Application::new(Settings::new(fixture.root.clone())).unwrap();
+  application.add_input(&fixture.root);
+  let cancelled = AtomicBool::new(false);
+  let names = application.prepare_names(&main, &cancelled).unwrap();
+  application.check_name_inputs(&names, &cancelled).unwrap();
+  fixture.write("new.sh", ". ./lib.sh\nf\n");
+  assert!(matches!(
+    application.check_name_inputs(&names, &cancelled),
+    Err(Error::Superseded)
+  ));
 }

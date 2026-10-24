@@ -60,6 +60,7 @@ fn main() {
       "documents",
       "values",
       "arithmetic",
+      "name_inheritance",
     ] {
       for size in [100, 400] {
         measure(case, size);
@@ -69,6 +70,7 @@ fn main() {
       measure("loop_chain", size);
       measure("branch_sum", size);
       measure("branch_concat", size);
+      measure("branch_append", size);
       measure("branch_merges", size);
       measure("branch_loop", size);
     }
@@ -193,6 +195,26 @@ fn uncalled_source(case: &str, size: usize) -> String {
   source
 }
 
+fn branch_values(case: &str, size: usize) -> String {
+  let mut source = String::new();
+  let mut expression = String::new();
+  for index in 0..size {
+    writeln!(source, "if condition; then v{index}=1; else v{index}=2; fi")
+      .unwrap();
+    if case == "branch_sum" {
+      write!(expression, "+v{index}").unwrap();
+    } else {
+      write!(expression, "$v{index}").unwrap();
+    }
+  }
+  if case == "branch_sum" {
+    writeln!(source, "x=$((0{expression}))").unwrap();
+  } else {
+    writeln!(source, "joined=\"{expression}\"; x=${{#joined}}").unwrap();
+  }
+  source
+}
+
 fn fixture(
   case: &str,
   size: usize,
@@ -202,25 +224,22 @@ fn fixture(
 ) -> String {
   let mut source = String::from("x=0\n");
   match case {
+    "name_inheritance" => {
+      source.push_str("value=1; read name; read \"$name\"\n");
+      source.push_str(&"(: \"$value\")\n".repeat(size));
+    }
     "branch_merges" | "branch_loop" => {
       source.push_str(&branch_merges(size, case == "branch_loop"));
     }
     "branch_sum" | "branch_concat" => {
-      let mut expression = String::new();
-      for index in 0..size {
-        writeln!(source, "if condition; then v{index}=1; else v{index}=2; fi")
-          .unwrap();
-        if case == "branch_sum" {
-          write!(expression, "+v{index}").unwrap();
-        } else {
-          write!(expression, "$v{index}").unwrap();
-        }
-      }
-      if case == "branch_sum" {
-        writeln!(source, "x=$((0{expression}))").unwrap();
-      } else {
-        writeln!(source, "joined=\"{expression}\"; x=${{#joined}}").unwrap();
-      }
+      source.push_str(&branch_values(case, size));
+    }
+    "branch_append" => {
+      source.push_str("PATH=/bin\n");
+      source.push_str(
+        &"if condition; then PATH=\"$PATH:/opt/bin\"; fi\n".repeat(size),
+      );
+      source.push_str("x=${#PATH}\n");
     }
     "independent_arguments" => {
       for index in 0..size {
@@ -325,5 +344,18 @@ fn measure(case: &str, size: usize) {
     analysis.uses().count(),
     analysis.gaps().len()
   );
-  black_box(analysis);
+  if case == "name_inheritance" {
+    workspace.publish_analysis(analysis).unwrap();
+    let start = Instant::now();
+    let names = workspace.name_relations(&cancelled).unwrap();
+    println!(
+      "name_relations_ms\t{:.3}\tnames\t{}\toccurrences\t{}",
+      start.elapsed().as_secs_f64() * 1_000.0,
+      names.names.len(),
+      names.occurrences.len()
+    );
+    black_box(names);
+  } else {
+    black_box(analysis);
+  }
 }

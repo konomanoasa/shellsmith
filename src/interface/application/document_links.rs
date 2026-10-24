@@ -31,9 +31,7 @@ impl Application {
         Some((link.location, self.path(target.document)?.to_path_buf()))
       })
       .collect();
-    if !self.analysis_inputs_current(&analyses, cancelled)? {
-      return Err(Error::Superseded);
-    }
+    self.check_inputs(cancelled)?;
     Ok(links)
   }
 }

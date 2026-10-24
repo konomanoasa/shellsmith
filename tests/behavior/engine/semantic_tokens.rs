@@ -399,6 +399,36 @@ mod classification {
   }
 
   #[test]
+  fn command_names_classify_their_spelling_without_quotes_or_continuations() {
+    let source =
+      "fun() { :; }; \"fun\"; f'u'n; \\fun; f\\\nun; trap 'f\"u\"n' EXIT\n";
+    let workspace = workspace(source);
+    let spans = workspace.semantic_spans(DocumentId(1)).unwrap();
+    let functions: Vec<_> = spans
+      .iter()
+      .filter(|span| span.semantic && span.kind == SemanticKind::Function)
+      .map(|span| span.location.bytes.clone())
+      .collect();
+    assert_eq!(
+      functions,
+      [
+        0..3,
+        15..18,
+        21..22,
+        23..24,
+        25..26,
+        28..30,
+        30..32,
+        34..35,
+        37..39,
+        47..48,
+        49..50,
+        51..52,
+      ]
+    );
+  }
+
+  #[test]
   fn numeric_operands_follow_builtin_roles_and_preserve_quotes_and_expansions()
   {
     for (source, expected) in [

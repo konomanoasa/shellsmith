@@ -174,7 +174,7 @@ pub(super) fn symbols<'a>(
   for entry in locations {
     let symbol = entry.symbol;
     let location = entry.location;
-    let Ok(Some(range)) = positions.range(&location) else {
+    let Some(range) = positions.range(&location)? else {
       continue;
     };
     let path = positions.path(location.snapshot.document)?;

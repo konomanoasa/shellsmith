@@ -74,25 +74,10 @@ impl<'a> Resolver<'a> {
     {
       initial.fail(ValueIssue::TransformedSource);
     }
+    let strip = self.index.strips_tabs(frame.snapshot, node, source);
     self.expand_parts(
-      Parts::new(node, quoted, source),
+      Parts::new(node, quoted, source).strip_tabs(strip),
       Expansion { word: initial, env },
-      frame,
-    )
-  }
-
-  pub(in crate::interface::application::engine::analysis) fn expand_here(
-    &mut self,
-    node: Node<'a>,
-    strip: bool,
-    env: Environment,
-    frame: Frame,
-  ) -> Task<'a> {
-    let source = self.workspace.source(frame.snapshot.document);
-    let word = self.source_word(node, frame);
-    self.expand_parts(
-      Parts::new(node, false, source).strip_tabs(strip),
-      Expansion { word, env },
       frame,
     )
   }

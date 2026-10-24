@@ -16,22 +16,39 @@ use std::time::Instant;
 #[derive(Clone, Debug)]
 pub(in crate::interface::application) struct AnalysisCollection {
   pub entries: BTreeMap<PathBuf, Workspace>,
-  pub(super) collected: Instant,
+  collected: Instant,
   pub(super) selection: InputSelection,
   failures: Vec<Failure>,
   paths: BTreeMap<PathBuf, Snapshot>,
   cache: InputCache,
 }
 
+impl AnalysisCollection {
+  pub(super) fn supersedes(&self, previous: Option<&Self>) -> bool {
+    previous.is_none_or(|previous| previous.collected < self.collected)
+  }
+}
+
 impl Application {
+  /// Reloads the workspace once when the inputs it was refreshed from have
+  /// changed since.
   pub(super) fn prepare_workspace_analysis(
     &mut self,
     cancelled: &AtomicBool,
   ) -> Result<Arc<AnalysisCollection>, Error> {
-    self.collect_analysis(BTreeSet::new(), cancelled)
+    match self.collect_analysis(BTreeSet::new(), cancelled) {
+      Err(Error::Superseded) => {
+        self.refresh_for(None, cancelled)?;
+        self.outdated = true;
+        self.collect_analysis(BTreeSet::new(), cancelled)
+      }
+      result => result,
+    }
   }
 
-  fn collect_analysis(
+  /// Fails with `Superseded` when a selected input was not loaded or the
+  /// collected inputs changed.
+  pub(super) fn collect_analysis(
     &mut self,
     explicit: BTreeSet<PathBuf>,
     cancelled: &AtomicBool,
@@ -40,8 +57,12 @@ impl Application {
     let mut entries = BTreeMap::new();
     for path in &selection.paths {
       check_cancelled(cancelled)?;
-      if self.cache.loaded.get(path).is_some_and(Result::is_ok) {
-        entries.insert(path.clone(), self.analyze_entry(path, cancelled)?);
+      match self.cache.loaded.get(path) {
+        Some(Ok(_)) => {
+          entries.insert(path.clone(), self.analyze_entry(path, cancelled)?);
+        }
+        Some(Err(_)) => {}
+        None => return Err(Error::Superseded),
       }
     }
     let collection = AnalysisCollection {
@@ -56,6 +77,7 @@ impl Application {
       return Err(Error::Superseded);
     }
     let collection = Arc::new(collection);
+    self.names = None;
     self.analyses = Some(collection.clone());
     Ok(collection)
   }
@@ -66,13 +88,32 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<Arc<AnalysisCollection>, Error> {
     let path = self.absolute(path);
-    if let Some(collection) = self.analyses.clone()
-      && self.analysis_inputs_current(&collection, cancelled)?
-    {
-      self.share_analyses(collection);
-    } else {
-      self.verify_discovery(cancelled)?;
-      self.refresh_for(None, cancelled)?;
+    if self.request_prepared {
+      self.check_inputs(cancelled)?;
+      return self
+        .analyses
+        .clone()
+        .filter(|collection| collection.entries.contains_key(&path))
+        .ok_or_else(|| {
+          Error::Message(
+            "Workspace results were not prepared for this request".into(),
+          )
+        });
+    }
+    match self.analyses.clone() {
+      Some(collection)
+        if self.analysis_inputs_current(&collection, cancelled)? =>
+      {
+        self.share_analyses(collection);
+      }
+      Some(_) => {
+        self.refresh_for(None, cancelled)?;
+        self.outdated = true;
+      }
+      None => {
+        self.verify_discovery(cancelled)?;
+        self.refresh_for(None, cancelled)?;
+      }
     }
     if self
       .analyses
@@ -92,6 +133,32 @@ impl Application {
     }
     self.restore_analysis_documents(cancelled)?;
     Ok(self.analyses.clone().expect("completed workspace analysis"))
+  }
+
+  pub(in crate::interface::application) fn prepare_position(
+    &mut self,
+    path: &Path,
+    cancelled: &AtomicBool,
+  ) -> Result<Arc<AnalysisCollection>, Error> {
+    if self.request_prepared {
+      return self.prepare_analysis(path, cancelled);
+    }
+    let previous = self
+      .document_id(path)
+      .and_then(|id| self.workspace.shared_document(id));
+    let mut prepared = self.clone();
+    let result = prepared.prepare_analysis(path, cancelled);
+    if let Some(previous) = previous
+      && prepared
+        .document_id(path)
+        .and_then(|id| prepared.workspace.document(id))
+        .is_none_or(|document| document.source() != previous.source())
+    {
+      self.discard_results();
+      return Err(Error::Superseded);
+    }
+    *self = prepared;
+    result
   }
 
   pub(super) fn restore_analysis_documents(
@@ -123,6 +190,13 @@ impl Application {
   }
 
   pub(super) fn share_analyses(&mut self, collection: Arc<AnalysisCollection>) {
+    if self
+      .analyses
+      .as_ref()
+      .is_none_or(|previous| !Arc::ptr_eq(previous, &collection))
+    {
+      self.names = None;
+    }
     self.entries.extend(collection.paths.clone());
     self.cache = collection.cache.clone();
     self.failures.clone_from(&collection.failures);
@@ -170,10 +244,7 @@ impl Application {
     collection: &AnalysisCollection,
     cancelled: &AtomicBool,
   ) -> Result<bool, Error> {
-    self.verify_discovery(cancelled)?;
-    if self.select_inputs(collection.selection.explicit.clone(), cancelled)?
-      != collection.selection
-    {
+    if !self.selection_current(&collection.selection, cancelled)? {
       return Ok(false);
     }
     for (path, current) in &self.cache.loaded {
@@ -187,6 +258,33 @@ impl Application {
     collection
       .cache
       .current(&self.opened, &collection.paths, cancelled)
+  }
+
+  pub(in crate::interface::application) fn inputs_current(
+    &self,
+    cancelled: &AtomicBool,
+  ) -> Result<bool, Error> {
+    if let Some(analyses) = &self.analyses {
+      return self.analysis_inputs_current(analyses, cancelled);
+    }
+    if let Some(selection) = &self.cache.selection
+      && !self.selection_current(selection, cancelled)?
+    {
+      return Ok(false);
+    }
+    self.cache.current(&self.opened, &self.entries, cancelled)
+  }
+
+  pub(in crate::interface::application) fn check_inputs(
+    &mut self,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    check_cancelled(cancelled)?;
+    if !self.inputs_current(cancelled)? {
+      self.discard_results();
+      return Err(Error::Superseded);
+    }
+    Ok(())
   }
 }
 

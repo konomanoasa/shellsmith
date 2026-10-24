@@ -206,6 +206,8 @@ impl<'a> Resolver<'a> {
         let number = id
           .and_then(|id| self.variable_value(id, &env))
           .map_or(Err(ValueIssue::Dynamic), |v| integer(v));
+        let mut env = env;
+        env.require_parameter(&word::lexical(node, source));
         result(number, env)
       }
       "arithmetic_unary_expression" => {
@@ -466,6 +468,7 @@ impl<'a> Resolver<'a> {
     for name in self.variable_access(node, frame).writes {
       env.invalidate(
         EffectTarget::Variable(name),
+        self.result.binding_context(frame.context),
         ResolutionIssue::EvaluationOrder,
         ValueIssue::Dynamic,
       );

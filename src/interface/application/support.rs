@@ -12,4 +12,4 @@ mod fixtures;
 
 pub use application::{Application, Error, Failure, Settings};
 pub(super) use names::NameCollection;
-pub use session::{RequestScope, Session};
+pub use session::{RequestOutcome, RequestScope, Session};

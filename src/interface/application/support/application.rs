@@ -55,6 +55,14 @@ impl Settings {
   }
 }
 
+/// Workspace inputs together with the explicitly requested documents.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct InputSelection {
+  pub(super) explicit: BTreeSet<PathBuf>,
+  pub(super) paths: BTreeSet<PathBuf>,
+  failures: Vec<Failure>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Failure {
   pub path: PathBuf,
@@ -331,10 +339,7 @@ impl Application {
       }
     };
     if result.is_err() {
-      self.cache.failed_inputs.insert(
-        path.to_path_buf(),
-        bytes.map(Arc::from).map_err(|error| error.to_string()),
-      );
+      self.cache.record_failure(path.to_path_buf(), bytes);
     }
     result
   }
@@ -397,7 +402,7 @@ impl Application {
     Ok(selected)
   }
 
-  pub(super) fn collect_inputs(
+  fn collect_inputs(
     &self,
     mut selected: BTreeSet<PathBuf>,
     cancelled: &AtomicBool,
@@ -408,6 +413,19 @@ impl Application {
       self.discovery.collect(&inputs, false, cancelled)?;
     selected.extend(collected);
     Ok((selected, failures))
+  }
+
+  pub(super) fn select_inputs(
+    &self,
+    explicit: BTreeSet<PathBuf>,
+    cancelled: &AtomicBool,
+  ) -> Result<InputSelection, Error> {
+    let (paths, failures) = self.collect_inputs(explicit.clone(), cancelled)?;
+    Ok(InputSelection {
+      explicit,
+      paths,
+      failures,
+    })
   }
 
   fn discovery_inputs(&self) -> BTreeSet<PathBuf> {

@@ -71,6 +71,14 @@ impl UseSite {
       Self::Argument { .. } => None,
     }
   }
+
+  #[must_use]
+  pub const fn snapshot(self) -> Snapshot {
+    match self {
+      Self::Syntax(id) => id.snapshot,
+      Self::Argument { snapshot, .. } => snapshot,
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

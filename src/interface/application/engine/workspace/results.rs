@@ -263,7 +263,7 @@ impl Workspace {
   pub fn semantic_spans(
     &self,
     id: DocumentId,
-  ) -> Result<Vec<engine::SemanticSpan>, Error> {
+  ) -> Result<Vec<SemanticSpan>, Error> {
     self.semantic_spans_with(id, &[])
   }
 
@@ -271,7 +271,7 @@ impl Workspace {
     &self,
     id: DocumentId,
     entries: &[&Self],
-  ) -> Result<Vec<engine::SemanticSpan>, Error> {
+  ) -> Result<Vec<SemanticSpan>, Error> {
     let snapshot = self
       .document(id)
       .ok_or(Error::UnknownDocument(id))?
@@ -284,10 +284,7 @@ impl Workspace {
 
   /// Locations are projected to the requested document.
   #[must_use]
-  pub fn source_links(
-    &self,
-    id: DocumentId,
-  ) -> Vec<(crate::interface::application::engine::Location, Snapshot)> {
+  pub fn source_links(&self, id: DocumentId) -> Vec<(Location, Snapshot)> {
     self
       .source_observations(id)
       .into_iter()
@@ -302,10 +299,7 @@ impl Workspace {
     let Some(analysis) = self.analysis() else {
       return Vec::new();
     };
-    let mut inputs: BTreeMap<
-      _,
-      crate::interface::application::engine::SourceInput,
-    > = BTreeMap::new();
+    let mut inputs: BTreeMap<_, engine::SourceInput> = BTreeMap::new();
     for (reference, _, input) in analysis.source_inputs() {
       inputs
         .entry(reference)
@@ -378,7 +372,7 @@ impl Workspace {
       .into_iter()
       .map(|((snapshot, start, end), target)| {
         (
-          crate::interface::application::engine::Location {
+          Location {
             snapshot,
             bytes: start..end,
           },

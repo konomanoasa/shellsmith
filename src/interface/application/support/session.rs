@@ -44,13 +44,14 @@ impl State {
     result
   }
 
+  /// Keeps the most recently collected analyses; reused results may be older.
   fn publish(&mut self, application: &Application) {
     if let Some(analyses) = &application.analyses
       && self
         .application
         .analyses
         .as_ref()
-        .is_none_or(|previous| !Arc::ptr_eq(previous, analyses))
+        .is_none_or(|previous| previous.collected < analyses.collected)
     {
       self.application.analyses = Some(analyses.clone());
       self.updates.send_replace(());
@@ -280,22 +281,13 @@ impl Session {
         (application, state.application.analyses.clone())
       };
       let failed_inputs = !application.failures().is_empty();
-      let permit = workers
-        .acquire_owned()
-        .await
-        .map_err(|error| Error::Message(error.to_string()))?;
-      let flag = request.cancellation.0.clone();
-      let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        check_cancelled(&flag)?;
-        let mut application = application.as_ref().clone();
-        application.analyses = analyses.or(application.analyses);
-        let output = operation(&mut application, &flag)?;
-        check_cancelled(&flag)?;
-        Ok::<_, Error>(output)
-      })
-      .await
-      .map_err(|error| worker_error(&error))?;
+      let result =
+        run_blocking(workers, request.cancellation.0.clone(), move |flag| {
+          let mut application = application.as_ref().clone();
+          application.analyses = analyses.or(application.analyses);
+          operation(&mut application, flag)
+        })
+        .await;
       let mut state = lock(&state)?;
       let result = state.accept(&request, result);
       if result.is_err() && failed_inputs {
@@ -410,42 +402,34 @@ impl Preparation {
         prerequisite.release();
         application = result?.as_ref().clone();
       }
-      let permit = workers
-        .acquire_owned()
-        .await
-        .map_err(|error| Error::Message(error.to_string()))?;
-      tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        check_cancelled(&flag)?;
+      run_blocking(workers, flag, move |flag| {
         match &scope {
           RequestScope::Analysis(path) => {
-            application.refresh_for(Some(path), &flag)?;
+            application.refresh_for(Some(path), flag)?;
             let id = application.document_id(path).ok_or_else(|| {
               Error::Message(format!("Cannot load {}", path.display()))
             })?;
-            application.analyze_document(id, &flag)?;
+            application.analyze_document(id, flag)?;
           }
           RequestScope::Results(path) => {
-            application.prepare_analysis(path, &flag)?;
+            application.prepare_analysis(path, flag)?;
           }
           RequestScope::Document(path) => {
-            application.refresh_for(Some(path), &flag)?;
+            application.refresh_for(Some(path), flag)?;
           }
           RequestScope::Names(path) => {
-            application.prepare_names(path, &flag)?;
+            application.prepare_names(path, flag)?;
           }
           RequestScope::Workspace => {
-            application.refresh_for(None, &flag)?;
+            application.refresh_for(None, flag)?;
           }
           RequestScope::WorkspaceAnalysis => {
-            application.prepare_workspace_analysis(&flag)?;
+            application.prepare_workspace_analysis(flag)?;
           }
         }
-        check_cancelled(&flag)?;
         Ok(Arc::new(application))
       })
       .await
-      .map_err(|error| worker_error(&error))?
     }
     .boxed()
     .shared();
@@ -459,8 +443,25 @@ impl Preparation {
   }
 }
 
-fn worker_error(error: &tokio::task::JoinError) -> Error {
-  Error::Message(format!("Analysis worker failed: {error}"))
+/// Runs blocking work once a worker is free, unless it is cancelled first.
+async fn run_blocking<T: Send + 'static>(
+  workers: Arc<tokio::sync::Semaphore>,
+  cancelled: Arc<AtomicBool>,
+  work: impl FnOnce(&AtomicBool) -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
+  let permit = workers
+    .acquire_owned()
+    .await
+    .map_err(|error| Error::Message(error.to_string()))?;
+  tokio::task::spawn_blocking(move || {
+    let _permit = permit;
+    check_cancelled(&cancelled)?;
+    let output = work(&cancelled)?;
+    check_cancelled(&cancelled)?;
+    Ok(output)
+  })
+  .await
+  .map_err(|error| Error::Message(format!("Analysis worker failed: {error}")))?
 }
 
 impl Drop for Session {

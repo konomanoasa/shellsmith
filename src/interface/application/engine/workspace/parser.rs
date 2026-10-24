@@ -330,9 +330,7 @@ pub(in crate::interface::application::engine) fn command_word(
 pub(in crate::interface::application::engine) fn damaged(
   node: Node<'_>,
 ) -> bool {
-  node.is_error()
-    || node.is_missing()
-    || matches!(node.kind(), "syntax_issue" | "unowned_issue")
+  node.is_error() || node.is_missing()
 }
 
 pub(in crate::interface::application::engine) fn subshell(kind: &str) -> bool {
@@ -525,7 +523,14 @@ impl Facts {
       return;
     };
     let damaged_owner = kind != OccurrenceKind::Command
-      && node.parent().is_some_and(|owner| owner.has_error());
+      && node.parent().is_some_and(|owner| {
+        owner.has_error()
+          && (kind != OccurrenceKind::FunctionDefinition
+            || owner.children(&mut owner.walk()).any(|child| {
+              Some(child) != owner.child_by_field_name("body")
+                && child.has_error()
+            }))
+      });
     let name = if node.has_error() || node.is_missing() || damaged_owner {
       Value::Unknown(ValueIssue::Recovery)
     } else if state.transformed && word::transformed(node, source) {

@@ -2,8 +2,8 @@ use super::redirections::Redirections;
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
-use super::super::execution::children;
 use super::super::execution::{Environment, Flow, Transfer, alternative};
+use super::super::execution::{children, damage_outside};
 use super::super::expansion::Argument;
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::word;
@@ -45,7 +45,7 @@ fn argument_use(
     };
     if name != b"command" {
       if super::arguments::numeric_argument(name) {
-        let fields = words.filter(|arg| arg.boundary.is_ok()).count()
+        let fields = words.filter(|arg| arg.count.boundary().is_ok()).count()
           + arguments
             .iter()
             .filter(|node| word::has_guaranteed_field(**node, source))
@@ -82,7 +82,7 @@ enum ForwardOption {
 }
 
 fn forward_option(argument: &Argument<'_>) -> ForwardOption {
-  if argument.boundary.is_err() {
+  if argument.count.boundary().is_err() {
     return ForwardOption::Unknown;
   }
   let Value::Literal(value) = &argument.value else {
@@ -170,7 +170,7 @@ impl<'a> Resolver<'a> {
     let suffix = node
       .child_by_field_name("suffix")
       .map_or_else(Vec::new, children);
-    let redirects = redirects(prefix, &suffix);
+    let redirects = redirects(node);
     let Some(command) = parser::command_word(node) else {
       return Self::without_command(node, prefix, redirects, env, frame);
     };
@@ -279,14 +279,11 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     let prefix = node.child_by_field_name("prefix");
-    let suffix = node
-      .child_by_field_name("suffix")
-      .map_or_else(Vec::new, children);
-    let redirects = redirects(prefix, &suffix);
+    let redirects = redirects(node);
     if words.is_empty() {
       return Self::without_command(node, prefix, redirects, env, frame);
     }
-    let name = words.remove(0).value;
+    let name = Argument::take_first(&mut words);
     let args = words;
     let mut flow = Flow::default();
     let assignments = assignments(prefix);
@@ -622,7 +619,7 @@ impl<'a> Resolver<'a> {
       alternative(Alternative::ExternalCommand)
     } else if special_builtin(name) {
       alternative(Alternative::Builtin)
-    } else if unspecified(name) {
+    } else if unspecified_command(name) {
       unspecified_resolution()
     } else if suppress {
       utility_resolution(name)
@@ -930,7 +927,7 @@ impl<'a> Resolver<'a> {
     );
     if args.len() == 1 {
       let arg = args.next().expect("query operand");
-      if arg.boundary.is_ok() {
+      if arg.count.boundary().is_ok() {
         let resolution = Self::command_resolution(&arg.value, &env, false);
         if !verbose {
           output = query_output(&arg.value, &resolution);
@@ -971,16 +968,17 @@ fn assignments(prefix: Option<Node<'_>>) -> Vec<Node<'_>> {
     .collect()
 }
 
-fn redirects<'a>(
-  prefix: Option<Node<'a>>,
-  suffix: &[Node<'a>],
-) -> Vec<Node<'a>> {
-  prefix
+/// Redirections and damaged syntax, which run in place before the command.
+fn redirects(node: Node<'_>) -> Vec<Node<'_>> {
+  let mut redirects: Vec<_> = ["prefix", "suffix"]
     .into_iter()
+    .filter_map(|field| node.child_by_field_name(field))
     .flat_map(children)
-    .chain(suffix.iter().copied())
     .filter(|node| node.kind() != "word" && node.kind() != "assignment_word")
-    .collect()
+    .chain(damage_outside(node, &["name", "prefix", "suffix", "word"]))
+    .collect();
+  redirects.sort_by_key(Node::start_byte);
+  redirects
 }
 
 const UNSPECIFIED: &[&[u8]] = &[
@@ -1041,7 +1039,8 @@ const UNSPECIFIED: &[&[u8]] = &[
   b"whence",
 ];
 
-fn unspecified(name: &[u8]) -> bool {
+#[must_use]
+pub fn unspecified_command(name: &[u8]) -> bool {
   UNSPECIFIED.contains(&name)
 }
 

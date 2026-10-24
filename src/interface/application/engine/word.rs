@@ -19,6 +19,7 @@ pub(in crate::interface::application::engine) fn literal(
     match part {
       Part::Fragment(fragment) => word.append(fragment, usize::MAX),
       Part::Expansion(_, _) => word.fail(ValueIssue::Dynamic),
+      Part::Damaged(_) => word.fail(ValueIssue::Recovery),
       Part::Invalid(issue) => word.fail(issue),
     }
   }
@@ -69,6 +70,7 @@ pub(in crate::interface::application::engine) fn syntax_field(
   for part in Parts::new(node, false, source) {
     match part {
       Part::Fragment(fragment) => partial.append(fragment, usize::MAX),
+      Part::Damaged(_) => partial.fail(ValueIssue::Recovery),
       Part::Invalid(issue) => partial.fail(issue),
       Part::Expansion(expansion, quoted) => {
         partial.extend(
@@ -109,12 +111,56 @@ pub(in crate::interface::application::engine) struct Word {
   pub fragments: Vec<Fragment>,
   pub issue: Option<ValueIssue>,
   pub unknown_fields: bool,
-  pub field_issue: Option<ValueIssue>,
   pub ambiguous_empty: bool,
   unknown: BTreeMap<usize, Value>,
+  counts: BTreeMap<usize, FieldCount>,
+  scalar_value: Option<Value>,
   bytes: usize,
   breaks: Vec<(usize, Option<Vec<u8>>)>,
   assignment_issue: Option<ValueIssue>,
+}
+
+/// Unknown counts describe a run whose fields share the associated value constraint.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub(in crate::interface::application::engine) enum FieldCount {
+  #[default]
+  One,
+  Unknown {
+    minimum: usize,
+    issue: ValueIssue,
+  },
+}
+
+impl FieldCount {
+  pub fn boundary(self) -> Result<(), ValueIssue> {
+    match self {
+      Self::One => Ok(()),
+      Self::Unknown { issue, .. } => Err(issue),
+    }
+  }
+
+  pub fn minimum(self) -> usize {
+    match self {
+      Self::One => 1,
+      Self::Unknown { minimum, .. } => minimum,
+    }
+  }
+
+  fn concatenate(self, other: Self) -> Self {
+    let issue = self
+      .boundary()
+      .err()
+      .into_iter()
+      .chain(other.boundary().err())
+      .reduce(ValueIssue::combine);
+    issue.map_or(Self::One, |issue| Self::Unknown {
+      minimum: self
+        .minimum()
+        .saturating_add(other.minimum())
+        .saturating_sub(usize::from(self.minimum() > 0 && other.minimum() > 0)),
+      issue,
+    })
+  }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -123,9 +169,18 @@ pub(in crate::interface::application::engine) struct Field {
   pub origins: Vec<OriginPart>,
   pub quoted: Vec<bool>,
   pub constraint: Option<Value>,
+  pub count: FieldCount,
 }
 
 impl Field {
+  pub fn unknown(value: Value, count: FieldCount) -> Self {
+    Self {
+      constraint: Some(value),
+      count,
+      ..Self::default()
+    }
+  }
+
   fn mark_unknown(&mut self, value: &Value) {
     let mut constraint = self.value();
     constraint.concat(value, usize::MAX);
@@ -173,9 +228,9 @@ impl Field {
 
 impl Word {
   pub fn parameters(
-    values: &[Value],
+    values: &[(Value, FieldCount)],
     quoted: bool,
-    separator: Option<&[u8]>,
+    separator: Option<&Value>,
     limit: usize,
   ) -> Self {
     let mut word = Self {
@@ -185,13 +240,25 @@ impl Word {
     if separator.is_none() {
       word.assignment_issue = Some(ValueIssue::Unspecified);
     }
-    for (i, value) in values.iter().enumerate() {
+    for (i, (value, count)) in values.iter().enumerate() {
       if i > 0 {
-        word
-          .breaks
-          .push((word.fragments.len(), separator.map(<[u8]>::to_vec)));
+        word.breaks.push((
+          word.fragments.len(),
+          separator
+            .and_then(|value| value.literal().ok())
+            .map(<[u8]>::to_vec),
+        ));
       }
+      let index = word.fragments.len();
       word.extend(Self::value(value.clone(), quoted), limit);
+      if count.boundary().is_err() {
+        word.counts.insert(index, *count);
+      }
+    }
+    if let Some(separator) = separator
+      && (!word.counts.is_empty() || separator.issue().is_some())
+    {
+      word.scalar_value = Some(join_parameters(values, separator, limit));
     }
     word
   }
@@ -218,11 +285,12 @@ impl Word {
           bytes: len,
           issue: None,
           unknown_fields: false,
-          field_issue: None,
           ambiguous_empty: false,
           breaks: Vec::new(),
           assignment_issue: None,
           unknown: BTreeMap::new(),
+          counts: BTreeMap::new(),
+          scalar_value: None,
         }
       }
       value @ (Value::Partial(_) | Value::Unknown(_)) => Self {
@@ -258,18 +326,44 @@ impl Word {
     self.issue = Some(self.issue.map_or(issue, |old| old.combine(issue)));
   }
 
-  pub fn append(&mut self, fragment: Fragment, limit: usize) {
+  /// Rejected bytes leave an empty fragment so later indices stay aligned.
+  pub fn append(&mut self, mut fragment: Fragment, limit: usize) {
+    if let Some(value) = &mut self.scalar_value {
+      value.concat(&Value::Literal(fragment.bytes.clone()), limit);
+    }
+    self.merge_optional_edge(false);
     if fragment.bytes.contains(&0) {
       self.fail(ValueIssue::Nul);
+      fragment.bytes.clear();
     } else if fragment.bytes.len() > limit.saturating_sub(self.bytes) {
       self.fail(ValueIssue::SizeLimit);
-    } else if self.issue.is_none() {
-      self.bytes += fragment.bytes.len();
-      self.fragments.push(fragment);
+      fragment.bytes.clear();
     }
+    self.bytes += fragment.bytes.len();
+    self.fragments.push(fragment);
   }
 
-  pub fn extend(&mut self, other: Self, limit: usize) {
+  pub fn extend(&mut self, mut other: Self, limit: usize) {
+    let scalar = if self.scalar_value.is_some() || other.scalar_value.is_some()
+    {
+      let mut value = self.scalar();
+      value.concat(&other.scalar(), limit);
+      Some(value)
+    } else {
+      None
+    };
+    self.scalar_value = None;
+    if !other.fragments.is_empty() {
+      self.merge_optional_edge(false);
+    }
+    if !self.fragments.is_empty()
+      && self
+        .breaks
+        .last()
+        .is_none_or(|(index, _)| *index != self.fragments.len())
+    {
+      other.merge_optional_edge(true);
+    }
     for value in other.unknown.values() {
       let size = value.known_size();
       if size > limit.saturating_sub(self.bytes) {
@@ -284,6 +378,11 @@ impl Word {
         .iter()
         .map(|(index, issue)| (self.fragments.len() + index, issue.clone())),
     );
+    let counts: Vec<_> = other
+      .counts
+      .iter()
+      .map(|(index, count)| (self.fragments.len() + index, *count))
+      .collect();
     self
       .breaks
       .extend(other.breaks.iter().map(|(index, separator)| {
@@ -296,17 +395,52 @@ impl Word {
       .reduce(ValueIssue::combine);
     self.unknown_fields |= other.unknown_fields;
     self.ambiguous_empty |= other.ambiguous_empty;
-    self.field_issue = self
-      .field_issue
-      .into_iter()
-      .chain(other.field_issue)
-      .reduce(ValueIssue::combine);
     if let Some(issue) = other.issue {
       self.fail(issue);
     }
     for fragment in other.fragments {
       self.append(fragment, limit);
     }
+    self.counts.extend(counts);
+    self.scalar_value = scalar;
+  }
+
+  fn merge_optional_edge(&mut self, first: bool) {
+    while !self.breaks.is_empty() {
+      let index = if first { 0 } else { self.breaks.len() - 1 };
+      let boundary = self.breaks[index].0;
+      let range = if first {
+        0..boundary
+      } else {
+        boundary..self.fragments.len()
+      };
+      if range.is_empty()
+        || self
+          .part_count(range)
+          .is_none_or(|count| count.minimum() > 0)
+      {
+        break;
+      }
+      self.breaks.remove(index);
+    }
+  }
+
+  fn part_count(&self, range: Range<usize>) -> Option<FieldCount> {
+    let mut count = None;
+    for index in range {
+      let next = if let Some(count) = self.counts.get(&index) {
+        *count
+      } else if self.fragments[index].quoted
+        || !self.fragments[index].bytes.is_empty()
+      {
+        FieldCount::One
+      } else {
+        continue;
+      };
+      count =
+        Some(count.map_or(next, |count: FieldCount| count.concatenate(next)));
+    }
+    count
   }
 
   fn scalar_issue(&self) -> Option<ValueIssue> {
@@ -322,7 +456,12 @@ impl Word {
     self
       .issue
       .into_iter()
-      .chain(self.field_issue)
+      .chain(
+        self
+          .counts
+          .values()
+          .filter_map(|count| count.boundary().err()),
+      )
       .chain(
         self
           .unknown
@@ -338,18 +477,30 @@ impl Word {
       .unknown
       .values()
       .filter_map(Value::issue)
+      .chain(
+        self
+          .counts
+          .values()
+          .filter_map(|count| count.boundary().err()),
+      )
       .fold(issue, ValueIssue::combine)
   }
 
   pub fn scalar(&self) -> Value {
     match self.scalar_issue() {
       Some(issue) => Value::Unknown(issue),
-      None => self.joined().value(),
+      None => self
+        .scalar_value
+        .clone()
+        .unwrap_or_else(|| self.joined().value()),
     }
   }
 
   /// Unquoted `$*` separators stay unquoted even when field splitting is disabled.
   fn joined(&self) -> Field {
+    if let Some(value) = &self.scalar_value {
+      return Field::unknown(value.clone(), FieldCount::One);
+    }
     let mut field = Field::default();
     let mut breaks = self.breaks.iter().peekable();
     for (i, part) in self.fragments.iter().enumerate() {
@@ -385,12 +536,9 @@ impl Word {
     }
     if context == WordContext::Assignment {
       if let Some(issue) = self.assignment_issue {
-        return Err(issue);
+        return Err(self.value_issue(issue));
       }
       return Ok(vec![self.joined()]);
-    }
-    if let Some(issue) = self.field_issue {
-      return Err(self.value_issue(issue));
     }
     if self.ambiguous_empty
       && self.fragments.iter().all(|part| part.bytes.is_empty())
@@ -405,6 +553,7 @@ impl Word {
       .map(|(index, _)| *index)
       .chain(std::iter::once(self.fragments.len()))
     {
+      let count = self.part_count(start..end).unwrap_or(FieldCount::One);
       let part = Self {
         fragments: self.fragments[start..end].to_vec(),
         unknown: self
@@ -414,11 +563,59 @@ impl Word {
           .collect(),
         ..Self::default()
       };
-      fields.extend(
-        part
-          .split(ifs, utf8, usize::MAX)
-          .map_err(|issue| self.value_issue(issue))?,
-      );
+      if let Err(issue) = count.boundary() {
+        if end - start == 1 && self.fragments[start].quoted {
+          let mut field = part.joined();
+          field.count = count;
+          fields.push(field);
+          start = end;
+          continue;
+        }
+        let value = part
+          .unknown
+          .values()
+          .filter_map(Value::issue)
+          .fold(issue, ValueIssue::combine);
+        let splitting = self
+          .counts
+          .range(start..end)
+          .any(|(index, _)| !self.fragments[*index].quoted)
+          || part
+            .unknown
+            .keys()
+            .any(|index| !part.fragments[*index].quoted);
+        let count = if splitting {
+          let minimum = usize::from((start..end).any(|index| {
+            !self.counts.contains_key(&index)
+              && (self.fragments[index].quoted
+                || (!self.fragments[index].split
+                  && !self.fragments[index].bytes.is_empty()))
+          }));
+          FieldCount::Unknown {
+            minimum,
+            issue: value,
+          }
+        } else {
+          count
+        };
+        fields.push(Field::unknown(Value::Unknown(value), count));
+      } else {
+        match part.split(ifs, utf8, usize::MAX) {
+          Ok(split) => fields.extend(split),
+          Err(issue) => {
+            let minimum = usize::from(part.fragments.iter().any(|part| {
+              part.quoted || (!part.split && !part.bytes.is_empty())
+            }));
+            fields.push(Field::unknown(
+              Value::Unknown(issue),
+              FieldCount::Unknown {
+                minimum,
+                issue: part.boundary_issue().unwrap_or(issue),
+              },
+            ));
+          }
+        }
+      }
       start = end;
     }
     Ok(fields)
@@ -528,6 +725,54 @@ impl Word {
   }
 }
 
+fn join_parameters(
+  values: &[(Value, FieldCount)],
+  separator: &Value,
+  limit: usize,
+) -> Value {
+  let mut result = Value::Literal(Vec::new());
+  let mut present = Some(false);
+  let mut cause = None;
+  for (value, count) in values {
+    let issue = count.boundary().err();
+    let mut next = match issue {
+      None => value.clone(),
+      Some(_)
+        if separator == &Value::Literal(Vec::new())
+          && value == &Value::Literal(Vec::new()) =>
+      {
+        Value::Literal(Vec::new())
+      }
+      Some(issue) => Value::Unknown(
+        value
+          .issue()
+          .into_iter()
+          .chain(separator.issue())
+          .fold(issue, ValueIssue::combine),
+      ),
+    };
+    if present != Some(false) {
+      let mut before = separator.clone();
+      if present.is_none() {
+        before.join_choice(&Value::Literal(Vec::new()), cause);
+      }
+      before.concat(&next, limit);
+      next = before;
+    }
+    if count.minimum() == 0 {
+      next.join_choice(&Value::Literal(Vec::new()), issue);
+    }
+    result.concat(&next, limit);
+    cause = cause.into_iter().chain(issue).reduce(ValueIssue::combine);
+    present = if present == Some(true) || count.minimum() > 0 {
+      Some(true)
+    } else {
+      None
+    };
+  }
+  result
+}
+
 pub(in crate::interface::application::engine) fn transformed(
   node: Node<'_>,
   source: &[u8],
@@ -583,6 +828,8 @@ fn number(digits: &[u8], radix: u32) -> Result<u8, ValueIssue> {
 pub(in crate::interface::application::engine) enum Part<'a> {
   Fragment(Fragment),
   Expansion(Node<'a>, bool),
+  /// Damaged syntax, whose value and effects are unknown.
+  Damaged(Node<'a>),
   Invalid(ValueIssue),
 }
 
@@ -734,9 +981,8 @@ impl<'a> Iterator for Parts<'a, '_> {
         }
       };
       if crate::interface::application::engine::workspace::parser::damaged(node)
-        || node.is_missing()
       {
-        return Some(Part::Invalid(ValueIssue::Recovery));
+        return Some(Part::Damaged(node));
       }
       let mut protected = quoted;
       let bytes = match node.kind() {
@@ -863,7 +1109,15 @@ impl Pattern {
     if let Some(issue) = word.scalar_issue() {
       return Err(issue);
     }
-    let field = word.joined();
+    Self::field(word, &word.joined(), utf8, portable_collation)
+  }
+
+  pub(in crate::interface::application::engine) fn field(
+    word: &Word,
+    field: &Field,
+    utf8: bool,
+    portable_collation: bool,
+  ) -> Result<Self, ValueIssue> {
     if let Some(issue) = field.constraint.as_ref().and_then(Value::issue) {
       return Err(issue);
     }

@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 #[derive(Clone, Debug, Default)]
 pub(super) struct InputCache {
   pub(super) loaded: BTreeMap<PathBuf, Result<Arc<Document>, String>>,
-  pub(super) failed_inputs: BTreeMap<PathBuf, Result<Arc<[u8]>, String>>,
+  failed_inputs: BTreeMap<PathBuf, Result<Arc<[u8]>, String>>,
   pub(super) paths: BTreeMap<SourceInput, Result<PathBuf, String>>,
   pub(super) evaluated: BTreeMap<engine::InputQuery, engine::InputResult>,
   pub(super) frozen: bool,
@@ -67,10 +67,7 @@ impl AnalysisInputs for Inputs<'_> {
       });
       check_cancelled(self.cancelled)?;
       if let Err(error) = &loaded {
-        self.cache.failed_inputs.insert(
-          path.clone(),
-          bytes.map(Arc::from).map_err(|error| error.to_string()),
-        );
+        self.cache.record_failure(path.clone(), bytes);
         self.failures.push(Failure {
           path: path.clone(),
           message: error.to_string(),
@@ -103,7 +100,20 @@ impl AnalysisInputs for Inputs<'_> {
   }
 }
 
+/// What a failed load observed; a different observation invalidates the cache.
+fn failed_input(bytes: Result<Vec<u8>, Error>) -> Result<Arc<[u8]>, String> {
+  bytes.map(Arc::from).map_err(|error| error.to_string())
+}
+
 impl InputCache {
+  pub(super) fn record_failure(
+    &mut self,
+    path: PathBuf,
+    bytes: Result<Vec<u8>, Error>,
+  ) {
+    self.failed_inputs.insert(path, failed_input(bytes));
+  }
+
   pub(super) fn current(
     &self,
     opened: &BTreeMap<PathBuf, Arc<str>>,
@@ -121,11 +131,7 @@ impl InputCache {
     }
     for (path, expected) in &self.failed_inputs {
       check_cancelled(cancelled)?;
-      if &files::read(path, opened)
-        .map(Arc::from)
-        .map_err(|error| error.to_string())
-        != expected
-      {
+      if failed_input(files::read(path, opened)) != *expected {
         return Ok(false);
       }
     }

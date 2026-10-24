@@ -302,7 +302,6 @@ impl<'a> Resolver<'a> {
           cause,
           ValueIssue::EmptyOperand
             | ValueIssue::MissingOperand
-            | ValueIssue::Recovery
             | ValueIssue::Nul
         )
       })
@@ -394,7 +393,7 @@ fn source_operand<'a, 'b>(
   let operand = args.get(first)?;
   args[..=first]
     .iter()
-    .all(|arg| arg.boundary.is_ok())
+    .all(|arg| arg.count.boundary().is_ok())
     .then_some(operand)
 }
 

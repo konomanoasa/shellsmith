@@ -103,9 +103,7 @@ pub(super) fn workspace_edit(
   let mut documents: BTreeMap<PathBuf, Vec<lsp::TextEdit>> = BTreeMap::new();
   let mut positions = Positions::new(application);
   for edit in edits {
-    let range = positions
-      .range(&edit.location)?
-      .ok_or(engine::Error::InvalidPosition)?;
+    let range = positions.result_range(&edit.location)?;
     let path = positions.path(edit.location.snapshot.document)?;
     documents
       .entry(path.to_path_buf())
@@ -141,6 +139,25 @@ pub(super) fn workspace_edit(
     );
   }
   Ok(output)
+}
+
+pub(super) fn locations(
+  application: &Application,
+  opened: &BTreeMap<PathBuf, OpenDocument>,
+  locations: &[engine::Location],
+) -> Result<Vec<lsp::Location>, Error> {
+  let mut positions = Positions::new(application);
+  locations
+    .iter()
+    .map(|location| {
+      let range = positions.result_range(location)?;
+      let path = positions.path(location.snapshot.document)?;
+      Ok(lsp::Location {
+        uri: uri(application, opened, path)?,
+        range,
+      })
+    })
+    .collect()
 }
 
 #[expect(
@@ -284,6 +301,16 @@ impl<'a> Positions<'a> {
     Ok(lines.range(&location.bytes))
   }
 
+  /// Result ranges always lie within their documents.
+  pub(super) fn result_range(
+    &mut self,
+    location: &engine::Location,
+  ) -> Result<lsp::Range, Error> {
+    self
+      .range(location)?
+      .ok_or_else(|| Error::Message("Invalid result range".into()))
+  }
+
   pub(super) fn path(&mut self, id: DocumentId) -> Result<&'a Path, Error> {
     if let Some(path) = self.paths.get(&id) {
       return Ok(path);
@@ -297,14 +324,14 @@ impl<'a> Positions<'a> {
   }
 }
 
-pub(super) struct Lines<'a> {
+struct Lines<'a> {
   source: &'a str,
   starts: Vec<usize>,
   ends: Vec<usize>,
   excess: Vec<(usize, usize)>,
 }
 impl<'a> Lines<'a> {
-  pub(super) fn new(source: &'a str) -> Self {
+  fn new(source: &'a str) -> Self {
     let mut total = 0;
     let excess = source
       .char_indices()
@@ -359,10 +386,7 @@ impl<'a> Lines<'a> {
     Some(end)
   }
 
-  pub(super) fn range(
-    &self,
-    bytes: &std::ops::Range<usize>,
-  ) -> Option<lsp::Range> {
+  fn range(&self, bytes: &std::ops::Range<usize>) -> Option<lsp::Range> {
     let (sl, sc) = self.position(bytes.start)?;
     let (el, ec) = self.position(bytes.end)?;
     Some(lsp::Range::new(

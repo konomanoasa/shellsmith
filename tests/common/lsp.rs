@@ -32,12 +32,18 @@ impl Client {
 
   pub async fn send(&mut self, message: Value) {
     let bytes = serde_json::to_vec(&message).unwrap();
+    self.send_body(&bytes).await;
+  }
+
+  pub async fn send_body(&mut self, bytes: &[u8]) {
     self
-      .input
-      .write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes())
-      .await
-      .unwrap();
-    self.input.write_all(&bytes).await.unwrap();
+      .send_bytes(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes())
+      .await;
+    self.send_bytes(bytes).await;
+  }
+
+  pub async fn send_bytes(&mut self, bytes: &[u8]) {
+    self.input.write_all(bytes).await.unwrap();
   }
 
   pub async fn receive(&mut self) -> Value {

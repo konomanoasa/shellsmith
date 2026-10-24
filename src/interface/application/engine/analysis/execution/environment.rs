@@ -1,4 +1,5 @@
 use super::alternatives::Alternatives;
+use crate::interface::application::engine::word::FieldCount;
 use imbl::{OrdMap, ordmap::DiffItem};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -201,70 +202,229 @@ impl Names {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(in crate::interface::application::engine::analysis) enum Positionals {
-  Known(Vec<Value>),
-  Unknown {
-    count: ValueIssue,
-    value: ValueIssue,
-  },
+pub(in crate::interface::application::engine::analysis) struct Positionals {
+  pub fields: Vec<(Value, FieldCount)>,
 }
 
 impl Positionals {
   pub fn unknown(issue: ValueIssue) -> Self {
-    Self::Unknown {
-      count: issue,
-      value: issue,
+    Self {
+      fields: vec![(
+        Value::Unknown(issue),
+        FieldCount::Unknown { minimum: 0, issue },
+      )],
     }
   }
 
-  pub fn values(&self) -> Result<&Vec<Value>, ValueIssue> {
-    match self {
-      Self::Known(values) => Ok(values),
-      Self::Unknown { value, .. } => Err(*value),
+  pub fn minimum(&self) -> usize {
+    self
+      .fields
+      .iter()
+      .map(|(_, count)| count.minimum())
+      .fold(0, usize::saturating_add)
+  }
+
+  pub fn parameter(&self, index: usize) -> (Value, Option<bool>) {
+    let mut minimum = 0usize;
+    let mut uncertain = None;
+    let mut result: Option<Value> = None;
+    for (value, count) in &self.fields {
+      if minimum > index {
+        break;
+      }
+      if uncertain.is_none() && count.boundary().is_ok() && minimum == index {
+        return (value.clone(), Some(false));
+      }
+      uncertain = uncertain
+        .into_iter()
+        .chain(count.boundary().err())
+        .reduce(ValueIssue::combine);
+      if uncertain.is_some() {
+        if let Some(result) = &mut result {
+          if result != value {
+            result.join_choice(value, uncertain);
+          }
+        } else {
+          result = Some(value.clone());
+        }
+      }
+      minimum = minimum.saturating_add(count.minimum());
+    }
+    let Some(mut result) = result else {
+      return (Value::Literal(Vec::new()), Some(true));
+    };
+    if index < self.minimum() {
+      (result, Some(false))
+    } else {
+      let empty = Value::Literal(Vec::new());
+      if result != empty {
+        result.join_choice(&empty, uncertain);
+      }
+      (result, None)
+    }
+  }
+
+  pub fn present(&self, index: usize) -> Result<Value, ValueIssue> {
+    let (value, absent) = self.parameter(index);
+    if absent == Some(false) {
+      Ok(value)
+    } else {
+      Err(value.issue().unwrap_or(ValueIssue::Dynamic))
     }
   }
 
   pub fn count(&self) -> Value {
-    match self {
-      Self::Known(values) => {
-        Value::Literal(values.len().to_string().into_bytes())
-      }
-      Self::Unknown { count, .. } => Value::Unknown(*count),
-    }
+    self
+      .fields
+      .iter()
+      .filter_map(|(_, count)| count.boundary().err())
+      .reduce(ValueIssue::combine)
+      .map_or_else(
+        || Value::Literal(self.fields.len().to_string().into_bytes()),
+        Value::Unknown,
+      )
   }
 
   pub fn issue(&self) -> Option<ValueIssue> {
-    match self {
-      Self::Known(values) => values
-        .iter()
-        .filter_map(Value::issue)
-        .reduce(ValueIssue::combine),
-      Self::Unknown { value, .. } => Some(*value),
-    }
+    self
+      .fields
+      .iter()
+      .flat_map(|(value, count)| {
+        value.issue().into_iter().chain(count.boundary().err())
+      })
+      .reduce(ValueIssue::combine)
   }
 
   fn join(&mut self, other: &Self) {
-    if let (Self::Known(left), Self::Known(right)) = (&mut *self, other)
-      && left.len() == right.len()
+    if self == other {
+      return;
+    }
+    if self.fields.len() == other.fields.len()
+      && self
+        .fields
+        .iter()
+        .zip(&other.fields)
+        .all(|((_, left), (_, right))| {
+          left.boundary().is_ok() == right.boundary().is_ok()
+        })
     {
-      for (left, right) in left.iter_mut().zip(right) {
+      for ((left, count), (right, other_count)) in
+        self.fields.iter_mut().zip(&other.fields)
+      {
         left.join(right);
+        if let Err(issue) = count.boundary() {
+          *count = FieldCount::Unknown {
+            minimum: count.minimum().min(other_count.minimum()),
+            issue: issue.combine(other_count.boundary().unwrap_err()),
+          };
+        }
       }
       return;
     }
-    let count = self
-      .count()
-      .issue()
-      .into_iter()
-      .chain(other.count().issue())
-      .reduce(ValueIssue::combine)
-      .unwrap_or(ValueIssue::Dynamic);
-    let value = self
-      .issue()
-      .into_iter()
-      .chain(other.issue())
-      .fold(count, ValueIssue::combine);
-    *self = Self::Unknown { count, value };
+    let prefix = self
+      .fields
+      .iter()
+      .zip(&other.fields)
+      .take_while(|(left, right)| left == right && left.1.boundary().is_ok())
+      .count();
+    let suffix = self.fields[prefix..]
+      .iter()
+      .rev()
+      .zip(other.fields[prefix..].iter().rev())
+      .take_while(|(left, right)| left == right && left.1.boundary().is_ok())
+      .count();
+    let mut fields = self.fields[..prefix].to_vec();
+    let left = &self.fields[prefix..self.fields.len() - suffix];
+    let right = &other.fields[prefix..other.fields.len() - suffix];
+    let known = left
+      .iter()
+      .zip(right)
+      .take_while(|((_, left), (_, right))| {
+        left.boundary().is_ok() && right.boundary().is_ok()
+      })
+      .count();
+    for ((left, _), (right, _)) in left[..known].iter().zip(&right[..known]) {
+      let mut value = left.clone();
+      value.join(right);
+      fields.push((value, FieldCount::One));
+    }
+    let left = &left[known..];
+    let right = &right[known..];
+    if !left.is_empty() || !right.is_empty() {
+      let minimum = |fields: &[(Value, FieldCount)]| {
+        fields
+          .iter()
+          .map(|(_, count)| count.minimum())
+          .fold(0, usize::saturating_add)
+      };
+      let issue = left
+        .iter()
+        .chain(right)
+        .filter_map(|(_, count)| count.boundary().err())
+        .reduce(ValueIssue::combine)
+        .unwrap_or(ValueIssue::Dynamic);
+      let value = left
+        .iter()
+        .chain(right)
+        .map(|(value, _)| value.clone())
+        .reduce(|mut left, right| {
+          left.join(&right);
+          left
+        })
+        .unwrap_or(Value::Unknown(issue));
+      fields.push((
+        value,
+        FieldCount::Unknown {
+          minimum: minimum(left).min(minimum(right)),
+          issue,
+        },
+      ));
+    }
+    fields.extend_from_slice(&self.fields[self.fields.len() - suffix..]);
+    self.fields = fields;
+  }
+
+  pub fn shift(&mut self, mut amount: usize) -> bool {
+    if amount > self.minimum() {
+      return false;
+    }
+    let mut removed = 0;
+    let mut uncertain: Option<(Value, ValueIssue)> = None;
+    while amount > 0 {
+      let (value, count) = &mut self.fields[removed];
+      if let Err(issue) = count.boundary() {
+        if let Some((previous, cause)) = &mut uncertain {
+          previous.join(value);
+          *cause = cause.combine(issue);
+        } else if amount <= count.minimum() {
+          *count = FieldCount::Unknown {
+            minimum: count.minimum() - amount,
+            issue,
+          };
+          break;
+        } else {
+          uncertain = Some((value.clone(), issue));
+        }
+      } else if let Some((previous, _)) = &mut uncertain {
+        previous.join(value);
+      }
+      let consumed = count.minimum().min(amount);
+      amount -= consumed;
+      if consumed < count.minimum() {
+        if let FieldCount::Unknown { minimum, .. } = count {
+          *minimum -= consumed;
+        }
+        break;
+      }
+      removed += 1;
+    }
+    self.fields.drain(..removed);
+    if let Some((value, issue)) = uncertain {
+      self
+        .fields
+        .insert(0, (value, FieldCount::Unknown { minimum: 0, issue }));
+    }
+    true
   }
 
   pub fn invalidate(&mut self, issue: ValueIssue) {
@@ -273,7 +433,13 @@ impl Positionals {
       .issue()
       .map_or(issue, |count| count.combine(issue));
     let value = self.issue().map_or(count, |value| value.combine(count));
-    *self = Self::Unknown { count, value };
+    self.fields = vec![(
+      Value::Unknown(value),
+      FieldCount::Unknown {
+        minimum: 0,
+        issue: count,
+      },
+    )];
   }
 }
 
@@ -295,7 +461,7 @@ pub(in crate::interface::application::engine::analysis) struct Environment {
   pub substitution_status: Option<Value>,
   /// Errors in this command's expansions, assignments and redirections.
   pub failure: CommandFailure,
-  pub option_cursor: Option<(Vec<Value>, usize)>,
+  pub option_cursor: Option<(Positionals, usize)>,
   pub options_reset: bool,
   pub io: Io,
   pub directory_variables_modified: bool,
@@ -577,8 +743,12 @@ impl Environment {
       },
       positional: input.positional.as_ref().map_or_else(
         || Positionals::unknown(ValueIssue::Dynamic),
-        |args| {
-          Positionals::Known(args.iter().cloned().map(Value::Literal).collect())
+        |args| Positionals {
+          fields: args
+            .iter()
+            .cloned()
+            .map(|value| (Value::Literal(value), FieldCount::One))
+            .collect(),
         },
       ),
       special: input
@@ -778,16 +948,7 @@ impl Environment {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .and_then(|n| n.checked_sub(1));
-      return self.positional.values().map_or_else(
-        |issue| (Value::Unknown(issue), None),
-        |args| {
-          index
-            .and_then(|i| args.get(i))
-            .map_or((Value::Literal(Vec::new()), Some(true)), |v| {
-              (v.clone(), Some(false))
-            })
-        },
-      );
+      return self.positional.parameter(index.unwrap_or(usize::MAX));
     }
     if matches!(name, b"?" | b"-" | b"$" | b"!" | b"0") {
       return (

@@ -1,9 +1,9 @@
 use super::encoding::{
-  Lines, MODIFIERS, OpenDocument, Positions, SymbolFormat, TYPES,
-  document_offset, document_source, document_symbols, encode, fault, file_path,
-  invalid, symbols, uri, workspace_edit,
+  MODIFIERS, OpenDocument, Positions, SymbolFormat, TYPES, document_offset,
+  document_source, document_symbols, encode, fault, file_path, invalid,
+  locations, symbols, uri, workspace_edit,
 };
-use crate::interface::application::engine::{self, DocumentId};
+use crate::interface::application::engine::DocumentId;
 use crate::interface::application::{
   Application, Error, Failure, RequestScope, Session,
 };
@@ -15,7 +15,7 @@ use async_lsp::{ClientSocket, ErrorCode, ResponseError};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -407,6 +407,34 @@ impl Server {
     })
   }
 
+  /// Name requests address the document by path at a source offset.
+  fn name_query<T: Send + 'static>(
+    &self,
+    position: &lsp::TextDocumentPositionParams,
+    operation: impl FnOnce(
+      &mut Application,
+      &Path,
+      usize,
+      &AtomicBool,
+    ) -> Result<T, Error>
+    + Send
+    + 'static,
+  ) -> Reply<T> {
+    let offset = position.position;
+    self.document_query(
+      &position.text_document.uri,
+      RequestScope::Names,
+      move |application, id, cancelled| {
+        let offset = document_offset(application, id, offset)?;
+        let path = application
+          .path(id)
+          .ok_or_else(|| Error::Message("Unknown document path".into()))?
+          .to_path_buf();
+        operation(application, &path, offset, cancelled)
+      },
+    )
+  }
+
   fn query<T: Send + 'static>(
     &self,
     scope: RequestScope,
@@ -475,24 +503,8 @@ impl Server {
         if definitions.is_empty() {
           return Ok(None);
         }
-        let mut positions = Positions::new(application);
-        let locations = definitions
-          .into_iter()
-          .map(|location| {
-            let range = positions.range(&location)?.ok_or_else(|| {
-              Error::Message("Invalid definition range".into())
-            })?;
-            Ok(lsp::Location {
-              uri: uri(
-                application,
-                &opened,
-                positions.path(location.snapshot.document)?,
-              )?,
-              range,
-            })
-          })
-          .collect::<Result<_, Error>>()?;
-        Ok(Some(lsp::GotoDefinitionResponse::Array(locations)))
+        locations(application, &opened, &definitions)
+          .map(|locations| Some(lsp::GotoDefinitionResponse::Array(locations)))
       },
     )
   }
@@ -501,20 +513,13 @@ impl Server {
     &self,
     params: &lsp::ReferenceParams,
   ) -> Reply<Option<Vec<lsp::Location>>> {
-    let position = params.text_document_position.position;
     let include_declaration = params.context.include_declaration;
     let opened = self.opened.clone();
-    self.document_query(
-      &params.text_document_position.text_document.uri,
-      RequestScope::Names,
-      move |application, id, cancelled| {
-        let offset = document_offset(application, id, position)?;
-        let path = application
-          .path(id)
-          .ok_or_else(|| Error::Message("Unknown document path".into()))?
-          .to_path_buf();
+    self.name_query(
+      &params.text_document_position,
+      move |application, path, offset, cancelled| {
         let references = application.references(
-          &path,
+          path,
           offset,
           include_declaration,
           cancelled,
@@ -522,24 +527,7 @@ impl Server {
         if references.is_empty() {
           return Ok(None);
         }
-        let mut positions = Positions::new(application);
-        references
-          .into_iter()
-          .map(|location| {
-            let range = positions
-              .range(&location)?
-              .ok_or(engine::Error::InvalidPosition)?;
-            Ok(lsp::Location {
-              uri: uri(
-                application,
-                &opened,
-                positions.path(location.snapshot.document)?,
-              )?,
-              range,
-            })
-          })
-          .collect::<Result<Vec<_>, Error>>()
-          .map(Some)
+        locations(application, &opened, &references).map(Some)
       },
     )
   }
@@ -548,33 +536,17 @@ impl Server {
     &self,
     params: &lsp::TextDocumentPositionParams,
   ) -> Reply<Option<lsp::PrepareRenameResponse>> {
-    let position = params.position;
-    self.document_query(
-      &params.text_document.uri,
-      RequestScope::Names,
-      move |application, id, cancelled| {
-        let offset = document_offset(application, id, position)?;
-        let path = application
-          .path(id)
-          .ok_or_else(|| Error::Message("Unknown document path".into()))?
-          .to_path_buf();
-        let Some(target) =
-          application.prepare_rename(&path, offset, cancelled)?
-        else {
-          return Ok(None);
-        };
-        let range = Lines::new(document_source(
-          application,
-          target.location.snapshot.document,
-        )?)
-        .range(&target.location.bytes)
-        .ok_or(engine::Error::InvalidPosition)?;
-        Ok(Some(lsp::PrepareRenameResponse::RangeWithPlaceholder {
-          range,
-          placeholder: target.placeholder,
-        }))
-      },
-    )
+    self.name_query(params, |application, path, offset, cancelled| {
+      let Some(target) = application.prepare_rename(path, offset, cancelled)?
+      else {
+        return Ok(None);
+      };
+      let range = Positions::new(application).result_range(&target.location)?;
+      Ok(Some(lsp::PrepareRenameResponse::RangeWithPlaceholder {
+        range,
+        placeholder: target.placeholder,
+      }))
+    })
   }
 
   fn rename(
@@ -583,21 +555,11 @@ impl Server {
   ) -> Reply<Option<lsp::WorkspaceEdit>> {
     let opened = self.opened.clone();
     let document_changes = self.support.document_changes;
-    self.document_query(
-      &params.text_document_position.text_document.uri,
-      RequestScope::Names,
-      move |application, id, cancelled| {
-        let offset = document_offset(
-          application,
-          id,
-          params.text_document_position.position,
-        )?;
-        let path = application
-          .path(id)
-          .ok_or_else(|| Error::Message("Unknown document path".into()))?
-          .to_path_buf();
-        let edits =
-          application.rename(&path, offset, &params.new_name, cancelled)?;
+    let new_name = params.new_name;
+    self.name_query(
+      &params.text_document_position,
+      move |application, path, offset, cancelled| {
+        let edits = application.rename(path, offset, &new_name, cancelled)?;
         workspace_edit(application, edits, &opened, document_changes).map(Some)
       },
     )
@@ -613,15 +575,12 @@ impl Server {
       RequestScope::Results,
       move |application, id, cancelled| {
         let links = application.document_links(id, cancelled)?;
-        let positions = Lines::new(document_source(application, id)?);
+        let mut positions = Positions::new(application);
         links
           .into_iter()
           .map(|(location, path)| {
-            let range = positions.range(&location.bytes).ok_or_else(|| {
-              Error::Message("Invalid document link range".into())
-            })?;
             Ok(lsp::DocumentLink {
-              range,
+              range: positions.result_range(&location)?,
               target: Some(uri(application, &opened, &path)?),
               tooltip: None,
               data: None,
@@ -634,7 +593,7 @@ impl Server {
   }
 }
 
-fn log(client: &ClientSocket, message: impl std::fmt::Display) {
+pub(super) fn log(client: &ClientSocket, message: impl std::fmt::Display) {
   let _ = client.notify::<notif::LogMessage>(lsp::LogMessageParams {
     typ: lsp::MessageType::ERROR,
     message: message.to_string(),

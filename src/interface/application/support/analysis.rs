@@ -1,5 +1,6 @@
 use super::{
   Application, Error, Failure,
+  application::InputSelection,
   inputs::{InputCache, Inputs},
 };
 use crate::interface::application::engine::{
@@ -10,13 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub(in crate::interface::application) struct AnalysisCollection {
   pub entries: BTreeMap<PathBuf, Workspace>,
-  pub(super) inputs: BTreeSet<PathBuf>,
-  pub(super) explicit: BTreeSet<PathBuf>,
-  pub(super) discovery_failures: Vec<Failure>,
+  pub(super) collected: Instant,
+  pub(super) selection: InputSelection,
   failures: Vec<Failure>,
   paths: BTreeMap<PathBuf, Snapshot>,
   cache: InputCache,
@@ -35,10 +36,9 @@ impl Application {
     explicit: BTreeSet<PathBuf>,
     cancelled: &AtomicBool,
   ) -> Result<Arc<AnalysisCollection>, Error> {
-    let (inputs, failures) =
-      self.collect_inputs(explicit.clone(), cancelled)?;
+    let selection = self.select_inputs(explicit, cancelled)?;
     let mut entries = BTreeMap::new();
-    for path in &inputs {
+    for path in &selection.paths {
       check_cancelled(cancelled)?;
       if self.cache.loaded.get(path).is_some_and(Result::is_ok) {
         entries.insert(path.clone(), self.analyze_entry(path, cancelled)?);
@@ -46,9 +46,8 @@ impl Application {
     }
     let collection = AnalysisCollection {
       entries,
-      inputs,
-      explicit,
-      discovery_failures: failures,
+      collected: Instant::now(),
+      selection,
       failures: self.failures.clone(),
       paths: self.entries.clone(),
       cache: self.cache.clone(),
@@ -86,7 +85,7 @@ impl Application {
       let mut explicit = self
         .analyses
         .as_ref()
-        .map(|collection| collection.explicit.clone())
+        .map(|collection| collection.selection.explicit.clone())
         .unwrap_or_default();
       explicit.insert(path);
       self.collect_analysis(explicit, cancelled)?;
@@ -126,11 +125,7 @@ impl Application {
   pub(super) fn share_analyses(&mut self, collection: Arc<AnalysisCollection>) {
     self.entries.extend(collection.paths.clone());
     self.cache = collection.cache.clone();
-    self.failures.extend(collection.failures.iter().cloned());
-    self.failures.sort_by(|left, right| {
-      (&left.path, &left.message).cmp(&(&right.path, &right.message))
-    });
-    self.failures.dedup();
+    self.failures.clone_from(&collection.failures);
     self.analyses = Some(collection);
   }
 
@@ -176,9 +171,8 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<bool, Error> {
     self.verify_discovery(cancelled)?;
-    let (inputs, failures) =
-      self.collect_inputs(collection.explicit.clone(), cancelled)?;
-    if inputs != collection.inputs || failures != collection.discovery_failures
+    if self.select_inputs(collection.selection.explicit.clone(), cancelled)?
+      != collection.selection
     {
       return Ok(false);
     }

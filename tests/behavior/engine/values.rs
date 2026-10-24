@@ -10,6 +10,64 @@ mod assignments {
   use support::analyze;
 
   #[test]
+  fn arithmetic_variable_contents_are_not_evaluated_recursively() {
+    for (body, expected, y) in [
+      ("x='y=5'; out=$((x))", None, "1"),
+      ("x='y'; out=$((x))", None, "1"),
+      ("x='z'; z='y=5'; out=$((x))", None, "1"),
+      ("x='x'; out=$((x))", None, "1"),
+      ("x='${y:=5}'; out=$((x))", None, "1"),
+      ("x='$(y=5)'; out=$((x))", None, "1"),
+      ("x='y=5'; out=$((x += 1))", None, "1"),
+      ("x='y=5'; out=$((x + (y=7)))", None, "7"),
+      ("x='y=5'; out=$((0 && x))", Some("0"), "1"),
+      ("x='y=5'; out=$((1 || x))", Some("1"), "1"),
+      ("x='y=5'; out=$((0 ? x : 2))", Some("2"), "1"),
+      ("x='y=5'; out=$(($x))", Some("5"), "5"),
+      ("x='y=5'; out=$((0 && ($x)))", Some("0"), "1"),
+      ("x='y=5'; out=$(($x + 1))", Some("6"), "6"),
+      ("x='z'; z='y=5'; out=$(($x))", None, "1"),
+      ("x='y=5'; f() { out=$((x)); }; f", None, "1"),
+      (
+        "if condition; then x='y=5'; else x='y=6'; fi; out=$((x))",
+        None,
+        "1",
+      ),
+    ] {
+      let source = format!("y=1; {body}; : \"$out\" \"$y\"");
+      let (workspace, analysis) = analyze(&source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [
+          expected.map_or(Value::Unknown(ValueIssue::Arithmetic), |value| {
+            Value::Literal(value.as_bytes().to_vec())
+          })
+        ],
+        "{source}"
+      );
+      assert_eq!(
+        reads(&workspace, &analysis, b"y"),
+        [Value::Literal(y.as_bytes().to_vec())],
+        "{source}"
+      );
+      assert!(analysis.unknown_effects().next().is_none(), "{source}");
+    }
+    let mut initial = InitialEnvironment::empty();
+    initial.values.insert(b"x".to_vec(), b"y=5".to_vec());
+    initial.values.insert(b"y".to_vec(), b"1".to_vec());
+    let (workspace, analysis) =
+      support::analyze_with("out=$((x)); : \"$out\" \"$y\"", initial);
+    assert_eq!(
+      reads(&workspace, &analysis, b"out"),
+      [Value::Unknown(ValueIssue::Arithmetic)]
+    );
+    assert_eq!(
+      reads(&workspace, &analysis, b"y"),
+      [Value::Literal(b"1".to_vec())]
+    );
+  }
+
+  #[test]
   fn completion_status_crosses_environment_boundaries_without_leaking_variables()
    {
     for (body, expected) in [
@@ -248,12 +306,12 @@ mod assignments {
   }
 
   #[test]
-  fn undecoded_definitions_forget_branch_choices_and_keep_readonly_values() {
+  fn uncalled_broken_bodies_preserve_branch_choices_and_readonly_values() {
     for (source, name, expected) in [
       (
-        "if condition; then f() { out=a; }; else f() { out=b; }; fi; g() { a | ; }; f; : \"$out\"",
-        b"out".as_slice(),
-        Value::Unknown(ValueIssue::Dynamic),
+        "if condition; then f() { out=1; }; tag=1; else f() { out=2; }; tag=2; fi; g() { a | ; }; f; result=$((out-tag)); : \"$result\"",
+        b"result".as_slice(),
+        Value::Literal(b"0".to_vec()),
       ),
       (
         "readonly r=1; x=$(a | ); : \"$r\"",
@@ -261,21 +319,130 @@ mod assignments {
         Value::Literal(b"1".to_vec()),
       ),
     ] {
-      let document = support::parse(1, 1, source);
-      assert!(document.has_syntax_errors(), "{source}");
-      let mut request = AnalysisRequest::new(document.snapshot());
-      request.initial = InitialEnvironment::empty();
-      let mut workspace = Workspace::default();
-      workspace.insert(document).unwrap();
-      let analysis = workspace
-        .analyze(
-          request,
-          &mut support::Inputs::default(),
-          &AtomicBool::new(false),
-        )
-        .unwrap();
+      let (workspace, analysis) = support::analyze_damaged(source);
       assert_eq!(reads(&workspace, &analysis, name), [expected], "{source}");
     }
+  }
+
+  #[test]
+  fn damaged_commands_taint_following_state_without_executing_inner_writes() {
+    for broken in [
+      ": \"${}\"",
+      "x=new : \"${}\"",
+      "x=new >\"${}\"",
+      "if :; then x=new; else x=other; fi >\"${}\"",
+      "if :; ) then x=new; fi",
+      "for item ) in a; do x=new; done",
+      "case a ) in a) x=new;; esac",
+      ": <<EOF\n${x^^}\nEOF\n",
+    ] {
+      let source = format!("x=old; : \"$x\"; {broken}\n: \"$x\"");
+      let (workspace, analysis) = support::analyze_damaged(&source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"x"),
+        [
+          Value::Literal(b"old".to_vec()),
+          Value::Unknown(ValueIssue::Recovery),
+        ],
+        "{source}"
+      );
+      assert!(
+        analysis
+          .gaps()
+          .iter()
+          .any(|gap| gap.issue == ResolutionIssue::Recovery),
+        "{source}"
+      );
+    }
+    let (workspace, analysis) = support::analyze_damaged(
+      "x=old; : \"$x\"; : \"$x\" \"${}\"; status=$?; : \"$x\" \"$status\"",
+    );
+    assert_eq!(
+      reads(&workspace, &analysis, b"x"),
+      [
+        Value::Literal(b"old".to_vec()),
+        Value::Unknown(ValueIssue::Recovery),
+      ]
+    );
+    assert_eq!(
+      reads(&workspace, &analysis, b"status"),
+      [Value::Unknown(ValueIssue::Recovery)]
+    );
+  }
+
+  #[test]
+  fn damage_in_separate_environments_preserves_outer_variables() {
+    for body in [
+      "(x=new; : \"${}\")",
+      "(x=new) >\"${}\"",
+      ": \"$(x=new; : \"${}\")\"",
+      "{ x=new; : \"${}\"; } &",
+    ] {
+      let source = format!("x=old; {body}\n: \"$x\"");
+      let (workspace, analysis) = support::analyze_damaged(&source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"x"),
+        [Value::Literal(b"old".to_vec())],
+        "{source}"
+      );
+      assert!(
+        analysis
+          .gaps()
+          .iter()
+          .any(|gap| gap.issue == ResolutionIssue::Recovery),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn damaged_expansions_forget_later_values_but_keep_readonly_values() {
+    for (source, name, expected) in [
+      (
+        "x=abc; : ${x^^}; : \"$x\"",
+        b"x".as_slice(),
+        Value::Unknown(ValueIssue::Recovery),
+      ),
+      (
+        "readonly r=1; : ${r^^}; : \"$r\"",
+        b"r",
+        Value::Literal(b"1".to_vec()),
+      ),
+      (
+        "x=abc; { read a; read b; } <<EOF\n1\n${x^^}\nEOF\n: \"$b\"",
+        b"b",
+        Value::Unknown(ValueIssue::Recovery),
+      ),
+      (
+        "{ read a; read b; } <<EOF\n1\n$((1(/0)) z\nEOF\n: \"$b\"",
+        b"b",
+        Value::Unknown(ValueIssue::Recovery),
+      ),
+      (
+        "v=1; f() { :; }; f $(( ${( ${v} )); s=$?; : \"$s\"",
+        b"s",
+        Value::Unknown(ValueIssue::Recovery),
+      ),
+      (
+        "v=1; f() { :; }; f $(( 1 + ${( ${v} )); s=$?; : \"$s\"",
+        b"s",
+        Value::Unknown(ValueIssue::Recovery),
+      ),
+    ] {
+      let (workspace, analysis) = support::analyze_damaged(source);
+      assert_eq!(reads(&workspace, &analysis, name), [expected], "{source}");
+    }
+    let (workspace, analysis) = support::analyze_damaged(
+      "IFS=' '; readonly IFS; { : ${x[$(read a)]}; read b; } <<EOF\n1\n2\nEOF\n: \"$b\"",
+    );
+    let values = reads(&workspace, &analysis, b"b");
+    let [Value::Unknown(issue)] = values.as_slice() else {
+      panic!("{values:?}");
+    };
+    assert_eq!(
+      issue.causes().collect::<Vec<_>>(),
+      [ValueIssue::Dynamic, ValueIssue::Recovery]
+    );
   }
 
   #[test]
@@ -1761,7 +1928,6 @@ mod expansion {
     for body in [
       "set -- $x; result=$1",
       "set -- $x; result=$#",
-      "set -- $x; result=\"$@\"",
       "set -- $x; result=\"$*\"",
       "set -- \"$x\"; result=$1",
       "f() { result=$1; }; f $x",
@@ -1972,18 +2138,23 @@ mod expansion {
         "{source}"
       );
     }
-    let value = last_value_with_limit(
-      "x=abcdefghijklmnopqrstuvwxyz; result=$(command -p echo -n \"$x\"); : \"$result\"",
-      InitialEnvironment::empty(),
-      16,
-    );
-    let Value::Unknown(issue) = value else {
-      panic!("{value:?}")
-    };
-    assert_eq!(
-      issue.causes().collect::<Vec<_>>(),
-      [ValueIssue::SizeLimit, ValueIssue::Unspecified]
-    );
+    for body in [
+      "result=$(command -p echo -n \"$x\")",
+      "set -- $x; result=\"$@\"",
+    ] {
+      let source =
+        format!("x=abcdefghijklmnopqrstuvwxyz; {body}; : \"$result\"");
+      let value =
+        last_value_with_limit(&source, InitialEnvironment::empty(), 16);
+      let Value::Unknown(issue) = value else {
+        panic!("{source}: {value:?}")
+      };
+      assert_eq!(
+        issue.causes().collect::<Vec<_>>(),
+        [ValueIssue::SizeLimit, ValueIssue::Unspecified],
+        "{source}"
+      );
+    }
     for body in [
       "set -- \"$x\" $y",
       "set -- \"$x\"$y",
@@ -2265,6 +2436,32 @@ mod expansion {
         [ValueIssue::Dynamic, ValueIssue::Arithmetic],
         "{source}"
       );
+    }
+  }
+
+  #[test]
+  fn transformed_backquote_words_keep_value_and_boundary_causes_of_expansions()
+  {
+    for (body, expected) in [
+      (
+        "command -p echo \\$x$y",
+        [ValueIssue::Dynamic, ValueIssue::TransformedSource].as_slice(),
+      ),
+      (
+        "set -- \\$x\"$y\"; command -p echo $#",
+        &[ValueIssue::TransformedSource],
+      ),
+      (
+        "set -- \\$x$y; command -p echo $#",
+        &[ValueIssue::Dynamic, ValueIssue::TransformedSource],
+      ),
+    ] {
+      let source = format!("read y; result=`{body}`; : \"$result\"");
+      let value = last_value(&source, InitialEnvironment::empty());
+      let Value::Unknown(issue) = value else {
+        panic!("{source}: {value:?}")
+      };
+      assert_eq!(issue.causes().collect::<Vec<_>>(), expected, "{source}");
     }
   }
 
@@ -2891,6 +3088,314 @@ EOF
   }
 
   #[test]
+  fn partial_argument_lists_preserve_known_positions_through_calls_and_shifts()
+  {
+    for (body, expected) in [
+      ("set -- a b ./s/*.sh; result=$1/$2", "a/b"),
+      ("set -- a b ./s/*.sh; shift; result=$1", "b"),
+      ("set -- a b ./s/*.sh; shift 0; result=$2", "b"),
+      ("set -- a b ./s/*.sh; set -- \"$@\"; result=$1/$2", "a/b"),
+      (
+        "set -- a b ./s/*.sh; set -- pre\"$@\"post; result=$1/$2",
+        "prea/b",
+      ),
+      (
+        "set -- a b ./s/*.sh; f() { shift; result=$1; }; f \"$@\"",
+        "b",
+      ),
+      ("f() { result=$1/$2; }; f a b ./s/*.sh", "a/b"),
+      ("set -- a b ./s/*.sh; result=${1+set}/${2+set}", "set/set"),
+      ("read x; set -- a b $x; result=$1/$2", "a/b"),
+      ("set -- a b ./s/*.sh; (shift); result=$1", "a"),
+      (
+        "if condition; then set -- a ./s/*.sh; else set -- a b; fi; result=$1",
+        "a",
+      ),
+      (
+        "if condition; then set -- a b ./s/*.sh; tag=a; else set -- b b ./s/*.sh; tag=b; fi; result=${1#\"$tag\"}/$2",
+        "/b",
+      ),
+      ("set -- a b ./s/*.sh; shift 3; result=$?", "0"),
+      ("read x; set -- a b $x; set -- \"$@\"tail; result=$1", "a"),
+      ("read x; set -- a b $x; set -- $@; result=$1/$2", "a/b"),
+      ("read x; set -- a b $x; set -- $*; result=$1/$2", "a/b"),
+      (
+        "read x; set -- a b ./s/*.sh; set -- \"$@\"${x:+yes}; result=$1",
+        "a",
+      ),
+      ("read x; set -- ${x:+}; result=$#", "0"),
+      ("f() { result=known; }; set -- f ./s/*.sh; \"$1\"", "known"),
+      (
+        "read x; IFS=:; set -- 'a:b' $x; set -- $@; result=$1/$2",
+        "a/b",
+      ),
+      (
+        "set -- a; while condition; do set -- \"$@\" x; done; result=$1",
+        "a",
+      ),
+      (
+        "set -- a ./s/*.sh; while condition; do set -- a b ./s/*.sh; done; result=$1",
+        "a",
+      ),
+      (
+        "set -- a b ./s/*.sh; f() { set -- changed; }; f; result=$1/$2",
+        "a/b",
+      ),
+      (
+        "OPTIND=1; set -- -a value ./s/*.sh; getopts a: flag; result=$flag/$OPTARG/$OPTIND",
+        "a/value/3",
+      ),
+      (
+        "OPTIND=1; getopts a: flag -a value ./s/*.sh; result=$flag/$OPTARG/$OPTIND",
+        "a/value/3",
+      ),
+      (
+        "if condition; then set -- head a ./s/*.sh; tag=a; else set -- head b ./s/*.sh; tag=b; fi; shift; result=${1#\"$tag\"}",
+        "",
+      ),
+      (
+        "if condition; then set -- a ./s/*.sh; tag=a; else set -- b ./s/*.sh; tag=b; fi; shift 0; result=${1#\"$tag\"}",
+        "",
+      ),
+      (
+        "OPTIND=1; if condition; then set -- -a ./s/*.sh; tag=a; else set -- -b ./s/*.sh; tag=b; fi; getopts ab flag; result=${flag#\"$tag\"}",
+        "",
+      ),
+      (
+        "set --; while condition; do set -- \"$@\" ''; done; IFS=; result=\"$*\"",
+        "",
+      ),
+    ] {
+      let source = format!("{body}; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn partial_argument_lists_distinguish_absence_from_unknown_values_and_counts()
+  {
+    for (body, expected) in [
+      (
+        "set -- a ./s/*.sh; result=${1+set}/${2+set}",
+        Value::Literal(b"set/set".to_vec()),
+      ),
+      (
+        "set -- a ./s/*.sh; shift; result=${1+set}",
+        Value::Literal(b"set".to_vec()),
+      ),
+      (
+        "read x; set -- a $x; result=${1+set}",
+        Value::Literal(b"set".to_vec()),
+      ),
+      (
+        "read x; set -- a $x b; result=${2+set}",
+        Value::Literal(b"set".to_vec()),
+      ),
+      (
+        "read x; set -- a $x b; shift; result=${1+set}",
+        Value::Literal(b"set".to_vec()),
+      ),
+      (
+        "set -- a ./s/*.sh; result=$#",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "read x; set -- a $x; result=$2",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "read x; set -- $x tail; result=$1",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "read x; set -- a $x; set -- \"$@\"tail; result=$1",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "read x; set -- $x tail; set -- pre\"$@\"; result=$2",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "set -- a ./s/*.sh; shift 2; result=$1",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "read x; set -- a $x b; shift 2; result=$1",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "f() { result=$#; }; set --; while condition; do set -- \"$@\" f; done; \"$@\" f",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+    ] {
+      let source = format!("{body}; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        expected,
+        "{source}"
+      );
+    }
+    let mut initial = InitialEnvironment::empty();
+    initial.positional = None;
+    assert_eq!(
+      last_value(
+        "set -- a b \"$@\"; shift; result=$1; : \"$result\"",
+        initial
+      ),
+      Value::Literal(b"b".to_vec())
+    );
+    for (body, expected) in [
+      (
+        "set -- $x; result=${1+set}",
+        Value::Unknown(ValueIssue::SizeLimit),
+      ),
+      (
+        "set -- \"$x\" $y; result=${2+set}",
+        Value::Unknown(ValueIssue::Arithmetic),
+      ),
+      (
+        "set -- \"$x\" $y; result=${1+set}",
+        Value::Literal(b"set".to_vec()),
+      ),
+      (
+        "set -- \"$x\" $y; shift; result=${1+set}",
+        Value::Unknown(ValueIssue::Arithmetic),
+      ),
+    ] {
+      let source = format!(
+        "x=abcdefghijklmnopqrstuvwxyz; y=$((1/0)); {body}; : \"$result\""
+      );
+      assert_eq!(
+        last_value_with_limit(&source, InitialEnvironment::empty(), 16),
+        expected,
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn partial_argument_lists_preserve_scalar_prefixes_and_suffixes() {
+    for (body, prefix, suffix) in [
+      (
+        "read separator; set -- a b; IFS=$separator; result=\"$*\"",
+        "a",
+        "b",
+      ),
+      (
+        "read separator; set -- a b; IFS=$separator; result=$*",
+        "a",
+        "b",
+      ),
+      (
+        "read separator; set -- a ./s/*.sh b; IFS=$separator; result=\"$*\"",
+        "a",
+        "b",
+      ),
+      ("set -- a ./s/*.sh b; IFS=:; result=\"$*\"", "a:", ":b"),
+      ("set -- a ./s/*.sh b; IFS=:; result=$*", "a:", ":b"),
+      ("read x; set -- a $x b; IFS=:; result=\"$*\"", "a", ":b"),
+      (
+        "read x; set -- a $x b; set -- pre\"$@\"post; IFS=:; result=\"$*\"",
+        "prea",
+        ":bpost",
+      ),
+      (
+        "read x; set -- a $x b; shift; IFS=:; result=\"$*\"",
+        "",
+        "b",
+      ),
+      (
+        "read x; set -- $x; IFS=:; result=pre\"$*\"post",
+        "pre",
+        "post",
+      ),
+      (
+        "read x; set -- $x b c; set -- pre\"$@\"; IFS=:; result=\"$*\"",
+        "",
+        ":c",
+      ),
+      (
+        "set -- a ./s/*.sh b; while condition; do set -- a b; done; IFS=:; result=\"$*\"",
+        "a",
+        ":b",
+      ),
+    ] {
+      let source = format!("{body}; : \"$result\"");
+      let value = last_value(&source, InitialEnvironment::empty());
+      let Value::Partial(partial) = &value else {
+        panic!("{source}: {value:?}");
+      };
+      assert!(
+        partial
+          .choices
+          .iter()
+          .all(|choice| choice.prefix.starts_with(prefix.as_bytes())
+            && choice.suffix.ends_with(suffix.as_bytes())),
+        "{source}: {value:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn optional_argument_boundaries_cover_empty_and_nonempty_expansions() {
+    for (body, expected) in [
+      (
+        "set -- a $x; set -- \"$@\"tail; result=$1",
+        ["atail", "a", "a"],
+      ),
+      (
+        "set -- $x b; set -- pre\"$@\"; result=$1",
+        ["preb", "prem", "prem"],
+      ),
+      (
+        "set -- a $x; set -- \"$@\"\"$@\"; result=$1",
+        ["aa", "a", "a"],
+      ),
+      (
+        "set -- $x b; set -- \"$@\"\"$@\"; result=$1",
+        ["bb", "m", "m"],
+      ),
+      (
+        "set -- a $x b; IFS=:; result=\"$*\"",
+        ["a:b", "a:m:b", "a:m:n:b"],
+      ),
+      (
+        "set -- $x; IFS=:; result=pre\"$*\"post",
+        ["prepost", "prempost", "prem:npost"],
+      ),
+      ("set -- a $x b; shift 2; result=$1", ["", "b", "n"]),
+    ] {
+      let source = format!("read x; {body}; : \"$result\"");
+      let value = last_value(&source, InitialEnvironment::empty());
+      for (input, expected) in ["", "m", "m n"].into_iter().zip(expected) {
+        let concrete = format!("x='{input}'; {body}; : \"$result\"");
+        assert_eq!(
+          last_value(&concrete, InitialEnvironment::empty()),
+          Value::Literal(expected.as_bytes().to_vec()),
+          "{concrete}"
+        );
+        let expected = expected.as_bytes();
+        let accepts = match &value {
+          Value::Literal(bytes) => bytes == expected,
+          Value::Unknown(_) => true,
+          Value::Partial(partial) => partial.choices.iter().any(|choice| {
+            expected.starts_with(&choice.prefix)
+              && expected.ends_with(&choice.suffix)
+              && expected.len() >= choice.minimum
+              && choice.required.iter().all(|byte| expected.contains(byte))
+              && (!choice.exact || expected == choice.prefix)
+          }),
+        };
+        assert!(accepts, "{source}: {value:?} excludes {expected:?}");
+      }
+    }
+  }
+
+  #[test]
   fn positional_arguments_preserve_empty_fields_and_function_scope() {
     for (source, expected) in [
       (
@@ -3144,7 +3649,9 @@ mod words {
 
   #[test]
   fn possibly_unset_or_unknown_ifs_does_not_prove_joined_or_split_values() {
-    use shellsmith::interface::application::engine::ValueIssue;
+    use shellsmith::interface::application::engine::{
+      PartialValue, ValueConstraint, ValueIssue,
+    };
     for (source, expected) in [
       (
         "unset IFS; set -- a b; out=\"$*\"; : \"$out\"",
@@ -3156,7 +3663,16 @@ mod words {
       ),
       (
         "IFS=; if condition; then unset IFS; fi; set -- a b; out=\"$*\"; : \"$out\"",
-        Value::Unknown(ValueIssue::Dynamic),
+        Value::Partial(PartialValue {
+          choices: vec![ValueConstraint {
+            prefix: b"a".to_vec(),
+            suffix: b"b".to_vec(),
+            minimum: 2,
+            required: b"ab".iter().copied().collect(),
+            exact: false,
+          }],
+          issue: ValueIssue::Dynamic,
+        }),
       ),
       (
         "IFS=; if condition; then unset IFS; fi; x='a b'; set -- $x; out=$#; : \"$out\"",

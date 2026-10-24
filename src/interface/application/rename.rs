@@ -2,7 +2,7 @@ use super::engine::{
   self, Access, Alternative, ExecutionContextId, Location, Name,
   NameEnvironment, NameId, ResolutionIssue, SymbolId, SymbolKind,
   check_cancelled, optional_reserved_word, reserved_word, special_builtin,
-  valid_name,
+  unspecified_command, valid_name,
 };
 use super::support::NameCollection;
 use super::{Application, Error};
@@ -77,12 +77,24 @@ impl Application {
     if !valid_name(new_name.as_bytes())
       || reserved(selection.kind, new_name.as_bytes())
       || selection.kind == SymbolKind::Function
-        && optional_reserved_word(new_name.as_bytes())
+        && (optional_reserved_word(new_name.as_bytes())
+          || unspecified_command(new_name.as_bytes()))
     {
       return Err(Error::InvalidName("The new name must be a portable shell name without special shell meaning".into()));
     }
     if selection.target.placeholder == new_name {
       return Ok(Vec::new());
+    }
+    if selection.kind == SymbolKind::Variable
+      && self
+        .settings()
+        .initial
+        .variable_binding(new_name.as_bytes())
+        != engine::InitialBinding::Absent
+    {
+      return Err(refused(
+        "The new name may already be bound in the initial environment",
+      ));
     }
     let mut edits = BTreeMap::new();
     for &(entry, site) in &selection.sites {

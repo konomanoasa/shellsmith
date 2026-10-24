@@ -99,6 +99,20 @@ pub fn analyze_with(
 ) -> (Workspace, Analysis) {
   let document = parse(1, 1, source);
   assert!(!document.has_syntax_errors(), "{source}");
+  analyze_document(document, initial)
+}
+
+/// Analyzes a source that must contain syntax errors.
+pub fn analyze_damaged(source: &str) -> (Workspace, Analysis) {
+  let document = parse(1, 1, source);
+  assert!(document.has_syntax_errors(), "{source}");
+  analyze_document(document, InitialEnvironment::empty())
+}
+
+fn analyze_document(
+  document: Document,
+  initial: InitialEnvironment,
+) -> (Workspace, Analysis) {
   let mut request = AnalysisRequest::new(document.snapshot());
   request.initial = initial;
   let mut workspace = Workspace::default();

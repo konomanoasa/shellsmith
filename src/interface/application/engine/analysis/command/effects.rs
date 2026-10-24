@@ -241,6 +241,8 @@ impl Resolver<'_> {
     issue: ResolutionIssue,
     value_issue: Option<ValueIssue>,
   ) -> Flow {
+    let value_issue = value_issue
+      .or((issue == ResolutionIssue::Recovery).then_some(ValueIssue::Recovery));
     env.io.consume_input(None);
     if let Some(output) = &mut env.io.output {
       output.fail(value_issue.unwrap_or(ValueIssue::UnsupportedExpansion));
@@ -324,7 +326,7 @@ fn unattempted_utilities(
         let operands = &args[options.operands..];
         if options.query {
           for arg in operands {
-            if arg.boundary.is_ok() {
+            if arg.count.boundary().is_ok() {
               result.dependencies.extend(command_dependency(&arg.value));
             } else {
               result.dependencies.insert(EffectTarget::Functions);
@@ -334,7 +336,7 @@ fn unattempted_utilities(
           result
             .dependencies
             .extend(command_dependency(&command.value));
-          if command.boundary.is_ok() {
+          if command.count.boundary().is_ok() {
             pending.push((&command.value, rest));
           } else {
             result
@@ -395,7 +397,9 @@ fn builtin_targets(
     }
     b"getopts" => {
       match getopts_operands(args).map(|start| &args[start..]) {
-        Some(args) if args.iter().take(2).all(|arg| arg.boundary.is_ok()) => {
+        Some(args)
+          if args.iter().take(2).all(|arg| arg.count.boundary().is_ok()) =>
+        {
           named_targets(
             args.get(1..2).unwrap_or(&[]),
             NameTarget::Variable,
@@ -480,7 +484,7 @@ fn named_targets(
           targets.insert(EffectTarget::Attribute(name.clone()));
         }
       }
-      _ if arg.boundary.is_err() || arg.value.issue().is_some() => {
+      _ if arg.count.boundary().is_err() || arg.value.issue().is_some() => {
         let target = argument_target(arg, kind);
         if attributes {
           targets.insert(attribute_target(&target));
@@ -508,7 +512,7 @@ pub(super) fn argument_target(
   } else {
     arg.value.clone()
   };
-  match (value, arg.boundary.is_ok(), kind) {
+  match (value, arg.count.boundary().is_ok(), kind) {
     (Value::Literal(name), true, NameTarget::Function) => {
       EffectTarget::Function(name)
     }

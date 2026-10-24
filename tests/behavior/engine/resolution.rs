@@ -807,6 +807,205 @@ mod bindings {
   }
 
   #[test]
+  fn empty_heredocs_keep_the_redirection_pairing_of_their_owner() {
+    let (workspace, analysis) = analyze(
+      "x=0\nf() { x=1; }\nf <<A <<B\nA\n$x\nB\n: \"$(cat <<C\nC\n)\"\n: \"$x\"\ncat <<'D'\nD\n",
+    );
+    let ids: Vec<_> = workspace
+      .symbols_named(b"x")
+      .map(|symbol| symbol.id)
+      .collect();
+    let uses = reads(&workspace, &analysis, b"x");
+    assert_eq!(
+      uses
+        .iter()
+        .map(|site| site.resolution.status())
+        .collect::<Vec<_>>(),
+      vec![
+        ResolutionStatus::Resolved(ids[0]),
+        ResolutionStatus::Resolved(ids[1])
+      ]
+    );
+    assert_eq!(analysis.gaps(), []);
+  }
+
+  #[test]
+  fn damaged_commands_keep_syntax_without_evaluating_arguments_or_sources() {
+    for source in [
+      "path=/lib.sh; . \"$path\" >",
+      "path=/lib.sh; . \"$path\" \"${}\"",
+      "path=/lib.sh; . \"$path\" <<EOF\n${x^^}\nEOF\n",
+      "path=/lib.sh; : \"$(. /lib.sh)\" \"${}\"",
+    ] {
+      let document = support::parse(1, 1, source);
+      assert!(document.has_syntax_errors(), "{source}");
+      let mut request = AnalysisRequest::new(document.snapshot());
+      request.initial = InitialEnvironment::empty();
+      let mut workspace = Workspace::default();
+      workspace.insert(document).unwrap();
+      let mut inputs = support::Inputs::sources([(
+        "/lib.sh",
+        support::parse(2, 1, "loaded=yes"),
+      )]);
+      let analysis = workspace
+        .analyze(request, &mut inputs, &AtomicBool::new(false))
+        .unwrap();
+      assert_eq!(inputs.source_queries, [], "{source}");
+      assert_eq!(inputs.queries, [], "{source}");
+      assert_eq!(analysis.contexts().len(), 1, "{source}");
+      assert!(
+        analysis
+          .gaps()
+          .iter()
+          .any(|gap| { gap.issue == ResolutionIssue::Recovery }),
+        "{source}"
+      );
+      let document = workspace.document(DocumentId(1)).unwrap();
+      let paths: Vec<_> = document
+        .occurrences()
+        .iter()
+        .filter(|site| {
+          site.kind == OccurrenceKind::VariableExpansion
+            && site.name == Value::Literal(b"path".to_vec())
+        })
+        .collect();
+      assert_eq!(
+        paths.len(),
+        usize::from(source.contains("$path")),
+        "{source}"
+      );
+      for path in paths {
+        assert_eq!(analysis.values(path.id).count(), 0, "{source}");
+        assert!(
+          !analysis
+            .uses()
+            .any(|site| site.site.syntax() == Some(path.id)),
+          "{source}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn damaged_commands_preserve_prior_results_and_taint_later_reads() {
+    for broken in [
+      "fi;",
+      ": && ) && :;",
+      ": | ) | :;",
+      "y=1 y): ;",
+      ": \"$x\" <$(x=2)) t;",
+      "if : \"$x\"; ) then :; fi;",
+      "while : \"$x\"; ) do :; break; done;",
+      "for i in \"$x\" ) ; do :; done;",
+      "for i ) in \"$x\"; do :; done;",
+      "for i in \"$x\" > d; do :; done;",
+      "case a esac;",
+      "case \"$x\" ) in a) :;; esac;",
+      "case \"$x\" in b) ;; ) c) ;; a) :;; esac;",
+      "case \"$x\" in a) b ) ;; esac;",
+      "f() ) { :; };",
+      "if : \"$x\"; then :; ) else :; fi;",
+      ": \"$x${x^^}$x\";",
+      ": \"$x\" ${x^^$((y=1))};",
+      ": \"$x\" \"${}\";",
+      ": \"$x\" ${y:-${x^^}};",
+      ": \"$x\" <<EOF\n${x^^}\nEOF\n",
+      ": \"$x\" <<EOF\n$((1(/0)) z\nEOF\n",
+      ": $(( ${x} + ${( ${x} ));",
+      ": \"$x\" $(( ${( ${y} ));",
+    ] {
+      let source = format!("x=1; : \"$x\"; {broken}\n: \"$x\"");
+      let (workspace, analysis) = support::analyze_damaged(&source);
+      let definition = workspace.symbols_named(b"x").next().unwrap().id;
+      let uses = reads(&workspace, &analysis, b"x");
+      assert!(uses.len() >= 2, "{source}");
+      let first = uses.first().unwrap();
+      assert_eq!(
+        first.resolution.status(),
+        ResolutionStatus::Resolved(definition),
+        "{source}"
+      );
+      assert!(
+        uses
+          .last()
+          .unwrap()
+          .resolution
+          .issues
+          .contains(&ResolutionIssue::Recovery),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn damaged_function_bodies_are_deferred_and_later_definitions_restore_bindings()
+   {
+    let source =
+      "x=1; f() { : \"${}\"; }; : \"$x\"; f; : \"$x\"; f() { :; }; f";
+    let (workspace, analysis) = support::analyze_damaged(source);
+    let definition = workspace.symbols_named(b"x").next().unwrap().id;
+    let variables = reads(&workspace, &analysis, b"x");
+    assert_eq!(variables.len(), 2);
+    assert_eq!(
+      variables[0].resolution.status(),
+      ResolutionStatus::Resolved(definition)
+    );
+    assert!(
+      variables[1]
+        .resolution
+        .issues
+        .contains(&ResolutionIssue::Recovery)
+    );
+    let functions: Vec<_> = workspace
+      .symbols_named(b"f")
+      .map(|symbol| symbol.id)
+      .collect();
+    assert_eq!(functions.len(), 2);
+    let calls: Vec<_> = analysis
+      .uses()
+      .filter(|site| {
+        site
+          .site
+          .syntax()
+          .and_then(|id| workspace.occurrence(id))
+          .is_some_and(|site| {
+            site.kind == OccurrenceKind::Command
+              && site.name == Value::Literal(b"f".to_vec())
+          })
+      })
+      .map(|site| site.resolution.status())
+      .collect();
+    assert_eq!(
+      calls,
+      [
+        ResolutionStatus::Resolved(functions[0]),
+        ResolutionStatus::Resolved(functions[1])
+      ]
+    );
+  }
+
+  #[test]
+  fn damaged_subshells_keep_prior_reads_and_their_isolation() {
+    for (source, count) in [
+      ("x=1; (: \"$x\"; a | ); : \"$x\"", 2),
+      ("x=1; (: \"$x\"; a | ) >out; : \"$x\"", 2),
+      ("x=1; (: \"$x\" ${x^^}); : \"$x\"", 1),
+      ("x=1; : \"$x\" \"$(: ${x^^})\"; : \"$x\"", 2),
+    ] {
+      let (workspace, analysis) = support::analyze_damaged(source);
+      let definition = workspace.symbols_named(b"x").next().unwrap().id;
+      assert_eq!(
+        reads(&workspace, &analysis, b"x")
+          .iter()
+          .map(|site| site.resolution.status())
+          .collect::<Vec<_>>(),
+        vec![ResolutionStatus::Resolved(definition); count],
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
   fn unspecified_evaluation_order_never_claims_a_single_reaching_write() {
     for source in [
       "x=0; x=1 y=$x external",
@@ -1222,6 +1421,58 @@ mod bindings {
       [ResolutionIssue::InitialState].into()
     );
     assert_eq!(uses[1].resolution.status(), ResolutionStatus::Resolved(x));
+  }
+
+  #[test]
+  fn arithmetic_variable_contents_do_not_create_names_or_execution_contexts() {
+    for body in [
+      "x='y=5'; n=$((x))",
+      "x='y'; n=$((x))",
+      "x='z'; z='y=5'; n=$((x))",
+      "x='y=5'; n=$((x += 1))",
+      "x='y=5'; n=$((0 ? x : 2))",
+    ] {
+      let source = format!("y=1; {body}; : \"$y\"");
+      let (workspace, analysis) = analyze(&source);
+      let definitions: Vec<_> = workspace
+        .symbols_named(b"y")
+        .map(|symbol| symbol.id)
+        .collect();
+      assert_eq!(definitions.len(), 1, "{source}");
+      let uses = reads(&workspace, &analysis, b"y");
+      assert_eq!(uses.len(), 1, "{source}");
+      assert_eq!(
+        uses[0].resolution.status(),
+        ResolutionStatus::Resolved(definitions[0]),
+        "{source}"
+      );
+      assert_eq!(analysis.references(definitions[0]).count(), 1, "{source}");
+      assert_eq!(analysis.contexts().len(), 1, "{source}");
+      assert!(analysis.unknown_effects().next().is_none(), "{source}");
+      assert_eq!(analysis.gaps(), [], "{source}");
+    }
+    let (workspace, analysis) = analyze("y=1; x='y=5'; n=$(($x)); : \"$y\"");
+    let original = workspace
+      .symbols_named(b"y")
+      .find(|symbol| symbol.id.snapshot.document == DocumentId(1))
+      .unwrap()
+      .id;
+    let uses = reads(&workspace, &analysis, b"y");
+    assert_eq!(uses.len(), 1);
+    assert!(uses[0].resolution.is_complete());
+    assert!(!uses[0].resolution.candidates.contains(&original));
+    assert_eq!(
+      analysis.value(uses[0].site.syntax().unwrap(), uses[0].context),
+      Some(&Value::Literal(b"5".to_vec()))
+    );
+    assert_eq!(
+      analysis
+        .contexts()
+        .iter()
+        .filter(|context| matches!(context.kind, ExecutionKind::Arithmetic(_)))
+        .count(),
+      1
+    );
   }
 
   #[test]

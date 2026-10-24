@@ -1,13 +1,13 @@
 use super::super::execution::{
-  CommandFailure, Environment, Positionals, Transfer,
+  CommandFailure, Environment, Positionals, Transfer, damage_outside,
 };
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::word::{
-  self, Part, Parts, Word, WordContext,
+  self, FieldCount, Part, Parts, Word, WordContext,
 };
 use crate::interface::application::engine::{
-  Access, CharacterEncoding, InputQuery, InputResult, OccurrenceId,
-  OccurrenceKind, OriginPart, ResolutionIssue, Value, ValueIssue,
+  Access, CharacterEncoding, EffectTarget, InputQuery, InputResult,
+  OccurrenceId, OccurrenceKind, OriginPart, ResolutionIssue, Value, ValueIssue,
 };
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -67,11 +67,7 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     let source = self.workspace.source(frame.snapshot.document);
-    let mut initial = Word::default();
-    if node.has_error() || node.is_missing() {
-      initial.fail(ValueIssue::Recovery);
-      self.gap(node, frame, ResolutionIssue::Recovery);
-    }
+    let mut initial = self.source_word(node, frame);
     if word::transformed(node, source)
       && std::iter::successors(node.parent(), tree_sitter::Node::parent)
         .any(|parent| parent.kind() == "backquote_substitution")
@@ -93,14 +89,42 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     let source = self.workspace.source(frame.snapshot.document);
+    let word = self.source_word(node, frame);
     self.expand_parts(
       Parts::new(node, false, source).strip_tabs(strip),
-      Expansion {
-        word: Word::default(),
-        env,
-      },
+      Expansion { word, env },
       frame,
     )
+  }
+
+  /// Damaged syntax leaves the word without a value.
+  fn source_word(&mut self, node: Node<'a>, frame: Frame) -> Word {
+    let mut word = Word::default();
+    if node.has_error() {
+      word.fail(ValueIssue::Recovery);
+      self.gap(node, frame, ResolutionIssue::Recovery);
+    }
+    word
+  }
+
+  /// Damaged expansion syntax may hide substitutions and assignments, which
+  /// read input, fail or assign any variable.
+  pub(in crate::interface::application::engine::analysis) fn damaged_expansion(
+    &mut self,
+    node: Node<'_>,
+    env: &mut Environment,
+    frame: Frame,
+  ) {
+    env.failure.uncertain(ValueIssue::Recovery);
+    env.io.consume_input(None);
+    self.invalidate(
+      node,
+      env,
+      frame,
+      ResolutionIssue::Recovery,
+      ValueIssue::Recovery,
+      [EffectTarget::Variables],
+    );
   }
 
   fn expand_parts(
@@ -113,6 +137,10 @@ impl<'a> Resolver<'a> {
     while let Some(part) = parts.next() {
       match part {
         Part::Fragment(fragment) => expansion.word.append(fragment, limit),
+        Part::Damaged(node) => {
+          expansion.word.fail(ValueIssue::Recovery);
+          self.damaged_expansion(node, &mut expansion.env, frame);
+        }
         Part::Invalid(issue) => expansion.word.fail(issue),
         Part::Expansion(node, quoted) => {
           let Expansion { mut word, env } = expansion;
@@ -143,7 +171,15 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     if node.kind() == "parameter_expansion" {
-      return self.expand_parameter(node, quoted, env, frame);
+      let task = self.expand_parameter(node, quoted, env, frame);
+      if damage_outside(node, &["word", "pattern"]).is_empty() {
+        return task;
+      }
+      // The operator is unknown after the parameter and word expand.
+      return task.then_word(move |resolver, mut result| {
+        resolver.damaged_expansion(node, &mut result.env, frame);
+        Task::expanded(result)
+      });
     }
     if node.kind() == "arithmetic_expansion" {
       return Task::arithmetic(node, env, frame).then_word(
@@ -215,68 +251,82 @@ impl<'a> Resolver<'a> {
     }
     let mut expanded = Vec::new();
     for field in fields {
-      if !field
-        .bytes
-        .iter()
-        .zip(&field.quoted)
-        .any(|(byte, quoted)| !quoted && b"*?[".contains(byte))
-      {
-        expanded.push(field);
-        continue;
+      match self.pathname_fields(word, &field, env, utf8) {
+        Ok(fields) => expanded.extend(fields),
+        Err(issue) => expanded.push(word::Field::unknown(
+          Value::Unknown(
+            field
+              .value()
+              .issue()
+              .map_or(issue, |value| value.combine(issue)),
+          ),
+          FieldCount::Unknown {
+            minimum: field.count.minimum(),
+            issue,
+          },
+        )),
       }
-      if let Some(issue) = field.constraint.as_ref().and_then(Value::issue) {
-        return Err(issue);
-      }
-      if word.backslash_before_quote() {
-        return Err(ValueIssue::Unspecified);
-      }
-      let pattern = word::Pattern::compile(
-        &field.bytes,
-        &field.quoted,
-        utf8,
-        env.portable_collation(),
-      )?;
-      if pattern.is_literal() {
-        expanded.push(field);
-        continue;
-      }
-      if env.noglob != Some(false) {
-        return Err(ValueIssue::PathnameExpansion);
-      }
-      let cwd = if field.bytes.starts_with(b"/") {
-        Vec::new()
-      } else {
-        let Value::Literal(cwd) = &env.cwd else {
-          return Err(env.cwd.issue().expect("unknown cwd"));
-        };
-        cwd.clone()
+    }
+    Ok(expanded)
+  }
+
+  fn pathname_fields(
+    &mut self,
+    word: &Word,
+    field: &word::Field,
+    env: &Environment,
+    utf8: bool,
+  ) -> Result<Vec<word::Field>, ValueIssue> {
+    if field.count.boundary().is_err() {
+      return Ok(vec![field.clone()]);
+    }
+    if !field
+      .bytes
+      .iter()
+      .zip(&field.quoted)
+      .any(|(byte, quoted)| !quoted && b"*?[".contains(byte))
+    {
+      return Ok(vec![field.clone()]);
+    }
+    let pattern =
+      word::Pattern::field(word, field, utf8, env.portable_collation())?;
+    if pattern.is_literal() {
+      return Ok(vec![field.clone()]);
+    }
+    if env.noglob != Some(false) {
+      return Err(ValueIssue::PathnameExpansion);
+    }
+    let cwd = if field.bytes.starts_with(b"/") {
+      Vec::new()
+    } else {
+      let Value::Literal(cwd) = &env.cwd else {
+        return Err(env.cwd.issue().expect("unknown cwd"));
       };
-      let query = InputQuery::Glob {
-        cwd,
-        pattern: field.bytes.clone(),
-        quoted: field.quoted.clone(),
-        utf8,
-        portable_collation: env.portable_collation(),
-      };
-      match self.input(&query) {
-        InputResult::Paths(paths) if paths.is_empty() => {
-          expanded.push(field);
-        }
-        InputResult::Paths(paths) => {
-          expanded.extend(paths.into_iter().map(|bytes| word::Field {
+      cwd.clone()
+    };
+    let query = InputQuery::Glob {
+      cwd,
+      pattern: field.bytes.clone(),
+      quoted: field.quoted.clone(),
+      utf8,
+      portable_collation: env.portable_collation(),
+    };
+    match self.input(&query) {
+      InputResult::Paths(paths) if paths.is_empty() => Ok(vec![field.clone()]),
+      InputResult::Paths(paths) => Ok(
+        paths
+          .into_iter()
+          .map(|bytes| word::Field {
             quoted: vec![true; bytes.len()],
             bytes,
             origins: Vec::new(),
             ..word::Field::default()
-          }));
-        }
-        InputResult::Unknown(issue) => {
-          return Err(issue);
-        }
-        _ => return Err(ValueIssue::PathnameExpansion),
-      }
+          })
+          .collect(),
+      ),
+      InputResult::Unknown(issue) => Err(issue),
+      _ => Err(ValueIssue::PathnameExpansion),
     }
-    Ok(expanded)
   }
 }
 
@@ -285,8 +335,50 @@ pub(in crate::interface::application::engine::analysis) struct Argument<'a> {
   pub node: Node<'a>,
   pub value: Value,
   pub origins: Vec<OriginPart>,
-  pub boundary: Result<(), ValueIssue>,
+  pub count: FieldCount,
   pub kind: Option<super::super::ArgumentKind>,
+}
+
+impl Argument<'_> {
+  pub fn take_first(args: &mut Vec<Self>) -> Value {
+    if args[0].count.boundary().is_ok() {
+      return args.remove(0).value;
+    }
+    let node = args[0].node;
+    let mut values = positional_arguments(args);
+    let name = values.parameter(0).0;
+    if values.shift(1) {
+      args.drain(..args.len() - values.fields.len());
+      for (arg, (value, count)) in args.iter_mut().zip(values.fields) {
+        arg.value = value;
+        arg.count = count;
+      }
+      if let Some(first) = args.first_mut() {
+        first.node = node;
+        first.origins.clear();
+      }
+    } else {
+      let issue = values.count().issue().expect("uncertain first argument");
+      let value = values
+        .fields
+        .into_iter()
+        .map(|(value, _)| value)
+        .reduce(|mut left, right| {
+          left.join(&right);
+          left
+        })
+        .unwrap_or(Value::Unknown(issue));
+      args.clear();
+      args.push(Self {
+        node,
+        value,
+        count: FieldCount::Unknown { minimum: 0, issue },
+        origins: Vec::new(),
+        kind: None,
+      });
+    }
+    name
+  }
 }
 
 type Ready<'a> = Box<
@@ -331,7 +423,7 @@ impl<'a> Resolver<'a> {
           node,
           value: field.value(),
           origins: field.origins,
-          boundary: Ok(()),
+          count: field.count,
           kind: None,
         })),
         Err(issue) => {
@@ -340,12 +432,15 @@ impl<'a> Resolver<'a> {
             node,
             value: Value::Unknown(issue),
             origins: Vec::new(),
-            boundary: if context == WordContext::Assignment
+            count: if context == WordContext::Assignment
               || word::syntax_field(node, source).1
             {
-              Ok(())
+              FieldCount::One
             } else {
-              Err(result.word.boundary_issue().unwrap_or(issue))
+              FieldCount::Unknown {
+                minimum: usize::from(word::has_guaranteed_field(node, source)),
+                issue: result.word.boundary_issue().unwrap_or(issue),
+              }
             },
             kind: None,
           });
@@ -389,7 +484,7 @@ impl<'a> Resolver<'a> {
     let condition = if matches!(name.as_slice(), b"@" | b"*") {
       Err(ValueIssue::Unspecified)
     } else {
-      self.parameter_condition(id, &value, &env, op.starts_with(b":"))
+      Self::parameter_condition(&name, &value, &env, op.starts_with(b":"))
     };
     let operation = op.last().copied();
     if matches!(
@@ -498,7 +593,7 @@ impl<'a> Resolver<'a> {
     };
     if name == b"@"
       && quoted
-      && env.positional.values().is_ok_and(Vec::is_empty)
+      && env.positional.fields.is_empty()
       && let Some(parent) =
         node.parent().filter(|p| p.kind() == "double_quoted")
     {
@@ -589,36 +684,38 @@ impl<'a> Resolver<'a> {
           joined.join_choice(&skipped, Some(cause));
         }
         result.word = Word::value(joined, quoted);
-        if !quoted {
-          result.word.field_issue = Some(cause);
-          result.word.unknown_fields = true;
-        }
       }
       Task::expanded(result)
     })
   }
 
   fn parameter_condition(
-    &self,
-    id: Option<OccurrenceId>,
+    name: &[u8],
     value: &Value,
     env: &Environment,
     colon: bool,
   ) -> Result<bool, ValueIssue> {
-    let absent =
-      id.and_then(|id| self.workspace.occurrence(id))
-        .and_then(|site| match &site.name {
-          Value::Literal(name) => env.parameter(name).1,
-          Value::Unknown(_) | Value::Partial(_) => None,
-        });
+    let absent = env.parameter(name).1;
+    let absence_issue = if name != b"0"
+      && !name.is_empty()
+      && name.iter().all(u8::is_ascii_digit)
+    {
+      env
+        .positional
+        .count()
+        .issue()
+        .unwrap_or(ValueIssue::Dynamic)
+    } else {
+      ValueIssue::Dynamic
+    };
     if !colon {
-      return absent.ok_or(ValueIssue::Dynamic);
+      return absent.ok_or(absence_issue);
     }
     match (absent, value.empty()) {
       (Some(true), _) | (_, Some(true)) => Ok(true),
       (Some(false), Some(false)) => Ok(false),
       (_, None) => Err(value.issue().expect("undetermined emptiness")),
-      (None, Some(false)) => Err(ValueIssue::Dynamic),
+      (None, Some(false)) => Err(absence_issue),
     }
   }
 }
@@ -631,38 +728,30 @@ impl Environment {
     limit: usize,
     utf8: bool,
   ) -> Word {
-    let args = match &self.positional {
-      Positionals::Known(args) => args,
-      Positionals::Unknown { count, value } => {
-        let mut word = Word::value(Value::Unknown(*value), quoted);
-        word.field_issue = Some(*count);
-        word.unknown_fields = true;
-        return word;
-      }
-    };
-    let separator = if name == b"*" && args.len() <= 1 {
-      Some(Vec::new())
+    let args = &self.positional.fields;
+    let separator = if name == b"*"
+      && args.len() <= 1
+      && args.iter().all(|(_, count)| count.boundary().is_ok())
+    {
+      Some(Value::Literal(Vec::new()))
     } else if name == b"*" {
       let ifs = self.ifs();
-      let Value::Literal(ifs) = ifs else {
-        let issue = args
-          .iter()
-          .filter_map(Value::issue)
-          .fold(ifs.issue().expect("unknown IFS"), ValueIssue::combine);
-        return Word::unknown(issue);
-      };
-      let Ok(chars) = word::characters(&ifs, utf8) else {
-        return Word::unknown(ValueIssue::Locale);
-      };
-      Some(
-        chars
-          .first()
-          .map_or(Vec::new(), |c| c.to_string().into_bytes()),
-      )
+      Some(match ifs {
+        Value::Literal(bytes) => {
+          word::characters(&bytes, utf8).map_or_else(Value::Unknown, |chars| {
+            Value::Literal(
+              chars
+                .first()
+                .map_or(Vec::new(), |c| c.to_string().into_bytes()),
+            )
+          })
+        }
+        value => Value::Unknown(value.issue().expect("unknown IFS")),
+      })
     } else {
       None
     };
-    let word = Word::parameters(args, quoted, separator.as_deref(), limit);
+    let word = Word::parameters(args, quoted, separator.as_ref(), limit);
     if name == b"*" && quoted {
       Word::value(word.scalar(), true)
     } else {
@@ -674,18 +763,10 @@ impl Environment {
 pub(in crate::interface::application::engine::analysis) fn positional_arguments(
   args: &[Argument<'_>],
 ) -> Positionals {
-  let count = args
-    .iter()
-    .filter_map(|arg| arg.boundary.err())
-    .reduce(ValueIssue::combine);
-  count.map_or_else(
-    || Positionals::Known(args.iter().map(|arg| arg.value.clone()).collect()),
-    |count| Positionals::Unknown {
-      count,
-      value: args
-        .iter()
-        .filter_map(|arg| arg.value.issue())
-        .fold(count, ValueIssue::combine),
-    },
-  )
+  Positionals {
+    fields: args
+      .iter()
+      .map(|arg| (arg.value.clone(), arg.count))
+      .collect(),
+  }
 }

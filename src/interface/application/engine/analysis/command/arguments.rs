@@ -12,7 +12,13 @@ use tree_sitter::Node;
 pub(super) fn argument_issue(args: &[Argument<'_>]) -> Option<ValueIssue> {
   args
     .iter()
-    .filter_map(|arg| arg.value.issue())
+    .flat_map(|arg| {
+      arg
+        .value
+        .issue()
+        .into_iter()
+        .chain(arg.count.boundary().err())
+    })
     .reduce(ValueIssue::combine)
 }
 
@@ -26,7 +32,7 @@ pub(super) fn numeric_argument(name: &[u8]) -> bool {
 pub(super) fn trap_action(args: &[Argument<'_>]) -> Result<Option<usize>, ()> {
   let mut index = 0;
   if let Some(first) = args.first() {
-    if first.boundary.is_err() {
+    if first.count.boundary().is_err() {
       return Err(());
     }
     match &first.value {
@@ -42,7 +48,7 @@ pub(super) fn trap_action(args: &[Argument<'_>]) -> Result<Option<usize>, ()> {
   let Some(action) = args.get(index) else {
     return Ok(None);
   };
-  if action.boundary.is_err() {
+  if action.count.boundary().is_err() {
     return Err(());
   }
   if matches!(&action.value, Value::Literal(body)
@@ -96,7 +102,7 @@ pub(in crate::interface::application::engine::analysis) fn operand_index(
   args: &[Argument<'_>],
 ) -> usize {
   usize::from(args.first().is_some_and(|arg| {
-    arg.boundary.is_ok() && arg.value == Value::Literal(b"--".to_vec())
+    arg.count.boundary().is_ok() && arg.value == Value::Literal(b"--".to_vec())
   }))
 }
 
@@ -126,10 +132,13 @@ pub(super) fn syntax_argument<'a>(
   };
   Argument {
     node,
-    boundary: if boundary_known {
-      Ok(())
+    count: if boundary_known {
+      word::FieldCount::One
     } else {
-      Err(value.issue().unwrap_or(ValueIssue::Dynamic))
+      word::FieldCount::Unknown {
+        minimum: usize::from(word::has_guaranteed_field(node, source)),
+        issue: value.issue().unwrap_or(ValueIssue::Dynamic),
+      }
     },
     origins: field.map_or_else(Vec::new, |field| field.origins),
     value,
@@ -157,7 +166,7 @@ pub(super) fn classify_arguments(
     b"exec" => {
       let first = operand_index(args);
       if let Some(arg) = args.get_mut(first)
-        && arg.boundary.is_ok()
+        && arg.count.boundary().is_ok()
         && matches!(&arg.value, Value::Literal(name) if !name.is_empty() && (first > 0 || !name.starts_with(b"-")))
       {
         arg.kind = Some(ArgumentKind::Command {
@@ -174,7 +183,7 @@ pub(super) fn classify_arguments(
       if let Some((index, functions, _)) = unset_options(args) {
         for arg in &mut args[index..] {
           if let Value::Literal(name) = &arg.value
-            && arg.boundary.is_ok()
+            && arg.count.boundary().is_ok()
             && valid_name(name)
           {
             arg.kind = Some(if functions {
@@ -192,7 +201,7 @@ pub(super) fn classify_arguments(
       };
       for arg in &mut args[options.operands..] {
         if let Value::Literal(name) = &arg.value
-          && arg.boundary.is_ok()
+          && arg.count.boundary().is_ok()
           && valid_name(name)
         {
           arg.kind = Some(variable_role(name, Access::Write, false, env));
@@ -204,7 +213,8 @@ pub(super) fn classify_arguments(
         return;
       };
       let args = &mut args[start..];
-      let known_prefix = args.iter().take(2).all(|arg| arg.boundary.is_ok());
+      let known_prefix =
+        args.iter().take(2).all(|arg| arg.count.boundary().is_ok());
       if let Some(arg) = args.get_mut(1)
         && known_prefix
         && let Value::Literal(name) = &arg.value
@@ -219,7 +229,7 @@ pub(super) fn classify_arguments(
 
 pub(super) fn getopts_operands(args: &[Argument<'_>]) -> Option<usize> {
   match args.first() {
-    Some(first) if first.boundary.is_err() => None,
+    Some(first) if first.count.boundary().is_err() => None,
     Some(first) if first.value == Value::Literal(b"--".to_vec()) => Some(1),
     Some(first) if first.value.can_equal(b"--") => None,
     _ => Some(0),
@@ -236,7 +246,7 @@ fn declaration_roles(
     let declaration =
       if let Some(variable) = arg.node.child_by_field_name("name") {
         Some((word::lexical(variable, source), true))
-      } else if arg.boundary.is_ok() {
+      } else if arg.count.boundary().is_ok() {
         declaration_operand(&arg.value)
           .map(|(name, value)| (name, value.is_some()))
       } else {
@@ -313,7 +323,7 @@ pub(super) fn unset_options(
       }
       Value::Literal(value) if !value.starts_with(b"-") => break,
       Value::Unknown(_) | Value::Partial(_)
-        if arg.boundary.is_ok() && !arg.value.may_start_with(b"-") =>
+        if arg.count.boundary().is_ok() && !arg.value.may_start_with(b"-") =>
       {
         break;
       }
@@ -331,7 +341,7 @@ pub(super) fn declaration_operands(args: &[Argument<'_>]) -> Option<usize> {
     if arg.node.child_by_field_name("name").is_some() {
       break;
     }
-    if arg.boundary.is_err() {
+    if arg.count.boundary().is_err() {
       return None;
     }
     match &arg.value {
@@ -369,7 +379,7 @@ pub(super) fn read_options(args: &[Argument<'_>]) -> Option<ReadOptions> {
     delimiter: false,
   };
   while let Some(arg) = args.get(options.operands) {
-    if arg.boundary.is_err() {
+    if arg.count.boundary().is_err() {
       return None;
     }
     let Value::Literal(value) = &arg.value else {
@@ -389,7 +399,7 @@ pub(super) fn read_options(args: &[Argument<'_>]) -> Option<ReadOptions> {
         b'd' => {
           options.delimiter = true;
           if index + 1 == value.len() {
-            if args.get(options.operands)?.boundary.is_err() {
+            if args.get(options.operands)?.count.boundary().is_err() {
               return None;
             }
             options.operands += 1;
@@ -410,7 +420,7 @@ fn decimal_operand<'a>(args: &'a [Argument<'_>]) -> Option<&'a [u8]> {
   let Value::Literal(bytes) = &arg.value else {
     return None;
   };
-  if arg.boundary.is_err()
+  if arg.count.boundary().is_err()
     || bytes.is_empty()
     || !bytes.iter().all(u8::is_ascii_digit)
   {
@@ -494,7 +504,7 @@ impl Argument<'_> {
     source: &[u8],
     context: Option<ExecutionContextId>,
   ) -> ArgumentRole {
-    let spelled = self.boundary.is_ok()
+    let spelled = self.count.boundary().is_ok()
       && matches!(word::literal_value(self.node, source), Value::Literal(_));
     let location = Location {
       snapshot,

@@ -61,19 +61,10 @@ impl AnalysisResults<'_> {
     for (entry, workspace) in self.entries.iter().enumerate() {
       check_cancelled(cancelled)?;
       let mut relations = workspace.name_relations(cancelled)?;
-      let mut definitions = BTreeMap::new();
       for (index, site) in relations.occurrences.iter_mut().enumerate() {
         check_cancelled(cancelled)?;
         if workspace
-          .derived_origin(match site.site {
-            crate::interface::application::engine::UseSite::Syntax(id) => {
-              id.snapshot.document
-            }
-            crate::interface::application::engine::UseSite::Argument {
-              snapshot,
-              ..
-            } => snapshot.document,
-          })
+          .derived_origin(site.site.snapshot().document)
           .is_some()
           && blocked.get(&site.location.snapshot).is_some_and(|ranges| {
             ranges.iter().any(|range| {
@@ -91,25 +82,28 @@ impl AnalysisResults<'_> {
           .entry((location.snapshot, location.bytes.start, location.bytes.end))
           .or_default()
           .push((entry, index));
-        for symbol in site.definitions.iter().chain(
-          site
-            .resolution
-            .iter()
-            .flat_map(|resolution| &resolution.candidates),
-        ) {
-          definitions.entry(*symbol).or_insert_with(|| {
-            workspace
-              .symbol(*symbol)
-              .and_then(|symbol| workspace.definition_location(symbol))
-          });
-        }
       }
-      for symbol in relations.names.iter().flat_map(|name| &name.definitions) {
-        definitions.entry(*symbol).or_insert_with(|| {
-          workspace
-            .symbol(*symbol)
-            .and_then(|symbol| workspace.definition_location(symbol))
-        });
+      let symbols: BTreeSet<_> = relations
+        .occurrences
+        .iter()
+        .flat_map(|site| {
+          site.definitions.iter().chain(
+            site
+              .resolution
+              .iter()
+              .flat_map(|resolution| &resolution.candidates),
+          )
+        })
+        .chain(relations.names.iter().flat_map(|name| &name.definitions))
+        .copied()
+        .collect();
+      let mut definitions = BTreeMap::new();
+      for symbol in symbols {
+        check_cancelled(cancelled)?;
+        let location = workspace
+          .symbol(symbol)
+          .and_then(|symbol| workspace.definition_location(symbol));
+        definitions.insert(symbol, location);
       }
       result.entries.push(EntryNames {
         relations,

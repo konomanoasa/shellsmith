@@ -391,6 +391,39 @@ async fn definition_positions_are_not_reused_after_an_unnotified_document_change
 }
 
 #[tokio::test]
+async fn reused_results_keep_the_newer_shared_analysis_and_its_read_failures() {
+  let fixture = Fixture::new();
+  let main = fixture.write("main.sh", "x=1; : $x\n");
+  let other = fixture.write("other.sh", "y=1; : $y\n");
+  let broken = fixture.root.join("broken.sh");
+  std::fs::write(&broken, b"z=\xff\n").unwrap();
+  let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+  session.add_input(&fixture.root).unwrap();
+  let failures = |path: PathBuf| {
+    session.request(
+      RequestScope::Results(path.clone()),
+      move |app, cancelled| {
+        app.definitions(app.document_id(&path).unwrap(), 7, cancelled)?;
+        Ok(app.failures().len())
+      },
+    )
+  };
+  assert_eq!(failures(main.clone()).await.unwrap(), 1);
+  fixture.write("broken.sh", "z=1\n");
+  assert_eq!(failures(other).await.unwrap(), 0);
+  assert_eq!(failures(main.clone()).await.unwrap(), 0);
+  let tokens = session
+    .request(
+      RequestScope::Analysis(main.clone()),
+      move |app, cancelled| {
+        app.classify(app.document_id(&main).unwrap(), cancelled)
+      },
+    )
+    .await;
+  assert!(tokens.is_ok(), "{tokens:?}");
+}
+
+#[tokio::test]
 async fn disk_changes_invalidate_shared_name_collection_and_retry_with_current_inputs()
  {
   let fixture = Fixture::new();

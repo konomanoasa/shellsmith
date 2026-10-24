@@ -3,8 +3,9 @@ use super::*;
 #[test]
 fn positional_joins_keep_cardinality_causes_separate_from_element_causes() {
   let mut left = Environment::new(&InitialEnvironment::empty());
-  left.positional =
-    Positionals::Known(vec![Value::Unknown(ValueIssue::SizeLimit)]);
+  left.positional = Positionals {
+    fields: vec![(Value::Unknown(ValueIssue::SizeLimit), FieldCount::One)],
+  };
   let right = Environment::new(&InitialEnvironment::empty());
   left.join(&right);
   assert_eq!(left.parameter(b"#").0, Value::Unknown(ValueIssue::Dynamic));

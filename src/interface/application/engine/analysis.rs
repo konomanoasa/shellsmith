@@ -12,7 +12,9 @@ pub(super) use command::invariant_command;
 pub(super) use command::{
   UnattemptedCommand, invariant_arguments, unattempted_command,
 };
-pub use command::{optional_reserved_word, reserved_word, special_builtin};
+pub use command::{
+  optional_reserved_word, reserved_word, special_builtin, unspecified_command,
+};
 use execution::Task;
 pub use request::*;
 pub(super) use resolver::analyze;

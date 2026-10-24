@@ -28,6 +28,194 @@ mod lsp {
   }
 
   #[tokio::test]
+  async fn malformed_messages_are_rejected_without_stopping_later_requests() {
+    let fixture = Fixture::new();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    for body in [b"{".as_slice(), b"", b"\xff", b"{} {}"] {
+      server.send_body(body).await;
+      let response = server.receive().await;
+      assert_eq!(response["error"]["code"], -32700, "{response}");
+      assert_eq!(response["id"], Value::Null);
+    }
+    for (message, id) in [
+      (json!(null), Value::Null),
+      (json!([]), Value::Null),
+      (json!({}), Value::Null),
+      (
+        json!({"jsonrpc":"1.0","id":"bad-version","method":"initialize"}),
+        json!("bad-version"),
+      ),
+      (json!({"jsonrpc":"2.0","id":9,"method":false}), json!(9)),
+      (
+        json!({"jsonrpc":"2.0","id":{},"method":"initialize"}),
+        Value::Null,
+      ),
+    ] {
+      server.send(message).await;
+      let response = server.receive().await;
+      assert_eq!(response["error"]["code"], -32600, "{response}");
+      assert_eq!(response["id"], id);
+    }
+    let invalid = server
+      .request("initialize", json!({"capabilities":false}))
+      .await;
+    assert_eq!(invalid["error"]["code"], -32602);
+    assert!(initialize(&mut server, true).await["result"].is_object());
+    server.send_body(br#"{"jsonrpc":"2.0","id":8,"id":9,"method":"first","method":"second"}"#).await;
+    let response = server.receive().await;
+    assert_eq!(response["id"], 9);
+    assert_eq!(response["error"]["code"], -32601);
+    server.send_body(br#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{},"params":{}}"#).await;
+    assert_eq!(server.receive().await["method"], "window/logMessage");
+    let invalid = server
+      .request("textDocument/documentSymbol", json!({}))
+      .await;
+    assert_eq!(invalid["error"]["code"], -32602);
+    let invalid = server.request("shutdown", json!({"invalid":true})).await;
+    assert_eq!(invalid["error"]["code"], -32602);
+    assert_eq!(
+      server
+        .request("workspace/symbol", json!({"query":""}))
+        .await["result"],
+      json!([])
+    );
+    assert!(
+      server
+        .request("shutdown", Value::Null)
+        .await
+        .get("error")
+        .is_none()
+    );
+  }
+
+  #[tokio::test]
+  async fn invalid_notification_params_are_logged_without_responses_or_state_changes()
+   {
+    let fixture = Fixture::new();
+    let uri = Url::from_file_path(fixture.root.join("input.sh"))
+      .unwrap()
+      .to_string();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    server
+      .request("initialize", json!({"capabilities":{}}))
+      .await;
+    for (method, params) in [
+      ("initialized", json!(false)),
+      ("initialized", Value::Null),
+      ("$/cancelRequest", json!({})),
+      ("$/cancelRequest", json!({"id":null})),
+      (
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri,"version":"bad","text":"wrong=1"}}),
+      ),
+      ("textDocument/didChange", json!({})),
+      ("textDocument/didClose", json!({})),
+      ("textDocument/didSave", json!({})),
+      ("workspace/didChangeWorkspaceFolders", json!({"event":null})),
+      ("workspace/didChangeWatchedFiles", json!({"changes":false})),
+      ("exit", json!(false)),
+      ("exit", json!({})),
+    ] {
+      server.notify(method, params).await;
+      let message = server.receive().await;
+      assert_eq!(
+        message["method"], "window/logMessage",
+        "{method}: {message}"
+      );
+      assert_eq!(message["params"]["type"], 1);
+      assert!(message.get("id").is_none());
+    }
+    server.notify("initialized", json!({})).await;
+    server.notify("textDocument/didOpen", json!({"textDocument":{"uri":uri,"languageId":"shellscript","version":1,"text":"original=1"}})).await;
+    server.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":false}]})).await;
+    assert_eq!(server.receive().await["method"], "window/logMessage");
+    let response =
+      request(&mut server, "textDocument/documentSymbol", &uri).await;
+    assert_eq!(response["result"][0]["name"], "original");
+    server.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"changed=1"}]})).await;
+    let response =
+      request(&mut server, "textDocument/documentSymbol", &uri).await;
+    assert_eq!(response["result"][0]["name"], "changed");
+    assert_eq!(server.take_messages(), Vec::<Value>::new());
+  }
+
+  #[tokio::test]
+  async fn framing_recovery_preserves_fragmented_messages_and_utf8_byte_lengths()
+   {
+    let fixture = Fixture::new();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    for header in [
+      b"Content-Length: 2\r\nContent-Type: application/vscode-jsonrpc; charset=utf-16\r\n\r\n".as_slice(),
+      b"Content-Length: 2\r\ninvalid header\r\n\r\n",
+      b"Content-Length: 2\r\nX-Test: \xff\r\n\r\n",
+      b"Content-Length: 2\n\n",
+    ] {
+      server.send_bytes(header).await;
+      server.send_bytes(b"{}").await;
+      assert_eq!(server.receive().await["error"]["code"], -32700);
+    }
+    let body = br#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"capabilities":{}}}"#;
+    let mut frames = b"Content-Length: 1\r\n\r\n{".to_vec();
+    frames.extend_from_slice(
+      format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
+    );
+    frames.extend_from_slice(body);
+    for chunk in frames.chunks(3) {
+      server.send_bytes(chunk).await;
+    }
+    assert_eq!(server.receive().await["error"]["code"], -32700);
+    assert_eq!(server.receive().await["id"], "init");
+    server.notify("initialized", json!({})).await;
+    for charset in ["utf-8", "utf8", "UTF-8"] {
+      let body = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":charset,"method":"workspace/symbol","params":{"query":"日本語"}})).unwrap();
+      server.send_bytes(format!("content-length: {}\r\nContent-Length: {}\r\nContent-Type: application/vscode-jsonrpc; charset={charset}\r\n\r\n", body.len(), body.len()).as_bytes()).await;
+      server.send_bytes(&body).await;
+      let response = server.receive().await;
+      assert_eq!(response["id"], charset);
+      assert_eq!(response["result"], json!([]));
+    }
+  }
+
+  #[tokio::test]
+  async fn malformed_client_responses_do_not_stop_requests_or_consume_pending_responses()
+   {
+    let fixture = Fixture::new();
+    let mut server = Client::new(Settings::new(fixture.root.clone()));
+    server.request("initialize", json!({"capabilities":{"workspace":{"didChangeWatchedFiles":{"dynamicRegistration":true}}}})).await;
+    server.notify("initialized", json!({})).await;
+    let registration = server.receive_unanswered().await;
+    assert_eq!(registration["method"], "client/registerCapability");
+    let id = registration["id"].clone();
+    for message in [
+      json!({"jsonrpc":"2.0","id":id,"result":null,"error":{"code":-1,"message":"invalid"}}),
+      json!({"jsonrpc":"2.0","id":id,"error":{"code":"invalid","message":"invalid"}}),
+      json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}),
+    ] {
+      server.send(message).await;
+      let log = server.receive_unanswered().await;
+      assert_eq!(log["method"], "window/logMessage");
+      assert!(log.get("id").is_none());
+    }
+    server.send(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"registration rejected"}})).await;
+    let log = server.receive_unanswered().await;
+    assert_eq!(log["method"], "window/logMessage");
+    assert!(
+      log["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("registration rejected")
+    );
+    server
+      .send(json!({"jsonrpc":"2.0","id":"unknown-response","result":null}))
+      .await;
+    server.send_body(br#"{"jsonrpc":"2.0","id":"unknown-response","result":null,"result":false}"#).await;
+    let result = server
+      .request("workspace/symbol", json!({"query":""}))
+      .await;
+    assert_eq!(result["result"], json!([]));
+  }
+
+  #[tokio::test]
   async fn completed_workspace_analysis_refreshes_tokens_after_caller_changes()
   {
     let fixture = Fixture::new();
@@ -1713,12 +1901,15 @@ mod transport {
   }
 
   #[test]
-  fn executable_rejects_invalid_json_truncated_frames_and_exit_without_shutdown()
-   {
+  fn executable_rejects_eof_unrecoverable_framing_and_exit_without_shutdown() {
     for bytes in [
       b"Content-Length: 1\r\n\r\n{".as_slice(),
       b"Content-Length: 5\r\n\r\n{}",
       b"Content-Length: invalid\r\n\r\n",
+      b"Content-Length: 2\r\nContent-Length: 3\r\n\r\n{}",
+      b"Content-Type: application/vscode-jsonrpc\r\n\r\n{}",
+      b"Content-Length: 2\r\n",
+      b"Content-Length: 18446744073709551615\r\n\r\n{}",
       b"Content-Length: 33\r\n\r\n{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}",
     ] {
       let mut child = Command::new(env!("CARGO_BIN_EXE_shellsmith"))
@@ -1730,7 +1921,7 @@ mod transport {
         .unwrap();
       child.stdin.take().unwrap().write_all(bytes).unwrap();
       let output = child.wait_with_output().unwrap();
-      assert!(!output.status.success());
+      assert_eq!(output.status.code(), Some(1), "{bytes:?}");
     }
   }
 

@@ -1,5 +1,5 @@
-use super::super::execution::children;
 use super::super::execution::{CommandFailure, Environment, Flow};
+use super::super::execution::{children, damage_outside};
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
   Document, Error, ResolutionIssue, Snapshot, Value, ValueIssue,
@@ -99,7 +99,7 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let Some(body) = self.index.heredoc(frame.snapshot, node) else {
+    let Some(document) = self.index.heredoc(frame.snapshot, node) else {
       return Task::Done(self.opaque(
         node,
         env,
@@ -113,22 +113,33 @@ impl<'a> Resolver<'a> {
     let strip = node
       .child_by_field_name("operator")
       .is_some_and(|op| word::lexical(op, source) == b"<<-");
-    let task = if body.kind() == "quoted_here_document_body" {
-      Task::expanded(super::super::expansion::Expansion {
+    let body = document.child_by_field_name("body");
+    let quoted =
+      body.is_some_and(|body| body.kind() == "quoted_here_document_body");
+    // Damaged syntax outside the body ends the here-document content.
+    let rest = damage_outside(document, &["body"]);
+    let task = match body {
+      Some(body) if !quoted => self.expand_here(body, strip, env, frame),
+      _ => Task::expanded(super::super::expansion::Expansion {
         word: word::Word::value(
-          Value::Literal(source[body.byte_range()].to_vec()),
+          Value::Literal(
+            body
+              .map_or_else(Vec::new, |body| source[body.byte_range()].to_vec()),
+          ),
           true,
         ),
         env,
-      })
-    } else {
-      self.expand_here(body, strip, env, frame)
+      }),
     };
-    task.then_word(move |_, mut result| {
+    task.then_word(move |resolver, mut result| {
+      for node in rest {
+        result.word.fail(ValueIssue::Recovery);
+        resolver.damaged_expansion(node, &mut result.env, frame);
+      }
       if fd == 0 {
         let input = match result.word.scalar() {
           Value::Literal(mut bytes) => {
-            if strip && body.kind() == "quoted_here_document_body" {
+            if strip && quoted {
               word::strip_leading_tabs(&mut bytes, true);
             }
             Ok((std::sync::Arc::new(bytes), 0))
@@ -154,7 +165,7 @@ pub(in crate::interface::application::engine::analysis) fn index_heredocs<
   cancelled: &AtomicBool,
 ) -> Result<(), Error> {
   let mut headers: BTreeMap<usize, Vec<Node<'a>>> = BTreeMap::new();
-  let mut bodies: BTreeMap<usize, Vec<Node<'a>>> = BTreeMap::new();
+  let mut documents: BTreeMap<usize, Vec<Node<'a>>> = BTreeMap::new();
   let mut pending = vec![(document.tree.root_node(), 0)];
   while let Some((node, mut owner)) = pending.pop() {
     check_cancelled(cancelled)?;
@@ -172,9 +183,7 @@ pub(in crate::interface::application::engine::analysis) fn index_heredocs<
         headers.entry(owner).or_default().push(node);
       }
       "here_document" => {
-        if let Some(body) = node.child_by_field_name("body") {
-          bodies.entry(owner).or_default().push(body);
-        }
+        documents.entry(owner).or_default().push(node);
       }
       "here_end" | "tilde_expansion" => continue,
       _ => {}
@@ -187,13 +196,13 @@ pub(in crate::interface::application::engine::analysis) fn index_heredocs<
     );
   }
   for (owner, mut headers) in headers {
-    if let Some(mut bodies) = bodies.remove(&owner)
-      && headers.len() == bodies.len()
+    if let Some(mut documents) = documents.remove(&owner)
+      && headers.len() == documents.len()
     {
       headers.sort_by_key(Node::start_byte);
-      bodies.sort_by_key(Node::start_byte);
-      for (header, body) in headers.into_iter().zip(bodies) {
-        output.insert((document.snapshot(), header.start_byte()), body);
+      documents.sort_by_key(Node::start_byte);
+      for (header, here) in headers.into_iter().zip(documents) {
+        output.insert((document.snapshot(), header.start_byte()), here);
       }
     }
   }

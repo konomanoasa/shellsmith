@@ -1,4 +1,5 @@
-use super::{Application, Error, Failure};
+use super::application::InputSelection;
+use super::{Application, Error};
 use crate::interface::application::engine;
 use engine::check_cancelled;
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,9 +20,7 @@ pub(in crate::interface::application) struct NameCollection {
   pub results: engine::NameResults,
   pub documents: BTreeMap<engine::Snapshot, (PathBuf, Arc<str>)>,
   roots: BTreeSet<PathBuf>,
-  explicit: BTreeSet<PathBuf>,
-  inputs: BTreeSet<PathBuf>,
-  discovery_failures: Vec<Failure>,
+  selection: InputSelection,
 }
 
 impl Application {
@@ -38,13 +37,11 @@ impl Application {
     }
     let analyses = self.prepare_analysis(&path, cancelled)?;
     let roots = analyses.entries.keys().cloned().collect();
-    let mut names = self.collect_names(roots, cancelled)?;
-    names.inputs.clone_from(&analyses.inputs);
-    names
-      .discovery_failures
-      .clone_from(&analyses.discovery_failures);
-    names.explicit.clone_from(&analyses.explicit);
-    let names = Arc::new(names);
+    let names = Arc::new(self.collect_names(
+      roots,
+      analyses.selection.clone(),
+      cancelled,
+    )?);
     self.names = Some(names.clone());
     Ok(names)
   }
@@ -52,10 +49,11 @@ impl Application {
   fn collect_names(
     &mut self,
     roots: BTreeSet<PathBuf>,
+    selection: InputSelection,
     cancelled: &AtomicBool,
   ) -> Result<NameCollection, Error> {
     let workspace = std::mem::take(&mut self.workspace);
-    let collection = self.collect_entries(roots, cancelled);
+    let collection = self.collect_entries(roots, selection, cancelled);
     self.workspace = workspace;
     let collection = collection?;
     self.restore_analysis_documents(cancelled)?;
@@ -66,10 +64,12 @@ impl Application {
   fn collect_entries(
     &mut self,
     roots: BTreeSet<PathBuf>,
+    selection: InputSelection,
     cancelled: &AtomicBool,
   ) -> Result<NameCollection, Error> {
     let mut collection = NameCollection {
       roots,
+      selection,
       ..NameCollection::default()
     };
     let mut workspaces = Vec::new();
@@ -143,14 +143,11 @@ impl Application {
       };
       scratch.stage(path, text.as_bytes(), cancelled)?;
     }
-    let mut result =
-      scratch.collect_names(collection.roots.clone(), cancelled)?;
-    result.explicit.clone_from(&collection.explicit);
-    result.inputs.clone_from(&collection.inputs);
-    result
-      .discovery_failures
-      .clone_from(&collection.discovery_failures);
-    Ok(result)
+    scratch.collect_names(
+      collection.roots.clone(),
+      collection.selection.clone(),
+      cancelled,
+    )
   }
 
   pub(in crate::interface::application) fn check_name_inputs(
@@ -172,10 +169,8 @@ impl Application {
     collection: &NameCollection,
     cancelled: &AtomicBool,
   ) -> Result<bool, Error> {
-    let (selected, failures) =
-      self.collect_inputs(collection.explicit.clone(), cancelled)?;
-    if selected != collection.inputs
-      || failures != collection.discovery_failures
+    if self.select_inputs(collection.selection.explicit.clone(), cancelled)?
+      != collection.selection
     {
       return Ok(false);
     }

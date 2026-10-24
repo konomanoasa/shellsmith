@@ -377,11 +377,6 @@ struct SyntaxName {
   definition: Option<SymbolId>,
 }
 
-#[derive(Clone, Copy)]
-struct SyntaxContext {
-  environment: NameEnvironment,
-}
-
 fn isolated_parent(
   scopes: &BTreeMap<ContextId, NameScope>,
   environment: NameEnvironment,
@@ -418,8 +413,8 @@ impl SyntaxNames {
     &mut self,
     document: &Document,
     cancelled: &AtomicBool,
-  ) -> Result<Vec<SyntaxContext>, Error> {
-    let mut contexts: Vec<SyntaxContext> = Vec::new();
+  ) -> Result<Vec<NameEnvironment>, Error> {
+    let mut contexts: Vec<NameEnvironment> = Vec::new();
     for context in document.contexts() {
       check_cancelled(cancelled)?;
       let node = document
@@ -433,8 +428,7 @@ impl SyntaxNames {
           std::iter::successors(Some(node), tree_sitter::Node::parent)
             .find(|node| node.kind() == context.kind)
         });
-      let parent = context.parent.map(|id| contexts[id.index]);
-      let outer = parent.map(|context| context.environment);
+      let outer = context.parent.map(|id| contexts[id.index]);
       let separate = super::parser::subshell(&context.kind)
         || node.is_some_and(super::parser::asynchronous);
       let environment =
@@ -462,7 +456,7 @@ impl SyntaxNames {
           environment,
         );
       }
-      contexts.push(SyntaxContext { environment });
+      contexts.push(environment);
     }
     Ok(contexts)
   }
@@ -481,7 +475,7 @@ impl SyntaxNames {
     for occurrence in document.occurrences() {
       check_cancelled(cancelled)?;
       let site = UseSite::Syntax(occurrence.id);
-      let environment = contexts[occurrence.context.index].environment;
+      let environment = contexts[occurrence.context.index];
       let own_definition = definitions.get(&occurrence.id).copied();
       if occurrence.kind == OccurrenceKind::Command {
         self.deferred_arguments(document, occurrence, environment);
@@ -1069,16 +1063,11 @@ impl<'a> Relationships<'a> {
     if self.analysis.temporary.is_empty() {
       return None;
     }
-    for ancestor in std::iter::successors(Some(context), |id| {
-      self
-        .analysis
-        .context(*id)
-        .and_then(|context| context.parent)
-    }) {
+    for ancestor in self.analysis.context_ancestors(context) {
       let Some(scope) = self
         .analysis
         .temporary
-        .get(&ancestor)
+        .get(&ancestor.id)
         .and_then(|names| names.get(text))
       else {
         continue;
@@ -1100,13 +1089,10 @@ impl<'a> Relationships<'a> {
                     ..=(*symbol, ExecutionContextId(usize::MAX)),
                 )
                 .any(|(_, written)| {
-                  std::iter::successors(Some(*written), |id| {
-                    self
-                      .analysis
-                      .context(*id)
-                      .and_then(|context| context.parent)
-                  })
-                  .any(|id| id == ancestor)
+                  self
+                    .analysis
+                    .context_ancestors(*written)
+                    .any(|context| context.id == ancestor.id)
                 })
             })
           });

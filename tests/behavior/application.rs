@@ -2366,6 +2366,10 @@ mod sources {
         "read target\nif :; then path=./lib.sh; else path=./auto.sh; fi\n# shellsmith source=./lib.sh\n. \"$path\"\n",
         vec![],
       ),
+      (
+        "path=./auto.sh; : ${path^^}\n# shellsmith source=./lib.sh\n. \"$path\"\n",
+        vec![&library],
+      ),
     ] {
       let main = fixture.write("main.sh", source);
       let mut app = application(&fixture);
@@ -2913,6 +2917,66 @@ mod definitions {
   use shellsmith::interface::application::engine::InitialEnvironment;
   use shellsmith::interface::application::{Application, Settings};
   use std::sync::atomic::AtomicBool;
+
+  #[test]
+  fn damaged_commands_share_unresolved_names_and_refresh_after_repair() {
+    use shellsmith::interface::application::{Error, engine::SemanticKind};
+
+    let fixture = Fixture::new();
+    let source = "path=./lib.sh\nf() { :; }\nf \"$path\" >\"${}\"\n# shellsmith source=./lib.sh\n. \"$path\" >\"${}\"\n";
+    let path = fixture.write("main.sh", source);
+    fixture.write("lib.sh", "loaded=yes");
+    let mut settings = Settings::new(fixture.root.clone());
+    settings.initial = InitialEnvironment::empty();
+    let mut app = Application::new(settings).unwrap();
+    let cancel = AtomicBool::new(false);
+    app.open(&path, source, &cancel).unwrap();
+    let id = app.document_id(&path).unwrap();
+    let call = source.find("f \"").unwrap();
+    let variable = source.find("$path").unwrap() + 1;
+    for offset in [call, variable] {
+      assert_eq!(app.definitions(id, offset, &cancel).unwrap(), []);
+      assert_eq!(app.references(&path, offset, false, &cancel).unwrap(), []);
+      assert!(matches!(
+        app.rename(&path, offset, "renamed", &cancel),
+        Err(Error::RenameRefused(_))
+      ));
+    }
+    assert!(
+      !app.classify(id, &cancel).unwrap().iter().any(|span| span
+        .location
+        .bytes
+        == (call..call + 1)
+        && span.kind == SemanticKind::Function)
+    );
+    assert_eq!(app.document_links(id, &cancel).unwrap(), []);
+    assert_eq!(
+      app
+        .references(&path, source.find("f()").unwrap(), false, &cancel)
+        .unwrap(),
+      []
+    );
+    let repaired = source.replace(">\"${}\"", "");
+    app.change(&path, &repaired, &cancel).unwrap();
+    assert_eq!(app.definitions(id, call, &cancel).unwrap().len(), 1);
+    assert_eq!(
+      app.references(&path, call, false, &cancel).unwrap().len(),
+      1
+    );
+    assert!(
+      app
+        .classify(id, &cancel)
+        .unwrap()
+        .iter()
+        .any(|span| span.location.bytes == (call..call + 1)
+          && span.kind == SemanticKind::Function)
+    );
+    assert_eq!(app.document_links(id, &cancel).unwrap().len(), 1);
+    assert_eq!(
+      app.rename(&path, call, "renamed", &cancel).unwrap().len(),
+      2
+    );
+  }
 
   #[test]
   fn trap_definitions_use_only_bindings_invariant_after_registration() {
@@ -4232,8 +4296,11 @@ mod references {
 
 mod rename {
   use crate::fixtures::Fixture;
-  use shellsmith::interface::application::engine::InitialEnvironment;
+  use shellsmith::interface::application::engine::{
+    InitialBinding, InitialEnvironment,
+  };
   use shellsmith::interface::application::{Application, Error, Settings};
+  use std::collections::BTreeMap;
   use std::sync::atomic::AtomicBool;
 
   fn application(fixture: &Fixture) -> Application {
@@ -5169,6 +5236,162 @@ mod rename {
   }
 
   #[test]
+  fn rename_refuses_initial_variable_bindings_without_source_references() {
+    let fixture = Fixture::new();
+    let path = fixture.write("main.sh", "");
+    let cancel = AtomicBool::new(false);
+    for (label, initial) in [
+      (
+        "environment",
+        InitialEnvironment {
+          environment: BTreeMap::from([(b"RESULT".to_vec(), b"old".to_vec())]),
+          ..InitialEnvironment::empty()
+        },
+      ),
+      (
+        "empty environment value",
+        InitialEnvironment {
+          environment: BTreeMap::from([(b"RESULT".to_vec(), Vec::new())]),
+          ..InitialEnvironment::empty()
+        },
+      ),
+      (
+        "explicit value",
+        InitialEnvironment {
+          values: BTreeMap::from([(b"RESULT".to_vec(), b"old".to_vec())]),
+          ..InitialEnvironment::empty()
+        },
+      ),
+      (
+        "external binding",
+        InitialEnvironment {
+          variables: BTreeMap::from([(
+            b"RESULT".to_vec(),
+            InitialBinding::External,
+          )]),
+          ..InitialEnvironment::empty()
+        },
+      ),
+      (
+        "unknown binding",
+        InitialEnvironment {
+          variables: BTreeMap::from([(
+            b"RESULT".to_vec(),
+            InitialBinding::Unknown,
+          )]),
+          ..InitialEnvironment::empty()
+        },
+      ),
+      (
+        "unknown fallback",
+        InitialEnvironment {
+          other_variables: InitialBinding::Unknown,
+          ..InitialEnvironment::empty()
+        },
+      ),
+      (
+        "external fallback",
+        InitialEnvironment {
+          other_variables: InitialBinding::External,
+          ..InitialEnvironment::empty()
+        },
+      ),
+    ] {
+      let mut settings = Settings::new(fixture.root.clone());
+      settings.initial = initial;
+      let mut app = Application::new(settings).unwrap();
+      for source in [
+        "value=new",
+        "value=new; env",
+        "value=new env",
+        "value=new; : \"$value\"",
+        "run() { value=new; env; }; run",
+      ] {
+        app.open(&path, source, &cancel).unwrap();
+        let offset = source.find("value=").unwrap();
+        assert!(
+          app
+            .prepare_rename(&path, offset, &cancel)
+            .unwrap()
+            .is_some(),
+          "{label}: {source}"
+        );
+        let result = app.rename(&path, offset, "RESULT", &cancel);
+        assert!(
+          matches!(result, Err(Error::RenameRefused(_))),
+          "{label}: {source}: {result:?}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn rename_initial_binding_checks_preserve_unset_overrides_namespaces_and_noops()
+   {
+    let fixture = Fixture::new();
+    let path = fixture.write("main.sh", "");
+    let cancel = AtomicBool::new(false);
+    let mut settings = Settings::new(fixture.root.clone());
+    settings.initial = InitialEnvironment {
+      environment: BTreeMap::from([
+        (b"RESULT".to_vec(), b"old".to_vec()),
+        (b"value".to_vec(), b"old".to_vec()),
+      ]),
+      ..InitialEnvironment::empty()
+    };
+    let mut app = Application::new(settings.clone()).unwrap();
+    for (source, query, new_name, expected) in [
+      ("f() { :; }; f", "f()", "RESULT", "RESULT() { :; }; RESULT"),
+      ("RESULT=new; env", "RESULT=", "RESULT", "RESULT=new; env"),
+      (
+        "value=new; : $value",
+        "value=",
+        "fresh",
+        "fresh=new; : $fresh",
+      ),
+    ] {
+      app.open(&path, source, &cancel).unwrap();
+      let edits = app
+        .rename(&path, source.find(query).unwrap(), new_name, &cancel)
+        .unwrap();
+      if new_name == "RESULT" && query == "RESULT=" {
+        assert_eq!(edits, []);
+      }
+      let mut changed = source.to_string();
+      for edit in edits.iter().rev() {
+        changed.replace_range(edit.location.bytes.clone(), &edit.new_text);
+      }
+      assert_eq!(changed, expected);
+    }
+
+    settings
+      .initial
+      .values
+      .insert(b"RESULT".to_vec(), b"explicit".to_vec());
+    settings
+      .initial
+      .variables
+      .insert(b"RESULT".to_vec(), InitialBinding::Absent);
+    settings.initial.other_variables = InitialBinding::Unknown;
+    app.configure(settings.clone()).unwrap();
+    app.open(&path, "value=new; : $value", &cancel).unwrap();
+    let edits = app.rename(&path, 0, "RESULT", &cancel).unwrap();
+    assert_eq!(
+      edits
+        .iter()
+        .map(|edit| (edit.location.bytes.clone(), edit.new_text.as_str()))
+        .collect::<Vec<_>>(),
+      [(0..5, "RESULT"), (14..19, "RESULT")]
+    );
+    settings.initial.variables.remove(b"RESULT".as_slice());
+    app.configure(settings).unwrap();
+    assert!(matches!(
+      app.rename(&path, 0, "RESULT", &cancel),
+      Err(Error::RenameRefused(_))
+    ));
+  }
+
+  #[test]
   fn rename_collects_shared_sources_across_entries_without_merging_unrelated_names()
    {
     let fixture = Fixture::new();
@@ -5341,7 +5564,7 @@ mod rename {
   }
 
   #[test]
-  fn rename_rejects_optional_reserved_words_as_new_function_names() {
+  fn rename_rejects_nonportable_function_names_with_or_without_calls() {
     let fixture = Fixture::new();
     let path = fixture.write("main.sh", "");
     let cancel = AtomicBool::new(false);
@@ -5353,7 +5576,67 @@ mod rename {
       "f() { :; }; \"f\"",
     ] {
       app.open(&path, source, &cancel).unwrap();
-      for name in ["function", "namespace", "select", "time"] {
+      for name in [
+        "function",
+        "namespace",
+        "select",
+        "time",
+        "alloc",
+        "autoload",
+        "bind",
+        "bindkey",
+        "builtin",
+        "bye",
+        "caller",
+        "cap",
+        "chdir",
+        "clone",
+        "comparguments",
+        "compcall",
+        "compctl",
+        "compdescribe",
+        "compfiles",
+        "compgen",
+        "compgroups",
+        "complete",
+        "compound",
+        "compquote",
+        "comptags",
+        "comptry",
+        "compvalues",
+        "declare",
+        "dirs",
+        "disable",
+        "disown",
+        "dosh",
+        "echotc",
+        "echoti",
+        "enum",
+        "float",
+        "help",
+        "history",
+        "hist",
+        "integer",
+        "let",
+        "local",
+        "login",
+        "logout",
+        "map",
+        "mapfile",
+        "nameref",
+        "popd",
+        "print",
+        "pushd",
+        "readarray",
+        "repeat",
+        "savehistory",
+        "source",
+        "shopt",
+        "stop",
+        "suspend",
+        "typeset",
+        "whence",
+      ] {
         assert!(
           matches!(
             app.rename(&path, 0, name, &cancel),
@@ -5366,7 +5649,7 @@ mod rename {
   }
 
   #[test]
-  fn rename_allows_optional_reserved_variable_names_and_replacing_function_names()
+  fn rename_allows_nonportable_command_names_for_variables_and_replaces_existing_function_names()
    {
     for (name, variable, function) in [
       ("function", "function=1; : $function", "function() { :; }"),
@@ -5377,6 +5660,9 @@ mod rename {
       ),
       ("select", "select=1; : $select", "select() { :; }"),
       ("time", "time=1; : $time", "time() { :; }"),
+      ("local", "local=1; : $local", "local() { :; }"),
+      ("source", "source=1; : $source", "source() { :; }"),
+      ("typeset", "typeset=1; : $typeset", "typeset() { :; }"),
     ] {
       assert_renamed("x=1; : $x", "x=", name, variable);
       assert_renamed(variable, name, "x", "x=1; : $x");

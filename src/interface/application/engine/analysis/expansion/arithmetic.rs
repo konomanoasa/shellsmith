@@ -8,6 +8,7 @@ use super::super::execution::{
 use super::super::{Frame, Resolver, Task};
 use super::Expansion;
 use crate::interface::application::engine::word::{self, Word};
+use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
   Access, DerivedOrigin, EffectTarget, ExecutionKind, OriginPart,
   ResolutionIssue, Snapshot, Value, ValueIssue,
@@ -171,6 +172,10 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     if node.kind() == "arithmetic_expansion" {
+      if node.has_error() {
+        let parts = arithmetic_parts(children(node)).into_iter();
+        return self.damaged_arithmetic(node, parts, env, frame);
+      }
       let source = self.workspace.source(frame.snapshot.document);
       if let Some(expression) = node.child_by_field_name("expression") {
         let bytes = word::lexical(expression, source);
@@ -516,6 +521,33 @@ struct ArithmeticSource<'a> {
 }
 
 impl<'a> Resolver<'a> {
+  /// Damaged arithmetic expands its intact expansions in order, and its
+  /// evaluation has unknown effects.
+  fn damaged_arithmetic(
+    &mut self,
+    node: Node<'a>,
+    mut parts: std::vec::IntoIter<Node<'a>>,
+    mut env: Environment,
+    frame: Frame,
+  ) -> Task<'a> {
+    while let Some(part) = parts.next() {
+      if parser::damaged(part) {
+        self.damaged_expansion(part, &mut env, frame);
+      } else {
+        return Task::expand(part, false, env, frame).then_word(
+          move |resolver, result| {
+            resolver.damaged_arithmetic(node, parts, result.env, frame)
+          },
+        );
+      }
+    }
+    self.damaged_expansion(node, &mut env, frame);
+    Task::expanded(Expansion {
+      word: Word::unknown(ValueIssue::Recovery),
+      env,
+    })
+  }
+
   fn expanded_arithmetic(
     &mut self,
     node: Node<'a>,
@@ -525,21 +557,7 @@ impl<'a> Resolver<'a> {
     let Some(expression) = node.child_by_field_name("expression") else {
       return self.arithmetic_unknown(node, env, frame, ValueIssue::Recovery);
     };
-    let mut pending = vec![expression];
-    let mut expansions = Vec::new();
-    while let Some(child) = pending.pop() {
-      if matches!(
-        child.kind(),
-        "parameter_expansion"
-          | "arithmetic_expansion"
-          | "command_substitution"
-          | "backquote_substitution"
-      ) {
-        expansions.push(child);
-      } else {
-        pending.extend(children(child).into_iter().rev());
-      }
-    }
+    let expansions = arithmetic_parts(vec![expression]);
     if expansions.is_empty() {
       return self.arithmetic_unknown(node, env, frame, ValueIssue::Arithmetic);
     }
@@ -717,6 +735,29 @@ fn arithmetic_text(bytes: &[u8]) -> bool {
     }
   }
   depth == 0 && !bytes.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Expansions and damaged syntax within `nodes` in source order, without their
+/// contents.
+fn arithmetic_parts(nodes: Vec<Node<'_>>) -> Vec<Node<'_>> {
+  let mut pending: Vec<_> = nodes.into_iter().rev().collect();
+  let mut parts = Vec::new();
+  while let Some(node) = pending.pop() {
+    if parser::damaged(node)
+      || matches!(
+        node.kind(),
+        "parameter_expansion"
+          | "arithmetic_expansion"
+          | "command_substitution"
+          | "backquote_substitution"
+      )
+    {
+      parts.push(node);
+    } else {
+      pending.extend(children(node).into_iter().rev());
+    }
+  }
+  parts
 }
 
 fn dynamic_arithmetic(root: Node<'_>) -> bool {

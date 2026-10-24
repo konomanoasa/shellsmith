@@ -23,17 +23,34 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
+    if parser::damaged(node) {
+      return Task::Done(self.opaque(
+        node,
+        env,
+        frame,
+        ResolutionIssue::Recovery,
+        Some(ValueIssue::Recovery),
+      ));
+    }
     if !env.alternatives.is_empty() {
       let target = match node.kind() {
         "simple_command" => parser::command_word(node),
         "assignment_word" => Some(node),
         "word" if node.child_by_field_name("name").is_some() => Some(node),
+        "for_clause" => node.child_by_field_name("words"),
         "io_redirect" if !self.expansion_targets([node], frame).is_empty() => {
           Some(node)
         }
         _ => None,
       };
-      let names = self.value_dependencies(target, frame);
+      let mut names = self.value_dependencies(target, frame);
+      if node.kind() == "for_clause"
+        && !node
+          .children(&mut node.walk())
+          .any(|child| child.kind() == "in")
+      {
+        names.insert(StateKey::Positionals);
+      }
       if let Some(states) = env.alternatives.select(&env, &names) {
         if node.kind() == "assignment_word"
           || node.kind() == "word" && node.child_by_field_name("name").is_some()
@@ -53,15 +70,6 @@ impl<'a> Resolver<'a> {
           move |_, env| Task::eval(node, env, frame),
         );
       }
-    }
-    if parser::damaged(node) {
-      return Task::Done(self.opaque(
-        node,
-        env,
-        frame,
-        ResolutionIssue::Recovery,
-        None,
-      ));
     }
     self.eval_syntax(node, env, frame)
   }
@@ -138,14 +146,18 @@ impl<'a> Resolver<'a> {
         Self::negated_pipeline(node, env, frame)
       }
       "io_here" => self.heredoc(node, env, frame),
-      "io_file" => self.redirect(node, env, frame),
+      "io_file" => {
+        let env = self.recover(
+          &damage_outside(node, &["operator", "filename"]),
+          env,
+          frame,
+        );
+        self.redirect(node, env, frame)
+      }
       "command" | "function_body" => self.compound(node, env, frame),
       "complete_command" | "compound_list" => {
-        if let Some(body) = node.child_by_field_name("body") {
-          self.list(body, env, frame)
-        } else {
-          Task::Done(Flow::next(env))
-        }
+        let [body] = regions(node, ["body"]);
+        Task::sequence(body, env, frame)
       }
       "list" | "term" => self.list(node, env, frame),
       "and_or" => Self::short_circuit(node, env, frame),
@@ -182,6 +194,8 @@ impl<'a> Resolver<'a> {
           );
         }
         env.set_status(Value::Literal(b"0".to_vec()));
+        let env =
+          self.recover(&damage_outside(node, &["name", "body"]), env, frame);
         Task::Done(Flow::next(env))
       }
       kind if parser::subshell(kind) => self.isolated(node, env, frame),
@@ -245,30 +259,31 @@ impl<'a> Resolver<'a> {
   ) -> Task<'a> {
     let body = node.child_by_field_name("body");
     let redirects = node.child_by_field_name("redirects");
+    let damaged = self.index.damaged(frame.snapshot, node);
     let subshell = body
       .filter(|body| body.kind() == "compound_command")
       .and_then(|body| body.named_child(0))
       .filter(|body| body.kind() == "subshell");
-    if let (Some(subshell), Some(redirects)) = (subshell, redirects) {
-      if node.has_error() {
-        return Task::Done(self.opaque(
-          node,
-          env,
-          frame,
-          ResolutionIssue::Recovery,
-          None,
-        ));
-      }
-      let nodes = std::iter::once(redirects)
-        .chain(children(subshell))
-        .collect();
+    if let Some(subshell) = subshell
+      && (redirects.is_some() || damaged)
+    {
+      let nodes = redirects.into_iter().chain(children(subshell)).collect();
       return self.isolated_sequence(
-        subshell,
+        if damaged { node } else { subshell },
         nodes,
         env,
         frame,
         ExecutionKind::Subshell,
       );
+    }
+    if damaged {
+      return Task::Done(self.opaque(
+        node,
+        env,
+        frame,
+        ResolutionIssue::Recovery,
+        Some(ValueIssue::Recovery),
+      ));
     }
     let source = self.workspace.source(frame.snapshot.document);
     let io = super::super::command::Redirections::new(
@@ -310,7 +325,8 @@ impl<'a> Resolver<'a> {
     let input = env.io.save_input();
     let mut input_env = env.clone();
     input_env.failure = CommandFailure::None;
-    Task::sequence(nodes, input_env, inner).then(move |_, mut flow| {
+    let task = self.recovered_sequence(node, nodes, input_env, inner);
+    task.then(move |_, mut flow| {
       for state in flow.environments_mut() {
         state.complete_command();
       }
@@ -362,7 +378,8 @@ impl<'a> Resolver<'a> {
     {
       output.fail(ValueIssue::Dynamic);
     }
-    Task::sequence(children(node), input, inner).then(move |_, flow| {
+    let task = self.recovered_sequence(node, children(node), input, inner);
+    task.then(move |_, flow| {
       let result = flow.merged();
       let value = if let Some(result) = result {
         env.substitution_status = Some(match body {
@@ -393,6 +410,26 @@ impl<'a> Resolver<'a> {
         env,
       })
     })
+  }
+
+  fn recovered_sequence(
+    &mut self,
+    node: Node<'a>,
+    nodes: Vec<Node<'a>>,
+    env: Environment,
+    frame: Frame,
+  ) -> Task<'a> {
+    if self.index.damaged(frame.snapshot, node) {
+      Task::Done(self.opaque(
+        node,
+        env,
+        frame,
+        ResolutionIssue::Recovery,
+        Some(ValueIssue::Recovery),
+      ))
+    } else {
+      Task::sequence(nodes, env, frame)
+    }
   }
 
   /// Any node may observe the others' writes to `targets`.
@@ -575,7 +612,9 @@ struct PipelineState {
   transfers: Flow,
 }
 
-struct LoopState {
+struct LoopState<'a> {
+  /// Condition of `while` and `until` with its damaged syntax.
+  condition: Vec<Node<'a>>,
   header: Environment,
   output: Flow,
   exit: Flow,
@@ -592,46 +631,38 @@ struct CaseState {
 
 impl<'a> Resolver<'a> {
   fn conditional(node: Node<'a>, env: Environment, frame: Frame) -> Task<'a> {
-    if let Some(body) = node.child_by_field_name("body") {
-      return Task::eval(body, env, frame);
+    if node.child_by_field_name("body").is_some() {
+      let [body] = regions(node, ["body"]);
+      return Task::sequence(body, env, frame);
     }
-    Task::sequence(
-      node.child_by_field_name("condition").into_iter().collect(),
-      env,
-      frame,
-    )
-    .then(move |_, mut flow| {
+    let [condition, consequence, alternative] =
+      regions(node, ["condition", "consequence", "alternative"]);
+    Task::sequence(condition, env, frame).then(move |_, mut flow| {
       let Some(state) = flow.take(Transfer::Next) else {
         return Task::Done(flow);
       };
-      Task::sequence(
-        node
-          .child_by_field_name("consequence")
-          .into_iter()
-          .collect(),
-        state.clone(),
-        frame,
+      Task::sequence(consequence, state.clone(), frame).then(
+        move |_, consequence| {
+          flow.join(consequence);
+          if alternative.is_empty() {
+            let mut state = state;
+            state.set_status(Value::Literal(b"0".to_vec()));
+            flow.add(Transfer::Next, state);
+            return Task::Done(flow);
+          }
+          Task::sequence(alternative, state, frame).then(
+            move |_, alternative| {
+              flow.join(alternative);
+              Task::Done(flow)
+            },
+          )
+        },
       )
-      .then(move |_, consequence| {
-        flow.join(consequence);
-        let Some(alternative) = node.child_by_field_name("alternative") else {
-          let mut state = state;
-          state.set_status(Value::Literal(b"0".to_vec()));
-          flow.add(Transfer::Next, state);
-          return Task::Done(flow);
-        };
-        Task::eval(alternative, state, frame).then(move |_, alternative| {
-          flow.join(alternative);
-          Task::Done(flow)
-        })
-      })
     })
   }
 
   fn short_circuit(node: Node<'a>, env: Environment, frame: Frame) -> Task<'a> {
-    let pipelines: Vec<_> = node
-      .children_by_field_name("pipeline", &mut node.walk())
-      .collect();
+    let [pipelines] = regions(node, ["pipeline"]);
     Self::short_circuit_next(
       pipelines.into_iter().enumerate(),
       Flow::next(env),
@@ -665,8 +696,9 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let entries: Vec<_> = node
-      .children_by_field_name("and_or", &mut node.walk())
+    let [entries] = regions(node, ["and_or"]);
+    let entries: Vec<_> = entries
+      .into_iter()
       .map(|child| (child, parser::asynchronous(child)))
       .collect();
     self.list_next(entries.into_iter(), Flow::next(env), frame)
@@ -725,9 +757,7 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let commands: Vec<_> = node
-      .children_by_field_name("command", &mut node.walk())
-      .collect();
+    let [commands] = regions(node, ["command"]);
     if commands.len() <= 1 {
       return Task::sequence(commands, env, frame);
     }
@@ -804,8 +834,8 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let words: Vec<_> = node
-      .child_by_field_name("words")
+    let list = node.child_by_field_name("words");
+    let words: Vec<_> = list
       .into_iter()
       .flat_map(|words| {
         words
@@ -813,117 +843,134 @@ impl<'a> Resolver<'a> {
           .collect::<Vec<_>>()
       })
       .collect();
-    self.arguments(
-      words.into_iter(),
-      Vec::new(),
-      env,
-      frame,
-      Box::new(move |_, arguments, header| {
-        let implicit = node.kind() == "for_clause"
-          && !node
-            .children(&mut node.walk())
-            .any(|child| child.kind() == "in");
-        let values = if implicit {
-          header
-            .positional
-            .values()
-            .cloned()
-            .unwrap_or_else(|issue| vec![Value::Unknown(issue)])
-        } else {
-          arguments.into_iter().map(|arg| arg.value).collect()
-        };
-        let value = values
-          .into_iter()
-          .reduce(|mut value, next| {
-            value.join(&next);
-            value
-          })
-          .unwrap_or(Value::Unknown(ValueIssue::Dynamic));
-        Self::loop_next(
-          node,
-          LoopState {
-            header,
-            output: Flow::default(),
-            exit: Flow::default(),
-            status: Value::Literal(b"0".to_vec()),
-            value,
-          },
-          frame,
-        )
-      }),
-    )
+    let [mut condition, mut tail, mut after] =
+      regions(node, ["condition", "words", "body"]);
+    tail.retain(|child| Some(*child) != list);
+    let tail: Vec<_> = list
+      .map_or_else(Vec::new, |list| damage_outside(list, &["word"]))
+      .into_iter()
+      .chain(tail)
+      .collect();
+    after.retain(|child| Some(*child) != node.child_by_field_name("body"));
+    // A `for` header runs once around its words; conditions run per iteration.
+    let env = if node.kind() == "for_clause" {
+      self.recover(&std::mem::take(&mut condition), env, frame)
+    } else {
+      env
+    };
+    self
+      .arguments(
+        words.into_iter(),
+        Vec::new(),
+        env,
+        frame,
+        Box::new(move |resolver, arguments, header| {
+          let implicit = node.kind() == "for_clause"
+            && !node
+              .children(&mut node.walk())
+              .any(|child| child.kind() == "in");
+          let values: Vec<_> = if implicit {
+            header
+              .positional
+              .fields
+              .iter()
+              .map(|(value, _)| value.clone())
+              .collect()
+          } else {
+            arguments.into_iter().map(|arg| arg.value).collect()
+          };
+          let value = values
+            .into_iter()
+            .reduce(|mut value, next| {
+              value.join(&next);
+              value
+            })
+            .unwrap_or(Value::Unknown(ValueIssue::Dynamic));
+          Self::loop_next(
+            node,
+            LoopState {
+              condition,
+              header: resolver.recover(&tail, header, frame),
+              output: Flow::default(),
+              exit: Flow::default(),
+              status: Value::Literal(b"0".to_vec()),
+              value,
+            },
+            frame,
+          )
+        }),
+      )
+      .then_recover(after, frame)
   }
 
-  fn loop_next(node: Node<'a>, mut state: LoopState, frame: Frame) -> Task<'a> {
+  fn loop_next(
+    node: Node<'a>,
+    mut state: LoopState<'a>,
+    frame: Frame,
+  ) -> Task<'a> {
     let inner = Frame {
       loops: frame.loops + 1,
       ..frame
     };
-    Task::sequence(
-      node.child_by_field_name("condition").into_iter().collect(),
-      state.header.clone(),
-      inner,
-    )
-    .then(move |resolver, mut condition| {
-      let task = if let Some(mut body_input) = condition.take(Transfer::Next) {
-        state.exit.add(Transfer::Next, body_input.clone());
-        if let Some(name) = node.child_by_field_name("name") {
-          resolver.write(
-            name,
-            &mut body_input,
+    Task::sequence(state.condition.clone(), state.header.clone(), inner).then(
+      move |resolver, mut condition| {
+        let task = if let Some(mut body_input) = condition.take(Transfer::Next)
+        {
+          state.exit.add(Transfer::Next, body_input.clone());
+          if let Some(name) = node.child_by_field_name("name") {
+            resolver.write(
+              name,
+              &mut body_input,
+              inner,
+              false,
+              state.value.clone(),
+            );
+          }
+          Task::sequence(
+            node.child_by_field_name("body").into_iter().collect(),
+            body_input,
             inner,
-            false,
-            state.value.clone(),
-          );
-        }
-        Task::sequence(
-          node.child_by_field_name("body").into_iter().collect(),
-          body_input,
-          inner,
-        )
-      } else {
-        Task::Done(Flow::default())
-      };
-      task.then(move |_, body| {
-        for transfer in [Transfer::Next, Transfer::Continue(1)] {
-          if let Some(env) = body.get(transfer) {
-            state.status.join(&env.status());
+          )
+        } else {
+          Task::Done(Flow::default())
+        };
+        task.then(move |_, body| {
+          for transfer in [Transfer::Next, Transfer::Continue(1)] {
+            if let Some(env) = body.get(transfer) {
+              state.status.join(&env.status());
+            }
           }
-        }
-        let mut next = state.header.clone();
-        loop_transfers(body, &mut next, &mut state.output);
-        loop_transfers(condition, &mut next, &mut state.output);
-        if next == state.header {
-          if let Some(mut exit) = state.exit.take(Transfer::Next) {
-            exit.set_status(state.status);
-            state.output.add(Transfer::Next, exit);
+          let mut next = state.header.clone();
+          loop_transfers(body, &mut next, &mut state.output);
+          loop_transfers(condition, &mut next, &mut state.output);
+          if next == state.header {
+            if let Some(mut exit) = state.exit.take(Transfer::Next) {
+              exit.set_status(state.status);
+              state.output.add(Transfer::Next, exit);
+            }
+            return Task::Done(state.output);
           }
-          return Task::Done(state.output);
-        }
-        state.header = next;
-        Self::loop_next(node, state, frame)
-      })
-    })
+          state.header = next;
+          Self::loop_next(node, state, frame)
+        })
+      },
+    )
   }
 
   fn case_clause(node: Node<'a>, env: Environment, frame: Frame) -> Task<'a> {
-    Task::sequence(
-      node.child_by_field_name("word").into_iter().collect(),
-      env,
-      frame,
-    )
-    .then(move |resolver, mut output| {
+    let [word, items] = regions(node, ["word", "items"]);
+    Task::sequence(word, env, frame).then(move |resolver, mut output| {
       let Some(unmatched) = output.take(Transfer::Next) else {
         return Task::Done(output);
       };
-      let mut pending: Vec<_> =
-        node.child_by_field_name("items").into_iter().collect();
+      let mut pending: Vec<_> = items.into_iter().rev().collect();
       let mut items = Vec::new();
       while let Some(item) = pending.pop() {
-        if matches!(item.kind(), "case_item" | "case_item_ns") {
-          items.push(item);
+        if matches!(item.kind(), "case_list" | "case_list_ns") {
+          let [terminated, item] = regions(item, ["terminated", "item"]);
+          pending.extend(terminated.into_iter().chain(item).rev());
         } else {
-          pending.extend(children(item).into_iter().rev());
+          items.push(item);
         }
       }
       resolver.case_next(
@@ -935,6 +982,21 @@ impl<'a> Resolver<'a> {
         },
         frame,
       )
+    })
+  }
+
+  /// Runs damaged syntax as unknown commands.
+  fn recover(
+    &mut self,
+    damaged: &[Node<'_>],
+    env: Environment,
+    frame: Frame,
+  ) -> Environment {
+    damaged.iter().fold(env, |env, node| {
+      self
+        .opaque(*node, env, frame, ResolutionIssue::Recovery, None)
+        .take(Transfer::Next)
+        .expect("opaque state")
     })
   }
 
@@ -952,6 +1014,14 @@ impl<'a> Resolver<'a> {
       state.output.add(Transfer::Next, state.unmatched);
       return Task::Done(state.output);
     };
+    if !matches!(item.kind(), "case_item" | "case_item_ns") {
+      // Damaged syntax between clauses runs on the paths that reach it.
+      state.unmatched = self.recover(&[item], state.unmatched, frame);
+      state.fallthrough = state
+        .fallthrough
+        .map(|env| self.recover(&[item], env, frame));
+      return self.case_next(items, state, frame);
+    }
     let patterns: Vec<_> =
       item.child_by_field_name("patterns").into_iter().collect();
     // Clause patterns expand in an unspecified order until one matches.
@@ -1004,15 +1074,19 @@ impl<'a> Resolver<'a> {
       if body.is_none() && (!fallthrough || items.len() == 0) {
         input.set_status(Value::Literal(b"0".to_vec()));
       }
-      Task::sequence(body.into_iter().collect(), input, frame).then(
-        move |resolver, mut body| {
-          if fallthrough {
-            state.fallthrough = body.take(Transfer::Next);
-          }
-          state.output.join(body);
-          resolver.case_next(items, state, frame)
-        },
-      )
+      let [patterns, body] = regions(item, ["patterns", "body"]);
+      let nodes = patterns
+        .into_iter()
+        .filter(|child| Some(*child) != item.child_by_field_name("patterns"))
+        .chain(body)
+        .collect();
+      Task::sequence(nodes, input, frame).then(move |resolver, mut body| {
+        if fallthrough {
+          state.fallthrough = body.take(Transfer::Next);
+        }
+        state.output.join(body);
+        resolver.case_next(items, state, frame)
+      })
     })
   }
 }
@@ -1089,6 +1163,55 @@ pub(in crate::interface::application::engine::analysis) fn children(
   node.named_children(&mut node.walk()).collect()
 }
 
+/// Groups the children in `fields` with the following children that contain
+/// damaged syntax; damaged children before every field join the first group.
+fn regions<'a, const N: usize>(
+  node: Node<'a>,
+  fields: [&str; N],
+) -> [Vec<Node<'a>>; N] {
+  let mut regions = std::array::from_fn(|_| Vec::new());
+  let mut current = 0;
+  let mut cursor = node.walk();
+  let mut more = cursor.goto_first_child();
+  while more {
+    let child = cursor.node();
+    if let Some(index) = cursor
+      .field_name()
+      .and_then(|name| fields.iter().position(|field| *field == name))
+    {
+      current = index;
+      regions[index].push(child);
+    } else if child.has_error() {
+      regions[current].push(child);
+    }
+    more = cursor.goto_next_sibling();
+  }
+  regions
+}
+
+/// Children outside `fields` that contain damaged syntax.
+pub(in crate::interface::application::engine::analysis) fn damage_outside<
+  'a,
+>(
+  node: Node<'a>,
+  fields: &[&str],
+) -> Vec<Node<'a>> {
+  let mut cursor = node.walk();
+  let mut nodes = Vec::new();
+  let mut more = cursor.goto_first_child();
+  while more {
+    if cursor
+      .field_name()
+      .is_none_or(|name| !fields.contains(&name))
+      && cursor.node().has_error()
+    {
+      nodes.push(cursor.node());
+    }
+    more = cursor.goto_next_sibling();
+  }
+  nodes
+}
+
 type FlowContinuation<'a> =
   Box<dyn FnOnce(&mut Resolver<'a>, Flow) -> Task<'a> + 'a>;
 
@@ -1151,11 +1274,27 @@ impl<'a> Task<'a> {
     Self::Then(Box::new(self), Continuation::Word(Box::new(resume)))
   }
 
+  /// Runs damaged syntax as unknown commands after normal completion.
+  fn then_recover(self, damaged: Vec<Node<'a>>, frame: Frame) -> Self {
+    if damaged.is_empty() {
+      return self;
+    }
+    self.then(move |resolver, mut flow| {
+      if let Some(env) = flow.take(Transfer::Next) {
+        flow.add(Transfer::Next, resolver.recover(&damaged, env, frame));
+      }
+      Self::Done(flow)
+    })
+  }
+
   pub fn sequence(
     nodes: Vec<Node<'a>>,
     env: Environment,
     frame: Frame,
   ) -> Self {
+    if let [node] = nodes[..] {
+      return Self::eval(node, env, frame);
+    }
     Self::sequence_next(nodes.into_iter(), Flow::next(env), frame)
   }
 

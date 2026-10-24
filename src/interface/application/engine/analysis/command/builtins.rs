@@ -1,5 +1,5 @@
 use super::super::execution::{
-  Binding, Environment, Flow, Positionals, Transfer, alternative,
+  Binding, Environment, Flow, Positionals, StateKey, Transfer, alternative,
 };
 use super::super::expansion::Argument;
 use super::super::{Frame, Resolver, Task};
@@ -50,13 +50,39 @@ impl<'a> Resolver<'a> {
     &mut self,
     node: Node<'a>,
     name: &[u8],
+    args: Vec<Argument<'a>>,
+    env: Environment,
+    frame: Frame,
+  ) -> Task<'a> {
+    if ((name == b"shift" && decimal_value::<usize>(&args) != Some(0))
+      || (name == b"getopts" && args.len() == 2))
+      && let Some(states) = env
+        .alternatives
+        .select(&env, &BTreeSet::from([StateKey::Positionals]))
+    {
+      let name = name.to_vec();
+      return self.each_alternative(
+        states,
+        Flow::default(),
+        move |resolver, env| {
+          resolver.utility(node, &name, args.clone(), env, frame)
+        },
+      );
+    }
+    if name == b"command" {
+      return self.forward(node, args.into_iter(), env, frame);
+    }
+    self.builtin(node, name, args, env, frame)
+  }
+
+  fn builtin(
+    &mut self,
+    node: Node<'a>,
+    name: &[u8],
     mut args: Vec<Argument<'a>>,
     mut env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    if name == b"command" {
-      return self.forward(node, args.into_iter(), env, frame);
-    }
     let source = self.workspace.source(frame.snapshot.document);
     classify_arguments(name, &mut args, Some(&env), source);
     if name == b"exec" {
@@ -160,6 +186,9 @@ impl<'a> Resolver<'a> {
   ) -> Flow {
     let mut arguments = args.iter();
     while let Some(argument) = arguments.next() {
+      if let Err(issue) = argument.count.boundary() {
+        return self.unknown_options(node, env, frame, issue);
+      }
       let Value::Literal(option) = argument.value.clone() else {
         return self.unknown_options(
           node,
@@ -277,7 +306,7 @@ impl<'a> Resolver<'a> {
           .site(variable, frame)
           .and_then(|id| self.workspace.occurrence(id))
           .map(|site| site.name.clone())
-      } else if argument.boundary.is_ok() {
+      } else if argument.count.boundary().is_ok() {
         if let Some((name, value)) = declaration_operand(&argument.value) {
           if !valid_name(&name) {
             self.gap(node, frame, ResolutionIssue::DynamicName);
@@ -367,7 +396,7 @@ impl<'a> Resolver<'a> {
     };
     for arg in &args[index..] {
       let name = match &arg.value {
-        Value::Literal(name) if arg.boundary.is_ok() => Some(name),
+        Value::Literal(name) if arg.count.boundary().is_ok() => Some(name),
         _ => None,
       };
       let Some(name) = name else {
@@ -642,7 +671,7 @@ fn cd_arguments(
   let mut index = 0;
   while let Some(arg) = args.get(index) {
     let value = arg.value.literal()?;
-    arg.boundary?;
+    arg.count.boundary()?;
     if value == b"--" {
       index += 1;
       break;
@@ -693,32 +722,30 @@ impl Resolver<'_> {
     } else {
       decimal_value::<usize>(args)
     };
-    env.alternatives.forget_positionals();
-    match (&mut env.positional, count) {
-      (_, Some(0)) => {}
-      (Positionals::Known(args), Some(count)) if count <= args.len() => {
-        args.drain(..count);
-      }
-      _ => {
-        let issue = argument_issue(args)
-          .or_else(|| env.positional.count().issue())
-          .unwrap_or(ValueIssue::Dynamic);
-        self.invalidate(
-          node,
-          &mut env,
-          frame,
-          ResolutionIssue::UnknownEffect,
-          issue,
-          [EffectTarget::Positionals],
-        );
-        env.set_status(Value::Unknown(
-          env
-            .positional
-            .count()
-            .issue()
-            .expect("unknown positional count"),
-        ));
-      }
+    if count != Some(0) {
+      env.alternatives.forget_positionals();
+    }
+    if count.is_some_and(|count| env.positional.shift(count)) {
+      env.set_status(Value::Literal(b"0".to_vec()));
+    } else {
+      let issue = argument_issue(args)
+        .or_else(|| env.positional.count().issue())
+        .unwrap_or(ValueIssue::Dynamic);
+      self.invalidate(
+        node,
+        &mut env,
+        frame,
+        ResolutionIssue::UnknownEffect,
+        issue,
+        [EffectTarget::Positionals],
+      );
+      env.set_status(Value::Unknown(
+        env
+          .positional
+          .count()
+          .issue()
+          .expect("unknown positional count"),
+      ));
     }
     Flow::next(env)
   }
@@ -770,12 +797,12 @@ impl Resolver<'_> {
     let mut failed = None;
     for (offset, arg) in args[options.operands..].iter().enumerate() {
       if failed.is_none()
-        && !matches!(&arg.value, Value::Literal(name) if arg.boundary.is_ok() && valid_name(name) && env.readonly(name).is_none())
+        && !matches!(&arg.value, Value::Literal(name) if arg.count.boundary().is_ok() && valid_name(name) && env.readonly(name).is_none())
       {
         failed = Some(env.clone());
       }
       if let Value::Literal(name) = &arg.value
-        && arg.boundary.is_ok()
+        && arg.count.boundary().is_ok()
         && valid_name(name)
       {
         if let Some(id) = self.write_argument(
@@ -796,7 +823,9 @@ impl Resolver<'_> {
         ) {
           self.record_attribute(id, frame.context, &env);
         }
-      } else if matches!(arg.value, Value::Literal(_)) && arg.boundary.is_ok() {
+      } else if matches!(arg.value, Value::Literal(_))
+        && arg.count.boundary().is_ok()
+      {
         self.gap(node, frame, ResolutionIssue::DynamicName);
       } else {
         self.invalidate(
@@ -827,8 +856,8 @@ impl Resolver<'_> {
     let computed = operands
       .ok_or_else(|| argument_issue(args).unwrap_or(ValueIssue::Dynamic))
       .and_then(|_| option_values(args, &env));
-    let known_prefix =
-      operands.is_some() && args.iter().take(2).all(|arg| arg.boundary.is_ok());
+    let known_prefix = operands.is_some()
+      && args.iter().take(2).all(|arg| arg.count.boundary().is_ok());
     if known_prefix
       && (args.len() < 2
         || matches!(&args[1].value, Value::Literal(name) if !valid_name(name)))
@@ -1022,12 +1051,13 @@ fn exit_status(args: &[Argument<'_>], previous: Value) -> Value {
   if args.is_empty() {
     previous
   } else {
-    let issue =
-      if args.len() == 1 || args.iter().any(|arg| arg.boundary.is_err()) {
-        argument_issue(args).unwrap_or(ValueIssue::Unspecified)
-      } else {
-        ValueIssue::Unspecified
-      };
+    let issue = if args.len() == 1
+      || args.iter().any(|arg| arg.count.boundary().is_err())
+    {
+      argument_issue(args).unwrap_or(ValueIssue::Unspecified)
+    } else {
+      ValueIssue::Unspecified
+    };
     decimal_value::<u8>(args).map_or(Value::Unknown(issue), |status| {
       Value::Literal(status.to_string().into_bytes())
     })
@@ -1043,7 +1073,9 @@ pub(super) fn output(
   let known: Option<Vec<_>> = args
     .iter()
     .map(|arg| match &arg.value {
-      Value::Literal(bytes) if arg.boundary.is_ok() => Some(bytes.as_slice()),
+      Value::Literal(bytes) if arg.count.boundary().is_ok() => {
+        Some(bytes.as_slice())
+      }
       _ => None,
     })
     .collect();
@@ -1072,7 +1104,8 @@ pub(super) fn output(
     b"set"
       if !args.is_empty()
         && (args.first().is_some_and(|arg| {
-          arg.boundary.is_ok() && arg.value == Value::Literal(b"--".to_vec())
+          arg.count.boundary().is_ok()
+            && arg.value == Value::Literal(b"--".to_vec())
         }) || known.as_ref().is_some_and(|args| {
           !args
             .iter()
@@ -1142,7 +1175,7 @@ fn formatted_output(args: &[Argument<'_>], limit: usize) -> Value {
   let Some((format, operands)) = args.split_first() else {
     return Value::Unknown(ValueIssue::Unspecified);
   };
-  if format.boundary.is_err() {
+  if format.count.boundary().is_err() {
     return Value::Unknown(argument_issue(args).unwrap_or(ValueIssue::Dynamic));
   }
   let format = match format.value.literal() {
@@ -1161,7 +1194,8 @@ fn formatted_output(args: &[Argument<'_>], limit: usize) -> Value {
   if format.starts_with(b"-") {
     return Value::Unknown(ValueIssue::UnsupportedExpansion);
   }
-  let boundaries_known = operands.iter().all(|arg| arg.boundary.is_ok());
+  let boundaries_known =
+    operands.iter().all(|arg| arg.count.boundary().is_ok());
   let mut output = Value::Literal(Vec::new());
   let mut operand = 0;
   loop {
@@ -1216,7 +1250,7 @@ impl Resolver<'_> {
     if options.delimiter
       || operands.is_empty()
       || operands.iter().any(|arg| {
-        arg.boundary.is_err()
+        arg.count.boundary().is_err()
           || !matches!(&arg.value, Value::Literal(name) if valid_name(name))
       })
     {
@@ -1313,13 +1347,14 @@ struct OptionValues {
   argument: Option<Value>,
   index: usize,
   offset: usize,
-  arguments: Vec<Value>,
+  arguments: Positionals,
 }
 fn option_values(
   args: &[Argument<'_>],
   env: &Environment,
 ) -> Result<OptionValues, ValueIssue> {
-  if args.len() < 2 || args.iter().any(|arg| arg.boundary.is_err()) {
+  if args.len() < 2 || args[..2].iter().any(|arg| arg.count.boundary().is_err())
+  {
     return Err(argument_issue(args).unwrap_or(ValueIssue::Dynamic));
   }
   let options = args[0].value.literal()?;
@@ -1345,9 +1380,9 @@ fn option_values(
     return Err(ValueIssue::Dynamic);
   }
   let arguments = if args.len() == 2 {
-    env.positional.values()?.clone()
+    env.positional.clone()
   } else {
-    args[2..].iter().map(|arg| arg.value.clone()).collect()
+    super::super::expansion::positional_arguments(&args[2..])
   };
   let index = env.parameter(b"OPTIND").0;
   let mut index: usize = std::str::from_utf8(index.literal()?)
@@ -1364,10 +1399,9 @@ fn option_values(
     }
     (*offset).max(1)
   };
-  let current = arguments
-    .get(index.checked_sub(1).ok_or(ValueIssue::Dynamic)?)
-    .ok_or(ValueIssue::Dynamic)?
-    .literal()?;
+  let current =
+    arguments.present(index.checked_sub(1).ok_or(ValueIssue::Dynamic)?)?;
+  let current = current.literal()?;
   if !current.starts_with(b"-") || current == b"--" {
     return Err(ValueIssue::Dynamic);
   }
@@ -1385,7 +1419,7 @@ fn option_values(
       Value::Literal(current[offset..].to_vec())
     } else {
       index += 1;
-      arguments.get(index - 1).ok_or(ValueIssue::Dynamic)?.clone()
+      arguments.present(index - 1)?
     };
     index += 1;
     offset = 1;

@@ -30,6 +30,16 @@ pub(super) struct Frame {
 }
 
 impl Frame {
+  const fn entry(snapshot: Snapshot) -> Self {
+    Self {
+      snapshot,
+      context: ExecutionContextId(0),
+      loops: 0,
+      dynamic_loops: false,
+      returnable: false,
+    }
+  }
+
   pub(super) fn location(self, node: Node<'_>) -> Location {
     Location {
       snapshot: self.snapshot,
@@ -160,14 +170,7 @@ pub(in crate::interface::application::engine) fn analyze<'a>(
     .tree
     .root_node();
   let initial = Environment::new(&resolver.result.request.initial);
-  let frame = Frame {
-    snapshot,
-    context: ExecutionContextId(0),
-    loops: 0,
-    dynamic_loops: false,
-    returnable: false,
-  };
-  resolver.run(Task::eval(root, initial, frame))?;
+  resolver.run(Task::eval(root, initial, Frame::entry(snapshot)))?;
   resolver.finish()
 }
 
@@ -184,14 +187,7 @@ impl<'a> Resolver<'a> {
     let root = document.tree.root_node();
     let track_invariants =
       document.has_body_candidates() || !document.references().is_empty();
-    let context = ExecutionContextId(0);
-    let frame = Frame {
-      snapshot: request.entry,
-      context,
-      loops: 0,
-      dynamic_loops: false,
-      returnable: false,
-    };
+    let frame = Frame::entry(request.entry);
     let mut readable = BTreeSet::new();
     let index = Index::new(
       workspace.documents.values().copied(),
@@ -213,9 +209,9 @@ impl<'a> Resolver<'a> {
       result: Analysis::new(
         request,
         ExecutionContext {
-          id: context,
+          id: frame.context,
           parent: None,
-          environment: context,
+          environment: frame.context,
           kind: ExecutionKind::Entry,
           location: frame.location(root),
         },
@@ -261,10 +257,7 @@ impl Resolver<'_> {
     &self,
     frame: Frame,
   ) -> impl Iterator<Item = &ExecutionContext> {
-    std::iter::successors(Some(frame.context), |id| {
-      self.result.contexts[id.0].parent
-    })
-    .map(|id| &self.result.contexts[id.0])
+    self.result.context_ancestors(frame.context)
   }
 
   pub(super) fn derive_body(
@@ -441,9 +434,14 @@ pub(super) struct Index<'a> {
   functions: BTreeMap<SymbolId, Node<'a>>,
   heredocs: BTreeMap<(Snapshot, usize), Node<'a>>,
   sources: BTreeMap<(Snapshot, usize, usize), ReferenceId>,
+  damaged: BTreeSet<(Snapshot, usize)>,
 }
 
 impl<'a> Index<'a> {
+  pub fn damaged(&self, snapshot: Snapshot, node: Node<'_>) -> bool {
+    self.damaged.contains(&(snapshot, node.id()))
+  }
+
   pub fn site(
     &self,
     snapshot: Snapshot,
@@ -493,6 +491,7 @@ impl<'a> Index<'a> {
       functions: BTreeMap::new(),
       heredocs: BTreeMap::new(),
       sources: BTreeMap::new(),
+      damaged: BTreeSet::new(),
     };
     for document in documents {
       index.add(document, readable, cancelled)?;
@@ -508,6 +507,7 @@ impl<'a> Index<'a> {
   ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
     super::command::index_heredocs(document, &mut self.heredocs, cancelled)?;
+    self.index_damage(document, cancelled)?;
     for reference in document.references() {
       self.sources.insert(
         (
@@ -552,6 +552,54 @@ impl<'a> Index<'a> {
           node = current.parent();
         }
       }
+    }
+    Ok(())
+  }
+
+  fn index_damage(
+    &mut self,
+    document: &'a engine::Document,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    if !document.has_syntax_errors() {
+      return Ok(());
+    }
+    let snapshot = document.snapshot();
+    let mut pending = vec![(document.tree.root_node(), None)];
+    while let Some((node, mut owner)) = pending.pop() {
+      check_cancelled(cancelled)?;
+      if matches!(node.kind(), "command" | "function_body")
+        || engine::workspace::parser::subshell(node.kind())
+      {
+        owner = Some(node.id());
+      }
+      if engine::workspace::parser::damaged(node)
+        || (matches!(node.kind(), "here_end" | "tilde_expansion")
+          && node.has_error())
+      {
+        if let Some(owner) = owner {
+          self.damaged.insert((snapshot, owner));
+        }
+        continue;
+      }
+      if matches!(
+        node.kind(),
+        "here_document" | "here_end" | "tilde_expansion"
+      ) {
+        continue;
+      }
+      if node.kind() == "io_here" {
+        // Here-document bodies live outside their owning command's subtree.
+        if let Some(body) = self.heredoc(snapshot, node) {
+          pending.extend(
+            body.children(&mut body.walk()).map(|child| (child, owner)),
+          );
+        } else if let Some(owner) = owner {
+          self.damaged.insert((snapshot, owner));
+        }
+      }
+      pending
+        .extend(node.children(&mut node.walk()).map(|child| (child, owner)));
     }
     Ok(())
   }

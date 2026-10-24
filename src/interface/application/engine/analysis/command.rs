@@ -12,4 +12,6 @@ pub(in crate::interface::application::engine) use effects::{
 pub(super) use redirections::{Redirections, index_heredocs};
 
 pub(in crate::interface::application::engine) use dispatch::invariant_command;
-pub use dispatch::{optional_reserved_word, reserved_word, special_builtin};
+pub use dispatch::{
+  optional_reserved_word, reserved_word, special_builtin, unspecified_command,
+};

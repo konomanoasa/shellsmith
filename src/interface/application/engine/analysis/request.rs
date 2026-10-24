@@ -70,6 +70,17 @@ pub struct InitialEnvironment {
 
 impl InitialEnvironment {
   #[must_use]
+  pub fn variable_binding(&self, name: &[u8]) -> InitialBinding {
+    self.variables.get(name).copied().unwrap_or_else(|| {
+      if self.values.contains_key(name) || self.environment.contains_key(name) {
+        InitialBinding::External
+      } else {
+        self.other_variables
+      }
+    })
+  }
+
+  #[must_use]
   pub fn empty() -> Self {
     Self {
       positional: Some(Vec::new()),

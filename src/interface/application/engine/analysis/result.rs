@@ -699,6 +699,16 @@ impl Analysis {
     self.contexts.get(id.0)
   }
 
+  /// The context and its ancestors, innermost first.
+  pub(in crate::interface::application::engine) fn context_ancestors(
+    &self,
+    id: ExecutionContextId,
+  ) -> impl Iterator<Item = &ExecutionContext> {
+    std::iter::successors(self.context(id), |context| {
+      context.parent.and_then(|parent| self.context(parent))
+    })
+  }
+
   pub fn uses(&self) -> impl Iterator<Item = &ResolvedUse> {
     self.uses.values()
   }

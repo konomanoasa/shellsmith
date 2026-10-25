@@ -1965,6 +1965,33 @@ mod updates {
   }
 
   #[test]
+  fn analysis_limits_discard_incomplete_and_previous_results_and_allow_fresh_analysis()
+   {
+    for storage in [false, true] {
+      let (mut workspace, request, mut inputs) = workspace(2, false);
+      let flag = AtomicBool::new(false);
+      let complete = workspace
+        .analyze(request.clone(), &mut inputs, &flag)
+        .unwrap();
+      workspace.publish_analysis(complete).unwrap();
+      let mut limited = request.clone();
+      if storage {
+        limited.limits.storage_bytes = 1;
+      } else {
+        limited.limits.work = 1;
+      }
+      assert_eq!(
+        workspace.analyze(limited, &mut inputs, &flag).unwrap_err(),
+        Error::AnalysisLimit
+      );
+      assert!(workspace.analysis().is_none());
+      let recovered = workspace.analyze(request, &mut inputs, &flag).unwrap();
+      workspace.publish_analysis(recovered).unwrap();
+      assert!(workspace.analysis().is_some());
+    }
+  }
+
+  #[test]
   fn cancellation_and_rejected_requests_leave_the_published_result_intact() {
     let (mut workspace, request, mut inputs) = workspace(2, false);
     let report = workspace
@@ -2319,7 +2346,7 @@ mod convergence {
   use support::analyze;
 
   #[test]
-  fn thirty_thousand_commands_are_all_resolved_without_a_step_budget() {
+  fn thirty_thousand_commands_are_all_resolved_within_the_default_budget() {
     let source = String::from("x=1\n") + &": \"$x\"\n".repeat(30_000);
     let (workspace, analysis) = analyze(&source);
     let definition = workspace.symbols_named(b"x").next().unwrap().id;

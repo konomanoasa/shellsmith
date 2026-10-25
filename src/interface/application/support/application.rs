@@ -118,6 +118,7 @@ pub struct Application {
   pub(super) discovery: Arc<Discovery>,
   pub(super) cache: InputCache,
   pub(super) names: Option<Arc<NameCollection>>,
+  pub(super) limited: Option<engine::AnalysisRequest>,
   pub(in crate::interface::application) analyses:
     Option<Arc<AnalysisCollection>>,
 }
@@ -137,6 +138,7 @@ impl Application {
       discovery: Arc::default(),
       cache: InputCache::default(),
       names: None,
+      limited: None,
       analyses: None,
     })
   }
@@ -158,6 +160,7 @@ impl Application {
   }
 
   fn invalidate_inputs(&mut self) {
+    self.limited = None;
     self.cache = InputCache::default();
     self.names = None;
     self.analyses = None;
@@ -335,6 +338,7 @@ impl Application {
       self.cache.loaded.insert(path.to_path_buf(), Ok(document));
       return Ok(());
     }
+    self.limited = None;
     let result = self
       .documents
       .parse_entry(&mut self.entries, path, bytes, false, cancelled)
@@ -424,6 +428,7 @@ impl Application {
     document: Option<&Path>,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
+    self.limited = None;
     check_cancelled(cancelled)?;
     self.failures.clear();
     self.names = None;
@@ -496,7 +501,6 @@ impl Application {
     Ok(())
   }
 
-  /// Rescans the inputs and compares the files they select now.
   pub(super) fn selection_current(
     &self,
     selection: &InputSelection,
@@ -506,13 +510,17 @@ impl Application {
     Ok(self.select_inputs(selection.explicit.clone(), cancelled)? == *selection)
   }
 
-  /// Results collected from inputs that changed without notification are
-  /// collected again by the next request.
+  /// Unnotified input changes require recollection on the next request.
   pub(in crate::interface::application) fn discard_results(&mut self) {
+    self.limited = None;
+    self.clear_semantics();
+    self.outdated = true;
+  }
+
+  pub(in crate::interface::application) fn clear_semantics(&mut self) {
     self.names = None;
     self.analyses = None;
     self.workspace.clear_analysis();
-    self.outdated = true;
   }
 
   pub(super) fn share_workspace_documents(&mut self) {

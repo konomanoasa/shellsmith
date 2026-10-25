@@ -3,6 +3,17 @@ use crate::interface::application::engine::{self, DocumentId};
 use std::sync::atomic::AtomicBool;
 
 impl Application {
+  pub(in crate::interface::application) fn prepare_semantics(
+    &mut self,
+    id: DocumentId,
+    cancelled: &AtomicBool,
+  ) -> Result<(), Error> {
+    match self.analyze_document(id, cancelled) {
+      Err(Error::Engine(engine::Error::AnalysisLimit)) => Ok(()),
+      result => result,
+    }
+  }
+
   pub fn classify(
     &mut self,
     id: DocumentId,
@@ -20,7 +31,7 @@ impl Application {
       self.refresh_for(Some(&path), cancelled)?;
       self.discard_results();
     }
-    self.analyze_document(id, cancelled)?;
+    self.prepare_semantics(id, cancelled)?;
     let spans = if let Some(analyses) = &self.analyses {
       let snapshot = self
         .workspace

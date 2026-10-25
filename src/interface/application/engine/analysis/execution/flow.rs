@@ -3,20 +3,20 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use super::super::command::Redirections;
-use super::super::expansion::Expansion;
+use super::super::expansion::{Expansion, Sharing};
 use super::super::{Frame, Resolver};
 use super::alternatives::{Alternatives, StateKey};
 use super::environment::{
   Binding, CommandFailure, Environment, Flow, Output, Transfer, alternative,
   definition, merge_value,
 };
+use crate::interface::application::engine::Error;
 use crate::interface::application::engine::word::{Word, WordContext};
 use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
   Access, Alternative, EffectTarget, ExecutionContextId, ExecutionKind,
   OccurrenceId, OccurrenceKind, ResolutionIssue, UseSite, Value, ValueIssue,
 };
-use crate::interface::application::engine::{Error, check_cancelled};
 
 impl<'a> Resolver<'a> {
   pub(in crate::interface::application::engine::analysis) fn eval(
@@ -53,7 +53,7 @@ impl<'a> Resolver<'a> {
       {
         names.insert(StateKey::Positionals);
       }
-      if env.alternatives.choice(&names).is_some() {
+      if env.alternatives.depends(&names) {
         if node.kind() == "assignment_word"
           || node.kind() == "word" && node.child_by_field_name("name").is_some()
         {
@@ -66,7 +66,7 @@ impl<'a> Resolver<'a> {
             }
           }
         }
-        return self.each_alternative(env, names, move |_, env| {
+        return self.each_alternative(env, &names, move |_, env| {
           Task::eval(node, env, frame)
         });
       }
@@ -128,27 +128,39 @@ impl<'a> Resolver<'a> {
     })
   }
 
-  /// Runs `step` on each side of the choices that `names` depend on and joins
-  /// the results on the same choices.
   pub(in crate::interface::application::engine::analysis) fn each_alternative(
     &mut self,
     env: Environment,
-    names: BTreeSet<StateKey>,
+    names: &BTreeSet<StateKey>,
     step: impl Fn(&mut Self, Environment) -> Task<'a> + Clone + 'a,
   ) -> Task<'a> {
-    let Some(choice) = env.alternatives.choice(&names) else {
+    if !env.alternatives.depends(names) {
       return step(self, env);
+    }
+    match Alternatives::partitions(&env, names, self.cancelled) {
+      Ok(inputs) => {
+        self.evaluate_inputs(inputs.into_iter(), Flow::default(), step)
+      }
+      Err(error) => {
+        self.error = Some(error);
+        Task::Done(Flow::default())
+      }
+    }
+  }
+
+  fn evaluate_inputs(
+    &mut self,
+    mut inputs: std::vec::IntoIter<Environment>,
+    mut output: Flow,
+    step: impl Fn(&mut Self, Environment) -> Task<'a> + Clone + 'a,
+  ) -> Task<'a> {
+    let Some(input) = inputs.next() else {
+      return Task::Done(output);
     };
-    let (left, split) = Alternatives::split(env, choice);
-    let (right_names, right_step) = (names.clone(), step.clone());
-    self
-      .each_alternative(left, names, step)
-      .then(move |resolver, flow| {
-        let (right, join) = split.resume(flow);
-        resolver
-          .each_alternative(right, right_names, right_step)
-          .then(move |_, right| Task::Done(join(right)))
-      })
+    step(self, input).then(move |resolver, flow| {
+      output.join(flow);
+      resolver.evaluate_inputs(inputs, output, step)
+    })
   }
 
   fn eval_syntax(
@@ -405,6 +417,7 @@ impl<'a> Resolver<'a> {
     task.then(move |resolver, flow| {
       let result = flow.merged();
       let mut trace = None;
+      let mut expression = None;
       let value = if let Some(result) = result {
         env.substitution_status = Some(match body {
           SubstitutionBody::Empty => Value::Literal(b"0".to_vec()),
@@ -415,6 +428,23 @@ impl<'a> Resolver<'a> {
         });
         env.io.inherit_input(&result.io, saved_input);
         trace = result.io.output.as_ref().and_then(Output::trace);
+        if result
+          .io
+          .output
+          .as_ref()
+          .is_some_and(|output| output.expression.is_some())
+          && matches!(body, SubstitutionBody::Commands)
+        {
+          let id = result.alternatives.output(&result);
+          let mut values = result.alternatives.expressions();
+          match values.trim_newlines(id, resolver.cancelled) {
+            Ok(id) => expression = Some(id),
+            Err(error) => {
+              resolver.error = Some(error);
+              return Task::Done(Flow::default());
+            }
+          }
+        }
         let mut value =
           result.io.output.map_or(
             Value::Unknown(ValueIssue::UnsupportedExpansion),
@@ -436,7 +466,23 @@ impl<'a> Resolver<'a> {
           .and_then(|trace| trace.matching(bytes))
       });
       resolver.substitution_trace(&frame.location(node), frame.context, trace);
+      let value = if let Some(id) = expression {
+        match env
+          .alternatives
+          .expressions()
+          .projected(id, resolver.cancelled)
+        {
+          Ok(value) => value.as_ref().clone(),
+          Err(error) => {
+            resolver.error = Some(error);
+            return Task::Done(Flow::default());
+          }
+        }
+      } else {
+        value
+      };
       Task::expanded(Expansion {
+        expression,
         word: Word::value(value, quoted),
         env,
       })
@@ -606,6 +652,7 @@ impl<'a> Resolver<'a> {
       Task::expand(value, false, env, frame)
     } else {
       Task::expanded(Expansion {
+        expression: None,
         word: Word::default(),
         env,
       })
@@ -624,7 +671,35 @@ impl<'a> Resolver<'a> {
         Err(issue) => Value::Unknown(issue),
       };
       if let Some(name) = node.child_by_field_name("name") {
-        resolver.write(name, &mut result.env, frame, false, value);
+        let expression = result
+          .expression
+          .filter(|_| !matches!(value, Value::Unknown(_)));
+        let value = if let Some(id) = expression {
+          match result
+            .env
+            .alternatives
+            .expressions()
+            .projected(id, resolver.cancelled)
+          {
+            Ok(value) => value.as_ref().clone(),
+            Err(error) => {
+              resolver.error = Some(error);
+              return Task::Done(Flow::default());
+            }
+          }
+        } else {
+          value
+        };
+        if resolver.write(name, &mut result.env, frame, false, value)
+          && let Some(id) = expression
+        {
+          let name = crate::interface::application::engine::word::lexical(
+            name,
+            resolver.workspace.source(frame.snapshot.document),
+          );
+          let resolution = result.env.variables.get(&name).resolution.clone();
+          result.env.alternatives.store(&name, id, resolution);
+        }
       }
       Task::Done(Flow::next(result.env))
     })
@@ -889,7 +964,7 @@ impl<'a> Resolver<'a> {
         Vec::new(),
         env,
         frame,
-        false,
+        Sharing::None,
         Box::new(move |resolver, arguments, header| {
           let implicit = node.kind() == "for_clause"
             && !node
@@ -1005,7 +1080,6 @@ impl<'a> Resolver<'a> {
     })
   }
 
-  /// Runs damaged syntax as unknown commands.
   fn recover(
     &mut self,
     damaged: &[Node<'_>],
@@ -1183,8 +1257,7 @@ pub(in crate::interface::application::engine::analysis) fn children(
   node.named_children(&mut node.walk()).collect()
 }
 
-/// Groups the children in `fields` with the following children that contain
-/// damaged syntax; damaged children before every field join the first group.
+/// Damage joins the preceding field, or the first field if none precedes it.
 fn regions<'a, const N: usize>(
   node: Node<'a>,
   fields: [&str; N],
@@ -1209,7 +1282,6 @@ fn regions<'a, const N: usize>(
   regions
 }
 
-/// Children outside `fields` that contain damaged syntax.
 pub(in crate::interface::application::engine::analysis) fn damage_outside<
   'a,
 >(
@@ -1289,7 +1361,6 @@ impl<'a> Task<'a> {
     Self::Then(Box::new(self), Continuation::Word(Box::new(resume)))
   }
 
-  /// Runs damaged syntax as unknown commands after normal completion.
   fn then_recover(self, damaged: Vec<Node<'a>>, frame: Frame) -> Self {
     if damaged.is_empty() {
       return self;
@@ -1338,7 +1409,8 @@ impl<'a> Resolver<'a> {
   ) -> Result<Flow, Error> {
     let mut pending = Vec::new();
     loop {
-      check_cancelled(self.cancelled)?;
+      self.budget.work(1);
+      self.budget.check(self.cancelled)?;
       if let Some(error) = self.error.take() {
         return Err(error);
       }

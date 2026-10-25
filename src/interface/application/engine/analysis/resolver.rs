@@ -142,6 +142,7 @@ impl<'a> AnalysisWorkspace<'a> {
 }
 
 pub(super) struct Resolver<'a> {
+  pub(super) budget: super::request::Budget,
   pub(super) workspace: AnalysisWorkspace<'a>,
   pub(super) inputs: &'a mut dyn AnalysisInputs,
   pub(super) error: Option<Error>,
@@ -173,7 +174,20 @@ pub(in crate::interface::application::engine) fn analyze<'a>(
     .expect("analysis entry")
     .tree
     .root_node();
-  let initial = Environment::new(&resolver.result.request.initial);
+  let initial_bytes = resolver
+    .result
+    .request
+    .initial
+    .environment
+    .iter()
+    .chain(&resolver.result.request.initial.values)
+    .map(|(name, value)| name.len() + value.len() + 128)
+    .sum::<usize>();
+  resolver.budget.retain(initial_bytes);
+  resolver.budget.work(initial_bytes.div_ceil(16));
+  resolver.budget.check(cancelled)?;
+  let mut initial = Environment::new(&resolver.result.request.initial);
+  initial.alternatives.set_budget(resolver.budget.clone());
   resolver.run(Task::eval(root, initial, Frame::entry(snapshot)))?;
   resolver.finish()
 }
@@ -199,6 +213,7 @@ impl<'a> Resolver<'a> {
       cancelled,
     )?;
     Ok(Self {
+      budget: super::request::Budget::new(request.limits),
       workspace,
       inputs,
       error: None,
@@ -228,6 +243,7 @@ impl<'a> Resolver<'a> {
 impl Resolver<'_> {
   fn finish(mut self) -> Result<Analysis, Error> {
     self.analyze_deferred()?;
+    self.budget.check(self.cancelled)?;
     let mut derived = std::mem::take(&mut self.result.derived);
     let roots = self
       .result
@@ -254,6 +270,7 @@ impl Resolver<'_> {
     }
     self.commit_sources()?;
     self.result.index_uses(self.cancelled)?;
+    self.budget.check(self.cancelled)?;
     Ok(self.result)
   }
 
@@ -269,6 +286,12 @@ impl Resolver<'_> {
     origin: DerivedOrigin,
     body: &[u8],
   ) -> Option<Snapshot> {
+    self.budget.work(body.len().div_ceil(16) + 1);
+    self.budget.retain(body.len());
+    if let Err(error) = self.budget.check(self.cancelled) {
+      self.error = Some(error);
+      return None;
+    }
     let snapshot = self
       .result
       .derived
@@ -354,6 +377,17 @@ impl Resolver<'_> {
     variable: Option<&[u8]>,
     env: &Environment,
   ) {
+    let records = resolution.candidates.len()
+      + resolution.alternatives.len()
+      + resolution.issues.len()
+      + resolution.origins.len();
+    self.budget.work(records + 1);
+    self
+      .budget
+      .retain(records * 32 + std::mem::size_of::<ResolvedUse>());
+    if self.budget.exhausted() {
+      return;
+    }
     if variable.is_some_and(|name| env.uncertain_variable(name)) {
       resolution.issues.insert(ResolutionIssue::EvaluationOrder);
       resolution.origins.insert(engine::BindingOrigin::Context(
@@ -414,6 +448,12 @@ impl Resolver<'_> {
         ..frame
       };
     }
+    self.budget.work(1);
+    self.budget.retain(
+      std::mem::size_of::<ExecutionContext>()
+        + std::mem::size_of::<ContextKey>()
+        + 64,
+    );
     let id = ExecutionContextId(self.result.contexts.len());
     let environment = if separate {
       id

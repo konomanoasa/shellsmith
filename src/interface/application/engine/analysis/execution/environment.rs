@@ -329,7 +329,7 @@ impl Positionals {
       .reduce(ValueIssue::combine)
   }
 
-  fn join(&mut self, other: &Self) {
+  pub(super) fn join(&mut self, other: &Self) {
     if self == other {
       return;
     }
@@ -496,8 +496,7 @@ pub(in crate::interface::application::engine::analysis) struct OptionCursor {
   pub arguments: Positionals,
   pub index: usize,
   pub offset: usize,
-  /// The function call depth of the parse; callers and their functions do not
-  /// share one parse.
+  /// Call depth: callers and functions cannot share a getopts parse.
   pub functions: u32,
 }
 
@@ -826,14 +825,12 @@ impl Environment {
   }
 
   pub fn join(&mut self, other: &Self) {
-    self.join_choice(None, other);
-  }
-
-  /// Joins the two sides of `choice`; `None` introduces a new choice.
-  pub fn join_choice(&mut self, choice: Option<usize>, other: &Self) {
-    let alternatives = Alternatives::joined(self, other, choice);
+    let (alternatives, output) = Alternatives::joined(self, other);
     self.join_values(other);
     self.alternatives = alternatives;
+    if let Some(captured) = &mut self.io.output {
+      captured.expression = output;
+    }
   }
 
   /// Converges repeated execution without introducing a new path choice.
@@ -1050,6 +1047,7 @@ impl Environment {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(in crate::interface::application::engine::analysis) struct Output {
+  pub expression: Option<super::values::ValueId>,
   chunks: imbl::Vector<Vec<u8>>,
   bytes: usize,
   constraint: Option<Value>,
@@ -1070,6 +1068,7 @@ impl Output {
   }
 
   pub fn fail(&mut self, issue: ValueIssue) {
+    self.expression = None;
     self.constraint = Some(Value::Unknown(
       self
         .constraint
@@ -1088,6 +1087,7 @@ impl Output {
     trace: Option<OutputTrace>,
     limit: usize,
   ) {
+    self.expression = None;
     if let Some(constraint) = &mut self.constraint {
       constraint.concat(&value, limit);
     } else if let Value::Literal(bytes) = value {
@@ -1209,30 +1209,16 @@ impl Flow {
   }
 
   pub fn add(&mut self, transfer: Transfer, environment: Environment) {
-    self.add_choice(None, transfer, environment);
-  }
-
-  fn add_choice(
-    &mut self,
-    choice: Option<usize>,
-    transfer: Transfer,
-    environment: Environment,
-  ) {
     self
       .0
       .entry(transfer)
-      .and_modify(|old| old.join_choice(choice, &environment))
+      .and_modify(|old| old.join(&environment))
       .or_insert(environment);
   }
 
   pub fn join(&mut self, other: Self) {
-    self.join_choice(None, other);
-  }
-
-  /// Joins flows from the two sides of `choice`; `None` introduces new choices.
-  pub fn join_choice(&mut self, choice: Option<usize>, other: Self) {
     for (transfer, environment) in other.0 {
-      self.add_choice(choice, transfer, environment);
+      self.add(transfer, environment);
     }
   }
 }

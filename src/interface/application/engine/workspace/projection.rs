@@ -199,8 +199,7 @@ pub(super) struct ProjectedDocuments<'a> {
   pub(super) complete: bool,
 }
 
-/// A unit derived from another unit's text supersedes the names it was
-/// expanded from, as every unit supersedes the syntax of its source.
+/// Derived names supersede their source syntax, including parent units' names.
 fn insert_nested<T>(
   entries: &mut BTreeMap<(usize, usize), (usize, T)>,
   range: (usize, usize),

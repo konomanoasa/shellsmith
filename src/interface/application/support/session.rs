@@ -446,7 +446,8 @@ impl Preparation {
     let flag = cancelled.clone();
     let retain_completed = matches!(
       scope,
-      RequestScope::Workspace
+      RequestScope::Analysis(_)
+        | RequestScope::Workspace
         | RequestScope::WorkspaceAnalysis
         | RequestScope::Names(_)
         | RequestScope::Results(_)
@@ -468,7 +469,7 @@ impl Preparation {
             RequestScope::Analysis(path) => {
               application.refresh_for(Some(path), flag)?;
               application
-                .analyze_document(application.loaded_document(path)?, flag)?;
+                .prepare_semantics(application.loaded_document(path)?, flag)?;
             }
             RequestScope::Results(path) => {
               application.prepare_analysis(path, flag)?;
@@ -509,7 +510,6 @@ impl Preparation {
   }
 }
 
-/// Runs blocking work once a worker is free, unless it is cancelled first.
 async fn run_blocking<T: Send + 'static>(
   workers: Arc<tokio::sync::Semaphore>,
   cancelled: Arc<AtomicBool>,
@@ -565,7 +565,7 @@ impl Application {
           self.refresh_for(path, flag)?;
           self.outdated = true;
           if let RequestScope::Analysis(path) = scope {
-            self.analyze_document(self.loaded_document(path)?, flag)?;
+            self.prepare_semantics(self.loaded_document(path)?, flag)?;
           }
         }
       }

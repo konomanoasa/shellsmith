@@ -72,8 +72,7 @@ pub(super) fn read(
   }
 }
 
-/// Selects files whose prefix cannot be read, so that loading reports them
-/// unless an opened text replaces them.
+/// Select unreadable files so loading reports errors unless an overlay replaces them.
 pub(super) fn selected_shell(path: &Path, identity: &Path) -> bool {
   let mut prefix = Vec::new();
   std::fs::File::open(path)
@@ -565,9 +564,7 @@ struct ParsedFile {
 }
 
 impl Documents {
-  /// Shares parses across requests. Staged text replaces an input only
-  /// hypothetically, so its parse stays apart from the input parse until the
-  /// input has that text.
+  /// Keep hypothetical parses separate until the input matches the staged text.
   pub(super) fn parse_entry(
     &self,
     entries: &mut BTreeMap<PathBuf, Snapshot>,

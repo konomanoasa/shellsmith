@@ -112,6 +112,7 @@ impl<'a> Resolver<'a> {
     let task = match document.child_by_field_name("body") {
       Some(body) => self.expand_start(body, false, env, frame),
       None => Task::expanded(Expansion {
+        expression: None,
         word: word::Word::value(Value::Literal(Vec::new()), true),
         env,
       }),

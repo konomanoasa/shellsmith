@@ -221,7 +221,6 @@ pub enum EffectTarget {
 }
 
 impl EffectTarget {
-  /// Whether the target may be the variable or function `name`.
   #[must_use]
   pub fn covers(&self, kind: SymbolKind, name: &[u8]) -> bool {
     match (self, kind) {

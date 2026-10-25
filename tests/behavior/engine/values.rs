@@ -2100,7 +2100,7 @@ mod expansion {
     workspace.insert(document).unwrap();
     let result = workspace
       .analyze(request, inputs, &AtomicBool::new(false))
-      .unwrap();
+      .unwrap_or_else(|error| panic!("{error}: {source}"));
     let site = workspace
       .document(DocumentId(1))
       .unwrap()
@@ -2637,6 +2637,33 @@ mod expansion {
           "{declaration}{tail}"
         );
       }
+    }
+  }
+
+  #[test]
+  fn shared_values_cross_assignments_fields_calls_patterns_and_output_without_enumerating_paths()
+   {
+    use std::fmt::Write;
+    let mut source = String::from("P=/bin\n");
+    for index in 0..32 {
+      writeln!(source, "if condition; then P=\"$P:a{index:03}\"; fi").unwrap();
+    }
+    for body in [
+      "copy=$P; a=${#copy}; b=${#P}; result=$((a-b))",
+      "set -- start \"$P\" \"$P\"; left=$2; right=$3; a=${#left}; b=${#right}; result=$((a-b))",
+      "set -- start \"$P\"; shift; copy=$1; a=${#copy}; b=${#P}; result=$((a-b))",
+      "set -- start \"$P\"; count=$#; result=$((count-2))",
+      "f() { copy=$2; a=${#copy}; b=${#P}; result=$((a-b)); }; f start \"$P\"",
+      "copy=$(command -p echo \"$P\"); a=${#copy}; b=${#P}; result=$((a-b))",
+      "copy=$(command -p echo \"$P\"; command -p echo \"$P\"); a=${#copy}; b=${#P}; result=$((a-2*b-1))",
+      "copy=${P%%:*}; a=${#copy}; result=$((a-4))",
+    ] {
+      let input = format!("{source}{body}; : \"$result\"");
+      assert_eq!(
+        last_value(&input, InitialEnvironment::empty()),
+        Value::Literal(b"0".to_vec()),
+        "{body}"
+      );
     }
   }
 

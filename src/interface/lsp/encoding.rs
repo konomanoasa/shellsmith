@@ -28,7 +28,9 @@ pub(super) fn invalid(message: impl std::fmt::Display) -> ResponseError {
 
 pub(super) fn fault(error: Error) -> ResponseError {
   let code = match error {
-    Error::RenameRefused(_) => ErrorCode::REQUEST_FAILED,
+    Error::RenameRefused(_) | Error::Engine(engine::Error::AnalysisLimit) => {
+      ErrorCode::REQUEST_FAILED
+    }
     Error::Superseded => ErrorCode::CONTENT_MODIFIED,
     Error::InvalidName(_) | Error::Engine(engine::Error::InvalidPosition) => {
       ErrorCode::INVALID_PARAMS
@@ -301,7 +303,6 @@ impl<'a> Positions<'a> {
     Ok(lines.range(&location.bytes))
   }
 
-  /// Result ranges always lie within their documents.
   pub(super) fn result_range(
     &mut self,
     location: &engine::Location,

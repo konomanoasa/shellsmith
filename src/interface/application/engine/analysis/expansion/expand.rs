@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 pub(in crate::interface::application::engine::analysis) struct Expansion {
+  pub expression: Option<ValueId>,
   pub word: Word,
   pub env: Environment,
 }
@@ -79,12 +80,15 @@ impl<'a> Resolver<'a> {
     let strip = self.index.strips_tabs(frame.snapshot, node, source);
     self.expand_parts(
       Parts::new(node, quoted, source).strip_tabs(strip),
-      Expansion { word: initial, env },
+      Expansion {
+        expression: None,
+        word: initial,
+        env,
+      },
       frame,
     )
   }
 
-  /// Damaged syntax leaves the word without a value.
   fn source_word(&mut self, node: Node<'a>, frame: Frame) -> Word {
     let mut word = Word::default();
     if node.has_error() {
@@ -94,8 +98,7 @@ impl<'a> Resolver<'a> {
     word
   }
 
-  /// Damaged expansion syntax may hide substitutions and assignments, which
-  /// read input, fail or assign any variable.
+  /// Damage may hide substitutions or assignments.
   pub(in crate::interface::application::engine::analysis) fn damaged_expansion(
     &mut self,
     node: Node<'_>,
@@ -123,20 +126,75 @@ impl<'a> Resolver<'a> {
     let limit = self.result.request.limits.value_bytes;
     while let Some(part) = parts.next() {
       match part {
-        Part::Fragment(fragment) => expansion.word.append(fragment, limit),
+        Part::Fragment(fragment) => {
+          if let Some(previous) = expansion.expression {
+            let mut values = expansion.env.alternatives.expressions();
+            let next =
+              values.literal(Arc::new(Value::Literal(fragment.bytes.clone())));
+            match values.concat(previous, next, self.cancelled) {
+              Ok(value) => {
+                expansion.expression = value.filter(|id| {
+                  values.maximum(*id).is_some_and(|size| size <= limit)
+                });
+              }
+              Err(error) => {
+                self.error = Some(error);
+                return Task::Done(Flow::default());
+              }
+            }
+          }
+          expansion.word.append(fragment, limit);
+        }
         Part::Damaged(node) => {
+          expansion.expression = None;
           expansion.word.fail(ValueIssue::Recovery);
           self.damaged_expansion(node, &mut expansion.env, frame);
         }
-        Part::Invalid(issue) => expansion.word.fail(issue),
+        Part::Invalid(issue) => {
+          expansion.expression = None;
+          expansion.word.fail(issue);
+        }
         Part::Expansion(node, quoted) => {
-          let Expansion { mut word, env } = expansion;
+          let Expansion {
+            mut word,
+            env,
+            expression,
+          } = expansion;
           return self.expand_part(node, quoted, env, frame).then_word(
             move |resolver, next| {
+              let expression =
+                if expression.is_some() || next.expression.is_some() {
+                  let mut values = next.env.alternatives.expressions();
+                  let left = expression.or_else(|| {
+                    matches!(word.scalar(), Value::Literal(_))
+                      .then(|| values.literal(Arc::new(word.scalar())))
+                  });
+                  let right = next.expression.or_else(|| {
+                    matches!(next.word.scalar(), Value::Literal(_))
+                      .then(|| values.literal(Arc::new(next.word.scalar())))
+                  });
+                  match (left, right) {
+                    (Some(left), Some(right)) => {
+                      match values.concat(left, right, resolver.cancelled) {
+                        Ok(value) => value.filter(|id| {
+                          values.maximum(*id).is_some_and(|size| size <= limit)
+                        }),
+                        Err(error) => {
+                          resolver.error = Some(error);
+                          return Task::Done(Flow::default());
+                        }
+                      }
+                    }
+                    _ => None,
+                  }
+                } else {
+                  None
+                };
               word.extend(next.word, limit);
               resolver.expand_parts(
                 parts,
                 Expansion {
+                  expression,
                   word,
                   env: next.env,
                 },
@@ -200,6 +258,7 @@ impl<'a> Resolver<'a> {
         home
       };
       return Task::expanded(Expansion {
+        expression: None,
         word: Word::value(value, true),
         env,
       });
@@ -207,6 +266,7 @@ impl<'a> Resolver<'a> {
     let before = env.clone();
     Task::eval(node, env, frame).then(move |_, mut flow| {
       Task::expanded(Expansion {
+        expression: None,
         word: Word::value(
           Value::Unknown(ValueIssue::UnsupportedExpansion),
           quoted,
@@ -373,6 +433,13 @@ impl Argument<'_> {
   }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(in crate::interface::application::engine::analysis) enum Sharing {
+  None,
+  Assignments,
+  Fields,
+}
+
 type Ready<'a> = Box<
   dyn FnOnce(&mut Resolver<'a>, Vec<Argument<'a>>, Environment) -> Task<'a>
     + 'a,
@@ -385,24 +452,30 @@ impl<'a> Resolver<'a> {
     mut values: Vec<Argument<'a>>,
     env: Environment,
     frame: Frame,
-    shared: bool,
+    shared: Sharing,
     ready: Ready<'a>,
   ) -> Task<'a> {
     let Some(node) = nodes.next() else {
       return ready(self, values, env);
     };
-    if shared {
-      match self.conditional_value(node, &env, frame) {
+    if shared != Sharing::None {
+      match self.conditional_value(node, &env, frame, shared == Sharing::Fields)
+      {
         Ok(Some((expression, dependencies))) => {
           for id in dependencies {
             self.read(id, &env, frame);
           }
-          let value = env
+          let value = match env
             .alternatives
             .expressions()
-            .projected(expression)
-            .as_ref()
-            .clone();
+            .projected(expression, self.cancelled)
+          {
+            Ok(value) => value.as_ref().clone(),
+            Err(error) => {
+              self.error = Some(error);
+              return Task::Done(Flow::default());
+            }
+          };
           values.push(Argument {
             node,
             value,
@@ -435,6 +508,7 @@ impl<'a> Resolver<'a> {
       Task::expand(target, false, env, frame)
     } else {
       Task::expanded(Expansion {
+        expression: None,
         word: Word::default(),
         env,
       })
@@ -529,6 +603,7 @@ impl<'a> Resolver<'a> {
         Value::Unknown(value.issue().expect("unknown parameter length"))
       };
       return Task::expanded(Expansion {
+        expression: None,
         word: Word::value(result, quoted),
         env,
       });
@@ -539,6 +614,7 @@ impl<'a> Resolver<'a> {
       let task = pattern.map_or_else(
         || {
           Task::expanded(Expansion {
+            expression: None,
             word: Word::default(),
             env: env.clone(),
           })
@@ -631,7 +707,11 @@ impl<'a> Resolver<'a> {
                 .is_some_and(|p| word::lexical(p, source) == b"@"))
         });
     }
-    Task::expanded(Expansion { word, env })
+    Task::expanded(Expansion {
+      expression: None,
+      word,
+      env,
+    })
   }
 
   fn conditional_parameter(
@@ -661,6 +741,7 @@ impl<'a> Resolver<'a> {
     };
     if choose == Ok(false) {
       return Task::expanded(Expansion {
+        expression: None,
         word: Word::value(skipped, quoted),
         env,
       });
@@ -670,6 +751,7 @@ impl<'a> Resolver<'a> {
       Task::expand(body, quoted, env, frame)
     } else {
       Task::expanded(Expansion {
+        expression: None,
         word: Word::value(Value::Literal(Vec::new()), quoted),
         env,
       })
@@ -745,6 +827,23 @@ impl<'a> Resolver<'a> {
 }
 
 impl Environment {
+  pub fn set_positionals(&mut self, args: &[Argument<'_>]) {
+    self.positional = positional_arguments(args);
+    let fields = args
+      .iter()
+      .map(|arg| {
+        let id = arg.expression.unwrap_or_else(|| {
+          self
+            .alternatives
+            .expressions()
+            .literal(Arc::new(arg.value.clone()))
+        });
+        (id, arg.count)
+      })
+      .collect();
+    self.alternatives.store_positionals(fields);
+  }
+
   fn positional_word(
     &self,
     name: &[u8],

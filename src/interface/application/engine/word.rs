@@ -61,8 +61,7 @@ fn single_field_expansion(node: Node<'_>, source: &[u8]) -> bool {
       .is_none_or(|parameter| lexical(parameter, source) != b"@")
 }
 
-/// The fields with unknown expansions; the flag guarantees exactly one field
-/// regardless of expansion values, IFS or directory contents.
+/// The flag guarantees one field regardless of expansions, IFS or directory contents.
 pub(in crate::interface::application::engine) fn syntax_fields(
   node: Node<'_>,
   source: &[u8],
@@ -106,8 +105,7 @@ pub(in crate::interface::application::engine) struct Fragment {
 }
 
 impl Fragment {
-  /// Unsplit bytes and quotes keep a field even when every other part of
-  /// the word expands to nothing.
+  /// Even empty quotes preserve a field.
   fn guarantees_field(&self) -> bool {
     self.quoted || (!self.split && !self.bytes.is_empty())
   }
@@ -606,8 +604,6 @@ impl Word {
     Ok(fields)
   }
 
-  /// The run after the leading fields shares `value` as its constraint; its
-  /// minimum count comes from the fragments that the leading fields leave.
   fn unknown_fields(
     &self,
     range: Range<usize>,
@@ -639,9 +635,8 @@ impl Word {
     fields
   }
 
-  /// Leading bytes that neither unknown values nor pathname expansion can
-  /// change keep the fields they complete and begin the field they leave
-  /// open; the rest starts at the returned index.
+  /// Fields unaffected by unknown expansions or globbing, the remaining fragment
+  /// index, and whether the last field stays open.
   fn leading_fields(
     &self,
     range: Range<usize>,
@@ -688,8 +683,7 @@ impl Word {
       .expect("fields without splitting")
   }
 
-  /// The returned flag tells whether bytes after the word continue its last
-  /// field.
+  /// The flag means following bytes continue the last field.
   pub fn split(
     &self,
     ifs: &Value,
@@ -1379,6 +1373,68 @@ impl Pattern {
       old = next;
     }
     old
+  }
+
+  pub(in crate::interface::application::engine) fn start(
+    &self,
+    reversed: bool,
+  ) -> Vec<usize> {
+    self.closure(vec![0], reversed)
+  }
+
+  fn closure(&self, mut states: Vec<usize>, reversed: bool) -> Vec<usize> {
+    let mut seen = vec![false; self.atoms.len() + 1];
+    while let Some(next) = states.pop() {
+      if std::mem::replace(&mut seen[next], true) {
+        continue;
+      }
+      if next < self.atoms.len() && *self.atom(next, reversed) == Atom::Star {
+        states.push(next + 1);
+      }
+    }
+    seen
+      .into_iter()
+      .enumerate()
+      .filter_map(|(index, present)| present.then_some(index))
+      .collect()
+  }
+
+  fn atom(&self, index: usize, reversed: bool) -> &Atom {
+    &self.atoms[if reversed {
+      self.atoms.len() - 1 - index
+    } else {
+      index
+    }]
+  }
+
+  pub(in crate::interface::application::engine) fn advance(
+    &self,
+    states: &[usize],
+    byte: u8,
+    reversed: bool,
+  ) -> Vec<usize> {
+    let next = states
+      .iter()
+      .filter_map(|index| {
+        if *index == self.atoms.len() {
+          return None;
+        }
+        let atom = self.atom(*index, reversed);
+        if *atom == Atom::Star {
+          Some(*index)
+        } else {
+          atom.accepts(char::from(byte)).then_some(index + 1)
+        }
+      })
+      .collect();
+    self.closure(next, reversed)
+  }
+
+  pub(in crate::interface::application::engine) fn accepts_end(
+    &self,
+    states: &[usize],
+  ) -> bool {
+    states.last() == Some(&self.atoms.len())
   }
 
   pub(in crate::interface::application::engine) fn remove(

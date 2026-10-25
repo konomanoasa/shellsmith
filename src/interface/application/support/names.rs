@@ -132,7 +132,6 @@ impl Application {
     )
   }
 
-  /// Name sites at `offset`, or `None` when no document is open at `path`.
   pub(in crate::interface::application) fn name_sites(
     &self,
     collection: &NameCollection,

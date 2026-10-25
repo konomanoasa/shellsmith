@@ -394,13 +394,20 @@ impl Workspace {
     staged.changed();
     staged.index_document(request.entry.document, request.limits, cancelled)?;
     let arena = typed_arena::Arena::new();
-    let mut result = engine::analysis::analyze(
+    let result = engine::analysis::analyze(
       &mut staged,
       request,
       &arena,
       inputs,
       cancelled,
-    )?;
+    );
+    let mut result = match result {
+      Err(Error::AnalysisLimit) => {
+        self.clear_analysis();
+        return Err(Error::AnalysisLimit);
+      }
+      result => result?,
+    };
     staged.prune_derived(result.request().entry.document, &result.derived);
     result.synchronize(&staged);
     check_cancelled(cancelled)?;

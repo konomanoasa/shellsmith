@@ -4,7 +4,7 @@ use tree_sitter::Node;
 
 use super::super::execution::{Environment, Flow, Transfer, alternative};
 use super::super::execution::{children, damage_outside};
-use super::super::expansion::{Argument, positional_arguments};
+use super::super::expansion::{Argument, Sharing};
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::word;
 use crate::interface::application::engine::workspace::parser;
@@ -17,6 +17,7 @@ use crate::interface::application::engine::{
 enum ArgumentUse {
   Effects,
   Values,
+  Fields,
   Command,
 }
 
@@ -35,7 +36,11 @@ fn argument_use(
     let resolution =
       Resolver::command_resolution(&command.value, env, suppress);
     if !resolution.candidates.is_empty() {
-      return ArgumentUse::Values;
+      return if resolution.alternatives.contains(&Alternative::Builtin) {
+        ArgumentUse::Values
+      } else {
+        ArgumentUse::Fields
+      };
     }
     if !resolution.alternatives.contains(&Alternative::Builtin) {
       return ArgumentUse::Effects;
@@ -45,7 +50,10 @@ fn argument_use(
     };
     if name != b"command" {
       if super::arguments::numeric_argument(name) {
-        let fields = words.filter(|arg| arg.count.boundary().is_ok()).count()
+        let fields = words
+          .clone()
+          .filter(|arg| arg.count.boundary().is_ok())
+          .count()
           + arguments
             .iter()
             .filter(|node| word::has_guaranteed_field(**node, source))
@@ -53,6 +61,20 @@ fn argument_use(
         if fields > 1 {
           return ArgumentUse::Effects;
         }
+      }
+      let first = words
+        .as_slice()
+        .first()
+        .map(|arg| arg.value.clone())
+        .or_else(|| {
+          arguments
+            .first()
+            .map(|node| word::literal_value(*node, source))
+        });
+      if (name == b"set" && first == Some(Value::Literal(b"--".to_vec())))
+        || (name == b"echo" && env.io.output.is_some())
+      {
+        return ArgumentUse::Fields;
       }
       return if super::builtins::uses_arguments(name) || env.io.output.is_some()
       {
@@ -188,7 +210,6 @@ impl<'a> Resolver<'a> {
     self.expand_call(command, call, env)
   }
 
-  /// Expands `node` after the words of `call` before classifying the rest.
   fn expand_call(
     &mut self,
     node: Node<'a>,
@@ -201,7 +222,7 @@ impl<'a> Resolver<'a> {
       words,
       env,
       call.frame,
-      false,
+      Sharing::None,
       Box::new(move |resolver, words, env| {
         resolver.command_arguments(CallArguments { words, ..call }, env)
       }),
@@ -229,12 +250,19 @@ impl<'a> Resolver<'a> {
           call.frame,
         )
         .is_empty();
+    let source = self.workspace.source(call.frame.snapshot.document);
+    let usage = argument_use(&call.words, &call.arguments, source, &env);
+    let shared = if !shared {
+      Sharing::None
+    } else if matches!(usage, ArgumentUse::Fields) {
+      Sharing::Fields
+    } else {
+      Sharing::Assignments
+    };
     if !env.alternatives.is_empty() {
-      let source = self.workspace.source(call.frame.snapshot.document);
-      let usage = argument_use(&call.words, &call.arguments, source, &env);
       let needed = call.arguments.iter().copied().enumerate().filter_map(
         |(index, argument)| {
-          (matches!(usage, ArgumentUse::Values)
+          (matches!(usage, ArgumentUse::Values | ArgumentUse::Fields)
             || (matches!(usage, ArgumentUse::Command) && index == 0)
             || (!matches!(usage, ArgumentUse::Command)
               && !self.expansion_targets([argument], call.frame).is_empty()))
@@ -244,11 +272,16 @@ impl<'a> Resolver<'a> {
       let needed: Vec<_> = needed.collect();
       let mut names = BTreeSet::new();
       for argument in needed {
-        if !shared {
+        if shared == Sharing::None {
           names.extend(self.value_dependencies([argument], call.frame));
           continue;
         }
-        match self.conditional_value(argument, &env, call.frame) {
+        match self.conditional_value(
+          argument,
+          &env,
+          call.frame,
+          shared == Sharing::Fields,
+        ) {
           Ok(Some(_)) => {}
           Ok(None) => {
             names.extend(self.value_dependencies([argument], call.frame));
@@ -259,8 +292,8 @@ impl<'a> Resolver<'a> {
           }
         }
       }
-      if env.alternatives.choice(&names).is_some() {
-        return self.each_alternative(env, names, move |resolver, env| {
+      if env.alternatives.depends(&names) {
+        return self.each_alternative(env, &names, move |resolver, env| {
           resolver.command_arguments(call.clone(), env)
         });
       }
@@ -721,8 +754,7 @@ impl<'a> Resolver<'a> {
     let name = name.clone();
     let args = args.to_vec();
     let mut call = env.clone();
-    call.alternatives.forget_positionals();
-    call.positional = positional_arguments(&args);
+    call.set_positionals(&args);
     self
       .invoke_candidates(node, candidates, &call, Flow::default(), frame)
       .then(move |resolver, mut flow| {
@@ -776,7 +808,7 @@ impl<'a> Resolver<'a> {
 
   /// Output is known only for standard utilities that `command -p` selects.
   fn external_command(
-    &self,
+    &mut self,
     node: Node<'_>,
     name: &Value,
     args: &[Argument<'_>],
@@ -784,19 +816,18 @@ impl<'a> Resolver<'a> {
     search: Search,
     frame: Frame,
   ) -> Environment {
-    let limit = self.result.request.limits.value_bytes;
     let standard = match name {
       Value::Literal(name) if search == Search::Standard => Some(name),
       _ => None,
     };
-    let (output, trace) = match standard {
+    let (output, trace, expression) = match standard {
       Some(name) => self.utility_output(node, name, args, &env, frame),
       None if search == Search::Standard => {
-        (Value::Unknown(ValueIssue::Dynamic), None)
+        (Value::Unknown(ValueIssue::Dynamic), None, None)
       }
-      None => (Value::Unknown(ValueIssue::UnsupportedExpansion), None),
+      None => (Value::Unknown(ValueIssue::UnsupportedExpansion), None, None),
     };
-    env.emit(output, trace, limit);
+    self.emit(&mut env, output, trace, expression);
     if !standard.is_some_and(|name| super::builtins::preserves_input(name)) {
       env.io.consume_input(None);
     }
@@ -979,7 +1010,7 @@ impl<'a> Resolver<'a> {
         self.argument_role(&arg, None, frame);
       }
     }
-    env.emit(output, None, self.result.request.limits.value_bytes);
+    self.emit(&mut env, output, None, None);
     self.non_source(node, frame);
     env.set_status(Value::Unknown(ValueIssue::Dynamic));
     Task::Done(Flow::next(env))
@@ -1320,14 +1351,12 @@ pub(super) enum Search {
   Standard,
 }
 
-/// Command search can find nothing but the built-in utility.
 pub(super) fn only_builtin(resolution: &Resolution) -> bool {
   resolution.candidates.is_empty()
     && resolution.issues.is_empty()
     && resolution.alternatives == [Alternative::Builtin].into()
 }
 
-/// Command search may find a utility whose effects are unknown.
 pub(super) fn unknown_utility(resolution: &Resolution) -> bool {
   !resolution.issues.is_empty()
     || resolution.alternatives.contains(&Alternative::External)

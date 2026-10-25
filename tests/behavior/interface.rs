@@ -28,6 +28,61 @@ mod lsp {
   }
 
   #[tokio::test]
+  async fn analysis_limit_returns_syntax_rejects_complete_requests_and_recovers_after_edit()
+   {
+    let fixture = Fixture::new();
+    let source = "f() { :; }\nf\n";
+    let path = fixture.write("main.sh", source);
+    let uri = Url::from_file_path(&path).unwrap().to_string();
+    let mut settings = Settings::new(fixture.root.clone());
+    settings.initial =
+      shellsmith::interface::application::engine::InitialEnvironment::empty();
+    settings.limits.work = 200;
+    let mut server = Client::new(settings);
+    initialize(&mut server, true).await;
+    server.notify("textDocument/didOpen",json!({"textDocument":{"uri":uri,"languageId":"sh","version":1,"text":source}})).await;
+    let tokens = decoded(
+      &request(&mut server, "textDocument/semanticTokens/full", &uri).await,
+    );
+    assert!(tokens.contains(&(1, 0, 1, 7, 0)), "{tokens:?}");
+    let large = format!("{source}{}", ":\n".repeat(512));
+    server.notify("textDocument/didChange",json!({"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":large}]})).await;
+    let tokens = decoded(
+      &request(&mut server, "textDocument/semanticTokens/full", &uri).await,
+    );
+    assert!(
+      !tokens.iter().any(|token| token.0 == 1 && token.3 == 7),
+      "{tokens:?}"
+    );
+    assert_ne!(tokens, []);
+    let params = json!({"textDocument":{"uri":uri},"position":{"line":1,"character":0},"context":{"includeDeclaration":true},"newName":"renamed"});
+    for method in [
+      "textDocument/definition",
+      "textDocument/references",
+      "textDocument/prepareRename",
+      "textDocument/rename",
+    ] {
+      let response = server.request(method, params.clone()).await;
+      assert_eq!(response["error"]["code"], -32803, "{method}: {response}");
+      assert_eq!(
+        response["error"]["message"],
+        "Analysis resource limit reached"
+      );
+    }
+    assert!(
+      request(&mut server, "textDocument/documentSymbol", &uri).await["result"]
+        .is_array()
+    );
+    server.notify("textDocument/didChange",json!({"textDocument":{"uri":uri,"version":3},"contentChanges":[{"text":source}]})).await;
+    let tokens = decoded(
+      &request(&mut server, "textDocument/semanticTokens/full", &uri).await,
+    );
+    assert!(tokens.contains(&(1, 0, 1, 7, 0)), "{tokens:?}");
+    let response = server.request("textDocument/references", params).await;
+    assert_eq!(response["result"].as_array().unwrap().len(), 2);
+  }
+
+  #[tokio::test]
   async fn malformed_messages_are_rejected_without_stopping_later_requests() {
     let fixture = Fixture::new();
     let mut server = Client::new(Settings::new(fixture.root.clone()));

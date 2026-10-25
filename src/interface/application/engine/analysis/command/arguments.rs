@@ -97,8 +97,7 @@ pub(super) fn argument_roles(
     .collect()
 }
 
-/// The index of the first operand of a utility whose only option is a
-/// leading `--` (XCU 1.4).
+/// For utilities accepting only a leading `--` (XCU 1.4).
 pub(in crate::interface::application::engine::analysis) fn operand_index(
   args: &[Argument<'_>],
 ) -> usize {
@@ -120,8 +119,7 @@ pub(in crate::interface::application::engine::analysis) fn syntax_arguments<
     .collect()
 }
 
-/// The first field of the command word names the command; its other fields
-/// precede the operands.
+/// Extra fields of the command word precede its operands.
 pub(super) fn syntax_command<'a>(
   node: Node<'a>,
   command: Node<'a>,
@@ -365,7 +363,6 @@ pub(super) fn unset_options(
   Some((index, namespace == Some(b'f'), namespace.is_some()))
 }
 
-/// Rejects unknown options and `-p` followed by operands.
 pub(super) fn declaration_operands(args: &[Argument<'_>]) -> Option<usize> {
   let mut print = false;
   let mut index = 0;
@@ -403,9 +400,7 @@ pub(super) struct ReadOptions {
   pub delimiter: bool,
 }
 
-/// Returns `None` if options leave operand positions uncertain or no var
-/// operand follows them (XCU read requires one; shells accepting none choose
-/// the variables they assign).
+/// XCU read requires a variable operand; shells accepting none choose the target.
 pub(super) fn read_options(args: &[Argument<'_>]) -> Option<ReadOptions> {
   let mut options = ReadOptions {
     operands: 0,

@@ -185,6 +185,7 @@ pub enum Error {
   InvalidEncoding { byte: usize },
   SourceTooLarge,
   Cancelled,
+  AnalysisLimit,
   Parser(String),
   StaleSnapshot(Snapshot),
   UnknownDocument(DocumentId),
@@ -204,6 +205,9 @@ impl fmt::Display for Error {
       }
       Self::SourceTooLarge => formatter.write_str("Source exceeds u32 bytes"),
       Self::Cancelled => formatter.write_str("Analysis cancelled"),
+      Self::AnalysisLimit => {
+        formatter.write_str("Analysis resource limit reached")
+      }
       Self::Parser(message)
       | Self::InvalidAnalysis(message)
       | Self::Input(message) => formatter.write_str(message),

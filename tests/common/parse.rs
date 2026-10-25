@@ -102,7 +102,6 @@ pub fn analyze_with(
   analyze_document(document, initial)
 }
 
-/// Analyzes a source that must contain syntax errors.
 pub fn analyze_damaged(source: &str) -> (Workspace, Analysis) {
   let document = parse(1, 1, source);
   assert!(document.has_syntax_errors(), "{source}");

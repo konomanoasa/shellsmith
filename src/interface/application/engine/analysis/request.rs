@@ -1,7 +1,10 @@
 use crate::interface::application::engine::{
   Error, Snapshot, SourceDocument, SourceInput, ValueIssue,
 };
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 
 /// Supplies immutable snapshots and stable results for each complete query during an analysis.
 /// Providers own input acquisition and caching, including unresolved and failed lookups.
@@ -98,14 +101,20 @@ impl InitialEnvironment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnalysisLimits {
   pub value_bytes: usize,
+  /// Deterministic evaluation steps, including condition and byte processing.
+  pub work: usize,
+  /// Cumulative storage charges for analysis data and memo tables, not process RSS.
+  pub storage_bytes: usize,
 }
 
 impl AnalysisLimits {
   pub(in crate::interface::application::engine) fn validate(
     self,
   ) -> Result<(), Error> {
-    if self.value_bytes == 0 {
-      return Err(Error::InvalidAnalysis("Value size must be positive".into()));
+    if self.value_bytes == 0 || self.work == 0 || self.storage_bytes == 0 {
+      return Err(Error::InvalidAnalysis(
+        "Analysis limits must be positive".into(),
+      ));
     }
     Ok(())
   }
@@ -115,6 +124,63 @@ impl Default for AnalysisLimits {
   fn default() -> Self {
     Self {
       value_bytes: 1024 * 1024,
+      work: 2_000_000,
+      storage_bytes: 64 * 1024 * 1024,
+    }
+  }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct Budget(Rc<Usage>);
+
+#[derive(Debug)]
+struct Usage {
+  work: Cell<usize>,
+  storage: Cell<usize>,
+  exhausted: Cell<bool>,
+}
+
+impl Default for Budget {
+  fn default() -> Self {
+    Self::new(AnalysisLimits::default())
+  }
+}
+
+impl Budget {
+  pub(super) fn new(limits: AnalysisLimits) -> Self {
+    Self(Rc::new(Usage {
+      work: Cell::new(limits.work),
+      storage: Cell::new(limits.storage_bytes),
+      exhausted: Cell::new(false),
+    }))
+  }
+
+  fn consume(&self, remaining: &Cell<usize>, amount: usize) {
+    if let Some(left) = remaining.get().checked_sub(amount) {
+      remaining.set(left);
+    } else {
+      self.0.exhausted.set(true);
+    }
+  }
+
+  pub(super) fn work(&self, amount: usize) {
+    self.consume(&self.0.work, amount);
+  }
+
+  pub(super) fn retain(&self, bytes: usize) {
+    self.consume(&self.0.storage, bytes);
+  }
+
+  pub(super) fn exhausted(&self) -> bool {
+    self.0.exhausted.get()
+  }
+
+  pub(super) fn check(&self, cancelled: &AtomicBool) -> Result<(), Error> {
+    crate::interface::application::engine::check_cancelled(cancelled)?;
+    if self.0.exhausted.get() {
+      Err(Error::AnalysisLimit)
+    } else {
+      Ok(())
     }
   }
 }

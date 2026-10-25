@@ -214,7 +214,6 @@ impl<'a> Resolver<'a> {
     self.source_document(node, args, env, frame, reference, target)
   }
 
-  /// Evaluates a loaded `.` file in the current environment.
   fn source_document(
     &mut self,
     node: Node<'a>,
@@ -249,9 +248,7 @@ impl<'a> Resolver<'a> {
     let root = document.tree.root_node();
     let empty =
       root.child_by_field_name("commands").is_none() && !root.has_error();
-    // XCU dot defines only the file operand. Further operands may replace the
-    // positional parameters (a KornShell extension), and restoring them
-    // afterwards differs between shells.
+    // Extra dot operands may replace positionals; restoration varies by shell.
     let arguments = args.len() > operand_index(args) + 1;
     if arguments {
       self.invalidate(

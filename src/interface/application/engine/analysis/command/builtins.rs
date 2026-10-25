@@ -1,6 +1,7 @@
 use super::super::deferred::OutputTrace;
 use super::super::execution::{
-  Binding, Environment, Flow, OptionCursor, StateKey, Transfer, alternative,
+  ALWAYS, Binding, Environment, Flow, NEVER, OptionCursor, StateKey, Transfer,
+  ValueId, Values, alternative,
 };
 use super::super::expansion::{Argument, positional_arguments};
 use super::super::{BindingOrigin, Frame, Resolver, Task};
@@ -14,9 +15,9 @@ use crate::interface::application::engine::valid_name;
 use crate::interface::application::engine::word;
 use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
-  Access, Alternative, ArgumentKind, DerivedOrigin, EffectTarget, InputQuery,
-  InputResult, OccurrenceId, OriginMapping, OriginPart, ResolutionIssue,
-  SymbolId, UseSite, Value, ValueIssue,
+  Access, Alternative, ArgumentKind, DerivedOrigin, EffectTarget, Error,
+  InputQuery, InputResult, OccurrenceId, OriginMapping, OriginPart,
+  ResolutionIssue, SymbolId, UseSite, Value, ValueIssue,
 };
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -56,13 +57,19 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    if (name == b"shift" && decimal_value::<usize>(&args) != Some(0))
+    if (name == b"shift"
+      && decimal_value::<usize>(&args) != Some(0)
+      && env
+        .positional
+        .fields
+        .iter()
+        .any(|(_, count)| count.boundary().is_err()))
       || (name == b"getopts" && args.len() == 2)
     {
       let names = BTreeSet::from([StateKey::Positionals]);
-      if env.alternatives.choice(&names).is_some() {
+      if env.alternatives.depends(&names) {
         let name = name.to_vec();
-        return self.each_alternative(env, names, move |resolver, env| {
+        return self.each_alternative(env, &names, move |resolver, env| {
           resolver.utility(node, &name, args.clone(), env, frame)
         });
       }
@@ -102,8 +109,9 @@ impl<'a> Resolver<'a> {
       self.non_source(node, frame);
     }
     if env.io.output.is_some() {
-      let (output, trace) = self.utility_output(node, name, &args, &env, frame);
-      env.emit(output, trace, self.result.request.limits.value_bytes);
+      let (output, trace, expression) =
+        self.utility_output(node, name, &args, &env, frame);
+      self.emit(&mut env, output, trace, expression);
       if env.io.stderr_captured
         && let Some(output) = &mut env.io.output
       {
@@ -195,16 +203,14 @@ impl<'a> Resolver<'a> {
         );
       };
       if option == b"--" {
-        env.alternatives.forget_positionals();
-        env.positional = positional_arguments(arguments.as_slice());
+        env.set_positionals(arguments.as_slice());
         return Flow::next(env);
       }
       if !matches!(option.first(), Some(b'-' | b'+')) {
         let rest = std::iter::once(argument.clone())
           .chain(arguments.cloned())
           .collect::<Vec<_>>();
-        env.alternatives.forget_positionals();
-        env.positional = positional_arguments(&rest);
+        env.set_positionals(&rest);
         return Flow::next(env);
       }
       env.special.remove(b"-".as_slice());
@@ -727,10 +733,41 @@ impl Resolver<'_> {
     } else {
       decimal_value::<usize>(args)
     };
+    let mut shared = None;
+    if let Some(count) = count
+      && count <= env.positional.fields.len()
+      && env
+        .positional
+        .fields
+        .iter()
+        .all(|(_, count)| count.boundary().is_ok())
+      && env
+        .alternatives
+        .depends(&BTreeSet::from([StateKey::Positionals]))
+    {
+      let fields = (count..env.positional.fields.len())
+        .map(|index| {
+          env
+            .alternatives
+            .positional(&env, index, self.cancelled)
+            .map(|value| (value.expect("fixed field"), word::FieldCount::One))
+        })
+        .collect::<Result<Vec<_>, _>>();
+      match fields {
+        Ok(fields) => shared = Some(fields),
+        Err(error) => {
+          self.error = Some(error);
+          return Flow::default();
+        }
+      }
+    }
     if count != Some(0) {
       env.alternatives.forget_positionals();
     }
     if count.is_some_and(|count| env.positional.shift(count)) {
+      if let Some(fields) = shared {
+        env.alternatives.store_positionals(fields);
+      }
       env.set_status(Value::Literal(b"0".to_vec()));
     } else {
       let issue = argument_issue(args)
@@ -1075,6 +1112,121 @@ fn exit_status(args: &[Argument<'_>], previous: Value) -> Value {
 
 impl Resolver<'_> {
   pub(super) fn utility_output(
+    &mut self,
+    node: Node<'_>,
+    name: &[u8],
+    args: &[Argument<'_>],
+    env: &Environment,
+    frame: Frame,
+  ) -> (Value, Option<OutputTrace>, Option<ValueId>) {
+    if !args.iter().any(|arg| arg.expression.is_some()) {
+      let (value, trace) = self.concrete_output(node, name, args, env, frame);
+      return (value, trace, None);
+    }
+    let result = (|| {
+      let mut values = env.alternatives.expressions();
+      let roots = args
+        .iter()
+        .map(|arg| {
+          arg
+            .expression
+            .unwrap_or_else(|| values.literal(Arc::new(arg.value.clone())))
+        })
+        .collect::<Vec<_>>();
+      let limit = self.result.request.limits.value_bytes;
+      let shared = if name == b"echo"
+        && args.iter().all(|arg| arg.count.boundary().is_ok())
+      {
+        shared_echo(&mut values, &roots, limit, self.cancelled)?
+      } else {
+        None
+      };
+      let id = if let Some(id) = shared {
+        id
+      } else {
+        let mut result = values.literal(Arc::new(Value::Literal(Vec::new())));
+        for (input, guard) in
+          values.combinations(&roots, ALWAYS, self.cancelled)?
+        {
+          let mut args = args.to_vec();
+          for (arg, value) in args.iter_mut().zip(input) {
+            arg.value = value.as_ref().clone();
+            arg.expression = None;
+          }
+          let value = output(name, &args, env, limit, &mut |_, _, _| {});
+          let id = values.literal(Arc::new(value));
+          result = values.select(guard, id, result);
+        }
+        result
+      };
+      Ok::<_, Error>((
+        values.projected(id, self.cancelled)?.as_ref().clone(),
+        id,
+      ))
+    })();
+    match result {
+      Ok((value, id)) => {
+        let (_, trace) = self.concrete_output(node, name, args, env, frame);
+        (value, trace, Some(id))
+      }
+      Err(error) => {
+        self.error = Some(error);
+        (Value::Unknown(ValueIssue::Dynamic), None, None)
+      }
+    }
+  }
+
+  pub(super) fn emit(
+    &mut self,
+    env: &mut Environment,
+    value: Value,
+    trace: Option<OutputTrace>,
+    expression: Option<ValueId>,
+  ) {
+    if env.io.stdout_redirected || env.io.output.is_none() {
+      return;
+    }
+    let previous = env.io.output.as_ref().and_then(|output| output.expression);
+    let limit = self.result.request.limits.value_bytes;
+    if expression.is_none() && previous.is_none() {
+      env.emit(value, trace, limit);
+      return;
+    }
+    let before = env.alternatives.output(env);
+    let next = expression.unwrap_or_else(|| {
+      env
+        .alternatives
+        .expressions()
+        .literal(Arc::new(value.clone()))
+    });
+    let result = (|| {
+      let mut values = env.alternatives.expressions();
+      let Some(id) = values.concat(before, next, self.cancelled)? else {
+        return Ok(None);
+      };
+      if values.maximum(id).is_none_or(|size| size > limit) {
+        return Ok(None);
+      }
+      Ok::<_, Error>(Some((
+        id,
+        values.projected(id, self.cancelled)?.as_ref().clone(),
+      )))
+    })();
+    env.emit(value, trace, limit);
+    match result {
+      Ok(Some((id, value))) => {
+        let output = env.io.output.as_mut().expect("captured output");
+        let trace = output.trace();
+        *output = super::super::execution::Output::default();
+        output.append(value, trace, limit);
+        output.expression = Some(id);
+      }
+      Ok(None) => {}
+      Err(error) => self.error = Some(error),
+    }
+  }
+
+  fn concrete_output(
     &self,
     node: Node<'_>,
     name: &[u8],
@@ -1120,6 +1272,44 @@ impl Resolver<'_> {
       .and_then(|bytes| trace?.matching(bytes));
     (value, trace)
   }
+}
+
+fn shared_echo(
+  values: &mut Values,
+  args: &[ValueId],
+  limit: usize,
+  cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Option<ValueId>, Error> {
+  let maximum = args.iter().try_fold(args.len().max(1), |size, id| {
+    size.checked_add(values.maximum(*id)?)
+  });
+  if maximum.is_none_or(|size| size > limit) {
+    return Ok(None);
+  }
+  let mut issue = NEVER;
+  let mut result = values.literal(Arc::new(Value::Literal(Vec::new())));
+  let space = values.literal(Arc::new(Value::Literal(b" ".to_vec())));
+  for (index, arg) in args.iter().enumerate() {
+    if index == 0 {
+      issue = values.equals(*arg, b"-n", cancelled)?;
+    } else {
+      result = values
+        .concat(result, space, cancelled)?
+        .expect("finite echo");
+    }
+    let escaped = values.contains(*arg, b'\\', cancelled)?;
+    issue = values.conditions.or(issue, escaped);
+    result = values
+      .concat(result, *arg, cancelled)?
+      .expect("finite echo");
+  }
+  let newline = values.literal(Arc::new(Value::Literal(b"\n".to_vec())));
+  result = values
+    .concat(result, newline, cancelled)?
+    .expect("finite echo");
+  let unknown =
+    values.literal(Arc::new(Value::Unknown(ValueIssue::Unspecified)));
+  Ok(Some(values.select(issue, unknown, result)))
 }
 
 fn output(

@@ -46,15 +46,12 @@ shellsmith lsp
 
 ### Source annotations
 
-Annotate unresolved source paths.
+For unresolved sources, use an absolute path or one relative to the annotated file.
 
 ```sh
 # shellsmith source="./lib.sh"
 . "$(dirname "$0")/lib.sh"
 ```
-
-Automatic resolution takes precedence. Annotation paths are absolute or relative
-to the directory of the file containing the annotation.
 
 ## License
 

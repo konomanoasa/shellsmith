@@ -30,8 +30,6 @@ impl AnalysisCollection {
 }
 
 impl Application {
-  /// Reloads the workspace once when the inputs it was refreshed from have
-  /// changed since.
   pub(super) fn prepare_workspace_analysis(
     &mut self,
     cancelled: &AtomicBool,
@@ -301,15 +299,21 @@ impl Application {
       .ok_or(engine::Error::UnknownDocument(id))?
       .snapshot();
     let initial = self.initial_environment(id)?;
-    if self.workspace.analysis().is_some_and(|result| {
-      result.request().entry == snapshot && result.request().initial == initial
-    }) {
+    let mut request = AnalysisRequest::new(snapshot);
+    request.initial = initial.clone();
+    request.limits = self.settings.limits;
+    if self.limited.as_ref() == Some(&request) {
+      return Err(engine::Error::AnalysisLimit.into());
+    }
+    if self
+      .workspace
+      .analysis()
+      .is_some_and(|result| result.request() == &request)
+    {
       return Ok(());
     }
     self.share_workspace_documents();
-    let mut request = AnalysisRequest::new(snapshot);
-    request.initial = initial;
-    request.limits = self.settings.limits;
+
     let mut inputs = Inputs {
       opened: &self.opened,
       documents: &self.documents,
@@ -318,7 +322,19 @@ impl Application {
       cache: &mut self.cache,
       cancelled,
     };
-    let result = self.workspace.analyze(request, &mut inputs, cancelled)?;
+    let result =
+      match self
+        .workspace
+        .analyze(request.clone(), &mut inputs, cancelled)
+      {
+        Err(engine::Error::AnalysisLimit) => {
+          self.clear_semantics();
+          self.limited = Some(request);
+          return Err(engine::Error::AnalysisLimit.into());
+        }
+        result => result?,
+      };
+    self.limited = None;
     self.workspace.publish_analysis(result)?;
     self.failures.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(())

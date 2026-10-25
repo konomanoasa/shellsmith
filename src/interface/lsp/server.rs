@@ -399,7 +399,6 @@ impl Server {
     })
   }
 
-  /// Name requests address the document by path at a source offset.
   fn name_query<T: Send + 'static>(
     &self,
     position: &lsp::TextDocumentPositionParams,

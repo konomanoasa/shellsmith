@@ -398,7 +398,6 @@ impl Value {
     }
   }
 
-  /// The join of `values`, or unknown with `issue` when there are none.
   pub(in crate::interface::application::engine) fn join_all(
     values: impl IntoIterator<Item = Self>,
     issue: ValueIssue,
@@ -412,7 +411,6 @@ impl Value {
       .unwrap_or(Self::Unknown(issue))
   }
 
-  /// `cause` explains why the choice is undetermined.
   pub(in crate::interface::application::engine) fn join_choice(
     &mut self,
     other: &Self,

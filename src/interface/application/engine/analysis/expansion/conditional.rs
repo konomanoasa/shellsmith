@@ -19,7 +19,8 @@ impl<'a> Resolver<'a> {
     let Some(name) = node.child_by_field_name("name") else {
       return Ok(None);
     };
-    let Some((result, reads)) = self.conditional_value(node, env, frame)?
+    let Some((result, reads)) =
+      self.conditional_value(node, env, frame, false)?
     else {
       return Ok(None);
     };
@@ -28,7 +29,7 @@ impl<'a> Resolver<'a> {
     let projected = env
       .alternatives
       .expressions()
-      .projected(result)
+      .projected(result, self.cancelled)?
       .as_ref()
       .clone();
     for id in reads {
@@ -47,22 +48,30 @@ impl<'a> Resolver<'a> {
     node: Node<'a>,
     env: &Environment,
     frame: Frame,
+    fields: bool,
   ) -> Result<Option<(ValueId, BTreeSet<OccurrenceId>)>, Error> {
     let source = self.workspace.source(frame.snapshot.document);
-    let (Some(name), Some(body)) = (
-      node.child_by_field_name("name"),
-      node.child_by_field_name("value"),
-    ) else {
-      return Ok(None);
-    };
-    let spelling = word::lexical(name, source);
-    if !valid_name(&spelling)
-      || env.readonly(&spelling).is_some()
-      || node.has_error()
-      || word::transformed(node, source)
-    {
+    if node.has_error() || word::transformed(node, source) {
       return Ok(None);
     }
+    let body = if let Some(name) = node.child_by_field_name("name") {
+      let spelling = word::lexical(name, source);
+      if !valid_name(&spelling) || env.readonly(&spelling).is_some() {
+        return Ok(None);
+      }
+      let Some(body) = node.child_by_field_name("value") else {
+        return Ok(None);
+      };
+      body
+    } else {
+      if !fields
+        || !word::syntax_fields(node, source).1
+        || self.value_dependencies([node], frame).is_empty()
+      {
+        return Ok(None);
+      }
+      node
+    };
     let mut reads = BTreeSet::new();
     Ok(
       self
@@ -81,11 +90,39 @@ impl<'a> Resolver<'a> {
     let Some(id) = self.site(node, frame) else {
       return Ok(None);
     };
+    let source = self.workspace.source(frame.snapshot.document);
+    let name = word::lexical(node, source);
+    if name == b"#"
+      && let Value::Literal(bytes) = env.positional.count()
+    {
+      reads.insert(id);
+      return Ok(Some(
+        env
+          .alternatives
+          .expressions()
+          .literal(Arc::new(Value::Literal(bytes))),
+      ));
+    }
+    if name.iter().all(u8::is_ascii_digit) && !name.is_empty() {
+      let Some(index) = std::str::from_utf8(&name)
+        .ok()
+        .and_then(|name| name.parse::<usize>().ok())
+        .and_then(|index| index.checked_sub(1))
+      else {
+        return Ok(None);
+      };
+      if env.parameter(&name).1 != Some(false) {
+        return Ok(None);
+      }
+      let value = env.alternatives.positional(env, index, self.cancelled)?;
+      if value.is_some() {
+        reads.insert(id);
+      }
+      return Ok(value);
+    }
     if self.variable_value(id, env).is_none() {
       return Ok(None);
     }
-    let source = self.workspace.source(frame.snapshot.document);
-    let name = word::lexical(node, source);
     if !valid_name(&name)
       || (env.nounset != Some(false)
         && env
@@ -197,18 +234,12 @@ impl<'a> Resolver<'a> {
         env
           .alternatives
           .expressions()
-          .apply(
+          .remove(
             value,
-            value,
-            |input, _| {
-              pattern.remove(
-                input,
-                op.starts_with(b"%"),
-                op.len() == 2,
-                utf8,
-                self.cancelled,
-              )
-            },
+            &pattern,
+            op.starts_with(b"%"),
+            op.len() == 2,
+            utf8,
             self.cancelled,
           )
           .map(Some)

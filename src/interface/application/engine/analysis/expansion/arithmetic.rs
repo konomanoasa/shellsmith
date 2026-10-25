@@ -64,6 +64,7 @@ fn result<'a>(number: Number, mut env: Environment) -> Task<'a> {
     env.failure.uncertain(issue);
   }
   Task::expanded(Expansion {
+    expression: None,
     word: Word::value(value, false),
     env,
   })
@@ -415,6 +416,7 @@ impl<'a> Resolver<'a> {
             let mut v = yes.word.scalar();
             v.join_choice(&no.word.scalar(), Some(cause));
             Task::expanded(Expansion {
+              expression: None,
               word: Word::value(v, false),
               env: yes.env,
             })
@@ -439,7 +441,6 @@ impl<'a> Resolver<'a> {
     conflict
   }
 
-  /// Returns the previous order for restoration after evaluation.
   fn unordered(
     &mut self,
     node: Node<'_>,
@@ -543,6 +544,7 @@ impl<'a> Resolver<'a> {
     }
     self.damaged_expansion(node, &mut env, frame);
     Task::expanded(Expansion {
+      expression: None,
       word: Word::unknown(ValueIssue::Recovery),
       env,
     })
@@ -712,6 +714,7 @@ impl<'a> Resolver<'a> {
       [EffectTarget::Variables],
     );
     Task::expanded(Expansion {
+      expression: None,
       word: Word::unknown(issue),
       env,
     })

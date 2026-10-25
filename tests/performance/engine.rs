@@ -79,6 +79,12 @@ fn main() {
       measure("branch_trim", size);
       measure("branch_merges", size);
       measure("branch_loop", size);
+      measure("shared_append", size);
+      measure("shared_trim", size);
+      measure("shared_fields", size);
+      measure("shared_output", size);
+      measure("shared_concrete", size);
+      measure("dynamic_commands", size);
     }
   }
 }
@@ -242,6 +248,21 @@ fn branch_values(case: &str, size: usize) -> String {
   source
 }
 
+fn shared_values(case: &str, size: usize) -> String {
+  let mut source = String::from("P=/bin\n");
+  for index in 0..size {
+    writeln!(source, "if condition; then P=\"$P:a{index:03}\"; fi").unwrap();
+  }
+  source.push_str(match case {
+    "shared_trim" => "x=${P%%:*}\n",
+    "shared_fields" => "set -- start \"$P\"; x=$2\n",
+    "shared_output" => "x=$(command -p echo \"$P\")\n",
+    "shared_concrete" => ". \"$P/lib\"\nx=$?\n",
+    _ => "x=$P\n",
+  });
+  source
+}
+
 fn copied_source(size: usize, output: bool) -> String {
   let mut source = String::from("h0='x=2; '\n");
   for index in 1..=size {
@@ -297,6 +318,12 @@ fn fixture(
     "name_inheritance" => {
       source.push_str("value=1; read name; read \"$name\"\n");
       source.push_str(&"(: \"$value\")\n".repeat(size));
+    }
+    "shared_append" | "shared_trim" | "shared_fields" | "shared_output"
+    | "shared_concrete" => source.push_str(&shared_values(case, size)),
+    "dynamic_commands" => {
+      source.push_str("x=$(unknown)\n");
+      source.push_str(&"\"c$x\"\n".repeat(size));
     }
     "branch_merges" | "branch_loop" => {
       source.push_str(&branch_merges(size, case == "branch_loop"));
@@ -396,7 +423,17 @@ fn measure(case: &str, size: usize) {
   let mut request = AnalysisRequest::new(snapshot(1, 1));
   request.initial = InitialEnvironment::empty();
   let start = Instant::now();
-  let analysis = workspace.analyze(request, &mut inputs, &cancelled).unwrap();
+  let analysis = match workspace.analyze(request, &mut inputs, &cancelled) {
+    Ok(analysis) => analysis,
+    Err(Error::AnalysisLimit) => {
+      println!(
+        "{case}\t{size}\t{parse:.3}\t{index:.3}\t{:.3}\tlimit",
+        start.elapsed().as_secs_f64() * 1000.0
+      );
+      return;
+    }
+    Err(error) => panic!("{error}"),
+  };
   let elapsed = start.elapsed().as_secs_f64() * 1000.0;
   let edges: usize = analysis
     .uses()

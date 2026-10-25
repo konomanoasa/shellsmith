@@ -7,6 +7,7 @@ use super::{Document, Workspace};
 use crate::interface::application::engine::{
   self, Analysis, DocumentId, Location, Occurrence, Snapshot, Value,
 };
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -107,8 +108,12 @@ impl Workspace {
     offset: Option<usize>,
   ) -> BTreeMap<(usize, usize), ProjectedResolution> {
     let analysis = self.analysis();
-    let mut result: BTreeMap<_, ProjectedResolution> = BTreeMap::new();
+    let mut result = BTreeMap::new();
     for group in self.projections(snapshot, analysis) {
+      let Some(first) = group.documents.first() else {
+        continue;
+      };
+      let site = first.key.site.clone();
       let mut projected: BTreeMap<_, ProjectedResolution> = BTreeMap::new();
       for unit in &group.documents {
         for (range, resolution) in
@@ -125,13 +130,15 @@ impl Workspace {
         {
           projected.resolution = None;
         }
-        result
-          .entry(range)
-          .and_modify(|old| old.join(&projected))
-          .or_insert(projected);
+        insert_nested(&mut result, range, &site, projected, |old, new| {
+          old.join(&new);
+        });
       }
     }
     result
+      .into_iter()
+      .map(|(range, (_, projected))| (range, projected))
+      .collect()
   }
 
   fn project_document_resolutions(
@@ -143,11 +150,11 @@ impl Workspace {
     let analysis = self.analysis();
     let mut resolutions: BTreeMap<_, ProjectedResolution> = BTreeMap::new();
     for site in document.occurrences() {
-      for location in
-        syntax_spelling(document, site).iter().flat_map(|location| {
-          self.project_locations_at(location, snapshot, offset)
-        })
-      {
+      for location in self.project_locations_at(
+        &syntax_spelling(document, site),
+        snapshot,
+        offset,
+      ) {
         let resolution = ProjectedResolution::syntax(document, site, analysis);
         resolutions
           .entry((location.bytes.start, location.bytes.end))
@@ -160,9 +167,9 @@ impl Workspace {
       .into_values()
       .filter(|role| role.kind != Some(engine::ArgumentKind::ShellBody))
     {
-      for location in role.selection_locations().flat_map(|location| {
-        self.project_locations_at(location, snapshot, offset)
-      }) {
+      for location in
+        self.project_locations_at(role.selection_locations(), snapshot, offset)
+      {
         resolutions
           .entry((location.bytes.start, location.bytes.end))
           .or_insert_with(|| ProjectedResolution::argument(&role, analysis));
@@ -171,16 +178,15 @@ impl Workspace {
     resolutions
   }
 
-  pub(super) fn project_locations_at(
+  pub(super) fn project_locations_at<'l>(
     &self,
-    location: &Location,
+    locations: impl IntoIterator<Item = &'l Location>,
     snapshot: Snapshot,
     offset: Option<usize>,
   ) -> impl Iterator<Item = Location> {
-    self
-      .project_locations(location)
-      .unwrap_or_default()
+    locations
       .into_iter()
+      .flat_map(|location| self.project_locations(location).unwrap_or_default())
       .filter(move |location| {
         location.snapshot == snapshot
           && offset.is_none_or(|offset| location.bytes.contains(&offset))
@@ -193,14 +199,43 @@ pub(super) struct ProjectedDocuments<'a> {
   pub(super) complete: bool,
 }
 
+/// A unit derived from another unit's text supersedes the names it was
+/// expanded from, as every unit supersedes the syntax of its source.
+fn insert_nested<T>(
+  entries: &mut BTreeMap<(usize, usize), (usize, T)>,
+  range: (usize, usize),
+  site: &DerivedSite,
+  value: T,
+  join: impl FnOnce(&mut T, T),
+) {
+  let width = site.argument.1 - site.argument.0;
+  match entries.entry(range) {
+    Entry::Occupied(mut entry) => {
+      let (previous, old) = entry.get_mut();
+      if width < *previous {
+        *entry.get_mut() = (width, value);
+      } else if width == *previous {
+        join(old, value);
+      }
+    }
+    Entry::Vacant(entry) => {
+      entry.insert((width, value));
+    }
+  }
+}
+
 pub(super) fn projected_semantic_spans(
   document: &Document,
   workspaces: &[&Workspace],
 ) -> Vec<engine::SemanticSpan> {
-  projection_groups(document, workspaces)
-    .into_iter()
-    .flat_map(|(_, units)| projected_units(document, units))
-    .collect()
+  let mut spans = BTreeMap::new();
+  for (site, units) in projection_groups(document, workspaces) {
+    for span in projected_units(document, units) {
+      let range = (span.location.bytes.start, span.location.bytes.end);
+      insert_nested(&mut spans, range, &site, vec![span], Vec::extend);
+    }
+  }
+  spans.into_values().flat_map(|(_, spans)| spans).collect()
 }
 
 type ProjectionUnits<'a> =
@@ -226,7 +261,12 @@ fn projection_groups<'a>(
           || group.documents.iter().any(|unit| {
             analysis.contexts().iter().any(|context| {
               context.location.snapshot == unit.document.snapshot()
-                || matches!(context.kind, engine::ExecutionKind::Deferred(snapshot) | engine::ExecutionKind::Arithmetic(snapshot) if snapshot == unit.document.snapshot())
+                || matches!(
+                  context.kind,
+                  engine::ExecutionKind::Deferred(snapshot)
+                    | engine::ExecutionKind::Arithmetic(snapshot)
+                    if snapshot == unit.document.snapshot()
+                )
             })
           })
       });
@@ -506,6 +546,10 @@ impl ProjectedResolution {
       resolution: argument_resolution(analysis, role),
       attempted: role.context.is_some(),
     }
+  }
+
+  pub(super) fn derived_from(&self, document: DocumentId) -> bool {
+    self.documents.contains(&document)
   }
 
   fn join(&mut self, other: &Self) {

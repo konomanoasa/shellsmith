@@ -16,6 +16,38 @@ impl<'a> Resolver<'a> {
     env: &Environment,
     frame: Frame,
   ) -> Result<Option<Environment>, Error> {
+    let Some(name) = node.child_by_field_name("name") else {
+      return Ok(None);
+    };
+    let Some((result, reads)) = self.conditional_value(node, env, frame)?
+    else {
+      return Ok(None);
+    };
+    let spelling =
+      word::lexical(name, self.workspace.source(frame.snapshot.document));
+    let projected = env
+      .alternatives
+      .expressions()
+      .projected(result)
+      .as_ref()
+      .clone();
+    for id in reads {
+      self.read(id, env, frame);
+    }
+    let mut output = env.clone();
+    if self.write(name, &mut output, frame, false, projected) {
+      let resolution = output.variables.get(&spelling).resolution.clone();
+      output.alternatives.store(&spelling, result, resolution);
+    }
+    Ok(Some(output))
+  }
+
+  pub(in crate::interface::application::engine::analysis) fn conditional_value(
+    &mut self,
+    node: Node<'a>,
+    env: &Environment,
+    frame: Frame,
+  ) -> Result<Option<(ValueId, BTreeSet<OccurrenceId>)>, Error> {
     let source = self.workspace.source(frame.snapshot.document);
     let (Some(name), Some(body)) = (
       node.child_by_field_name("name"),
@@ -32,25 +64,11 @@ impl<'a> Resolver<'a> {
       return Ok(None);
     }
     let mut reads = BTreeSet::new();
-    let Some(result) = self.conditional_word(body, env, frame, &mut reads)?
-    else {
-      return Ok(None);
-    };
-    let projected = env
-      .alternatives
-      .expressions()
-      .projected(result)
-      .as_ref()
-      .clone();
-    for id in reads {
-      self.read(id, env, frame);
-    }
-    let mut output = env.clone();
-    if self.write(name, &mut output, frame, false, projected) {
-      let resolution = output.variables.get(&spelling).resolution.clone();
-      output.alternatives.store(&spelling, result, resolution);
-    }
-    Ok(Some(output))
+    Ok(
+      self
+        .conditional_word(body, env, frame, &mut reads)?
+        .map(|value| (value, reads)),
+    )
   }
 
   fn conditional_variable(
@@ -88,7 +106,7 @@ impl<'a> Resolver<'a> {
   }
 
   fn conditional_word(
-    &self,
+    &mut self,
     node: Node<'a>,
     env: &Environment,
     frame: Frame,
@@ -115,29 +133,12 @@ impl<'a> Resolver<'a> {
           value
         }
         Part::Expansion(node, _) if node.kind() == "parameter_expansion" => {
-          let Some(parameter) = node.child_by_field_name("parameter") else {
-            return Ok(None);
-          };
           let Some(value) =
-            self.conditional_variable(parameter, env, frame, reads)?
+            self.conditional_parameter_value(node, env, frame, reads)?
           else {
             return Ok(None);
           };
-          if let Some(operator) = node.child_by_field_name("operator") {
-            if operator.kind() != "parameter_length_operator" {
-              return Ok(None);
-            }
-            let Some(length) = env
-              .alternatives
-              .expressions()
-              .ascii_length(value, self.cancelled)?
-            else {
-              return Ok(None);
-            };
-            length
-          } else {
-            value
-          }
+          value
         }
         _ => return Ok(None),
       };
@@ -154,6 +155,66 @@ impl<'a> Resolver<'a> {
       result = combined;
     }
     Ok(Some(result))
+  }
+
+  fn conditional_parameter_value(
+    &mut self,
+    node: Node<'a>,
+    env: &Environment,
+    frame: Frame,
+    reads: &mut BTreeSet<OccurrenceId>,
+  ) -> Result<Option<ValueId>, Error> {
+    let source = self.workspace.source(frame.snapshot.document);
+    let Some(parameter) = node.child_by_field_name("parameter") else {
+      return Ok(None);
+    };
+    let Some(value) =
+      self.conditional_variable(parameter, env, frame, reads)?
+    else {
+      return Ok(None);
+    };
+    let Some(operator) = node.child_by_field_name("operator") else {
+      return Ok(Some(value));
+    };
+    match operator.kind() {
+      "parameter_length_operator" => env
+        .alternatives
+        .expressions()
+        .ascii_length(value, self.cancelled),
+      "parameter_pattern_operator" => {
+        let Some(pattern_node) = node.child_by_field_name("pattern") else {
+          return Ok(None);
+        };
+        let utf8 = self.utf8(env);
+        let Ok(pattern) = word::Pattern::word(
+          &word::literal(pattern_node, source),
+          utf8,
+          env.portable_collation(),
+        ) else {
+          return Ok(None);
+        };
+        let op = word::lexical(operator, source);
+        env
+          .alternatives
+          .expressions()
+          .apply(
+            value,
+            value,
+            |input, _| {
+              pattern.remove(
+                input,
+                op.starts_with(b"%"),
+                op.len() == 2,
+                utf8,
+                self.cancelled,
+              )
+            },
+            self.cancelled,
+          )
+          .map(Some)
+      }
+      _ => Ok(None),
+    }
   }
 
   fn conditional_arithmetic(

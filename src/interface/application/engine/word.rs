@@ -1,3 +1,4 @@
+use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{OriginPart, Value, ValueIssue};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -60,12 +61,12 @@ fn single_field_expansion(node: Node<'_>, source: &[u8]) -> bool {
       .is_none_or(|parameter| lexical(parameter, source) != b"@")
 }
 
-/// The field with unknown expansions; the flag guarantees exactly one field
+/// The fields with unknown expansions; the flag guarantees exactly one field
 /// regardless of expansion values, IFS or directory contents.
-pub(in crate::interface::application::engine) fn syntax_field(
+pub(in crate::interface::application::engine) fn syntax_fields(
   node: Node<'_>,
   source: &[u8],
-) -> (Option<Field>, bool) {
+) -> (Vec<Field>, bool) {
   let mut partial = Word::default();
   for part in Parts::new(node, false, source) {
     match part {
@@ -82,20 +83,18 @@ pub(in crate::interface::application::engine) fn syntax_field(
       }
     }
   }
-  let field = partial
+  let fields = partial
     .fields(
       WordContext::Argument,
       &Value::Unknown(ValueIssue::Dynamic),
       false,
     )
-    .ok()
-    .and_then(|mut fields| (fields.len() == 1).then(|| fields.remove(0)));
+    .unwrap_or_default();
   let single = !partial.unknown_fields
-    && field.as_ref().is_some_and(|field| {
-      Pattern::compile(&field.bytes, &field.quoted, true, true)
-        .is_ok_and(|pattern| pattern.is_literal())
-    });
-  (field, single)
+    && fields.len() == 1
+    && Pattern::compile(&fields[0].bytes, &fields[0].quoted, true, true)
+      .is_ok_and(|pattern| pattern.is_literal());
+  (fields, single)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,26 +280,16 @@ impl Word {
 
   pub fn value(value: Value, quoted: bool) -> Self {
     match value {
-      Value::Literal(bytes) => {
-        let len = bytes.len();
-        Self {
-          fragments: vec![Fragment {
-            bytes,
-            source: None,
-            quoted,
-            split: !quoted,
-          }],
-          bytes: len,
-          issue: None,
-          unknown_fields: false,
-          ambiguous_empty: false,
-          breaks: Vec::new(),
-          assignment_issue: None,
-          unknown: BTreeMap::new(),
-          counts: BTreeMap::new(),
-          scalar_value: None,
-        }
-      }
+      Value::Literal(bytes) => Self {
+        bytes: bytes.len(),
+        fragments: vec![Fragment {
+          bytes,
+          source: None,
+          quoted,
+          split: !quoted,
+        }],
+        ..Self::default()
+      },
       value @ (Value::Partial(_) | Value::Unknown(_)) => Self {
         fragments: vec![Fragment {
           bytes: Vec::new(),
@@ -590,34 +579,26 @@ impl Word {
             .unknown
             .keys()
             .any(|index| !part.fragments[*index].quoted);
-        let count = if splitting {
-          let minimum = usize::from((start..end).any(|index| {
-            !self.counts.contains_key(&index)
-              && self.fragments[index].guarantees_field()
-          }));
-          FieldCount::Unknown {
-            minimum,
-            issue: value,
-          }
-        } else {
-          count
-        };
-        fields.push(Field::unknown(Value::Unknown(value), count));
+        let issue = if splitting { value } else { issue };
+        fields.extend(self.unknown_fields(
+          start..end,
+          ifs,
+          utf8,
+          value,
+          issue,
+          splitting,
+        ));
       } else {
         match part.split(ifs, utf8, usize::MAX) {
-          Ok(split) => fields.extend(split),
-          Err(issue) => {
-            let minimum = usize::from(
-              part.fragments.iter().any(Fragment::guarantees_field),
-            );
-            fields.push(Field::unknown(
-              Value::Unknown(issue),
-              FieldCount::Unknown {
-                minimum,
-                issue: part.boundary_issue().unwrap_or(issue),
-              },
-            ));
-          }
+          Ok((split, _)) => fields.extend(split),
+          Err(issue) => fields.extend(self.unknown_fields(
+            start..end,
+            ifs,
+            utf8,
+            issue,
+            part.boundary_issue().unwrap_or(issue),
+            true,
+          )),
         }
       }
       start = end;
@@ -625,12 +606,96 @@ impl Word {
     Ok(fields)
   }
 
+  /// The run after the leading fields shares `value` as its constraint; its
+  /// minimum count comes from the fragments that the leading fields leave.
+  fn unknown_fields(
+    &self,
+    range: Range<usize>,
+    ifs: &Value,
+    utf8: bool,
+    value: ValueIssue,
+    issue: ValueIssue,
+    splitting: bool,
+  ) -> Vec<Field> {
+    let (mut fields, rest, open) =
+      self.leading_fields(range.clone(), ifs, utf8, value);
+    let minimum = if splitting {
+      usize::from((rest..range.end).any(|index| {
+        !self.counts.contains_key(&index)
+          && self.fragments[index].guarantees_field()
+      }))
+    } else {
+      self
+        .part_count(rest..range.end)
+        .map_or(0, FieldCount::minimum)
+    };
+    fields.push(Field::unknown(
+      Value::Unknown(value),
+      FieldCount::Unknown {
+        minimum: minimum.saturating_sub(usize::from(open)),
+        issue,
+      },
+    ));
+    fields
+  }
+
+  /// Leading bytes that neither unknown values nor pathname expansion can
+  /// change keep the fields they complete and begin the field they leave
+  /// open; the rest starts at the returned index.
+  fn leading_fields(
+    &self,
+    range: Range<usize>,
+    ifs: &Value,
+    utf8: bool,
+    issue: ValueIssue,
+  ) -> (Vec<Field>, usize, bool) {
+    let end = |splitting: bool| {
+      range.start
+        + range
+          .clone()
+          .take_while(|index| {
+            let fragment = &self.fragments[*index];
+            !self.counts.contains_key(index)
+              && (fragment.quoted
+                || (!self.unknown.contains_key(index)
+                  && (splitting || !fragment.split)
+                  && !fragment.bytes.iter().any(|byte| b"*?[".contains(byte))))
+          })
+          .count()
+    };
+    [end(true), end(false)]
+      .into_iter()
+      .find_map(|end| {
+        let (mut fields, open) = Self {
+          fragments: self.fragments[range.start..end].to_vec(),
+          unknown: self
+            .unknown
+            .range(range.start..end)
+            .map(|(index, value)| (index - range.start, value.clone()))
+            .collect(),
+          ..Self::default()
+        }
+        .split(ifs, utf8, usize::MAX)
+        .ok()?;
+        if open {
+          fields
+            .last_mut()
+            .expect("open field")
+            .mark_unknown(&Value::Unknown(issue));
+        }
+        Some((fields, end, open))
+      })
+      .expect("fields without splitting")
+  }
+
+  /// The returned flag tells whether bytes after the word continue its last
+  /// field.
   pub fn split(
     &self,
     ifs: &Value,
     utf8: bool,
     maximum: usize,
-  ) -> Result<Vec<Field>, ValueIssue> {
+  ) -> Result<(Vec<Field>, bool), ValueIssue> {
     if let Some(issue) = self.issue {
       return Err(issue);
     }
@@ -722,10 +787,11 @@ impl Word {
         field.quoted.pop();
       }
     }
+    let open = keep && !whitespace;
     if keep {
       fields.push(field);
     }
-    Ok(fields)
+    Ok((fields, open))
   }
 }
 
@@ -849,6 +915,7 @@ pub(in crate::interface::application::engine) struct Parts<'a, 's> {
   source: &'s [u8],
   ready: Vec<Fragment>,
 }
+
 impl<'a, 's> Parts<'a, 's> {
   pub fn new(node: Node<'a>, quoted: bool, source: &'s [u8]) -> Self {
     Self {
@@ -908,6 +975,7 @@ impl<'a, 's> Parts<'a, 's> {
     }
   }
 }
+
 /// `start` indicates whether this chunk begins a line of a `<<-` body.
 fn strip_leading_tabs(bytes: &mut Vec<u8>, mut start: bool) {
   bytes.retain(|byte| {
@@ -964,30 +1032,31 @@ impl Parts<'_, '_> {
     }
     fragment
   }
+
   fn literal(&mut self, node: Node<'_>, quoted: bool) {
     let mut start = node.start_byte();
     for child in node.named_children(&mut node.walk()) {
       if child.kind() == "line_continuation" {
-        let range = start..child.start_byte();
-        self.ready.push(Fragment {
-          bytes: self.source[range.clone()].to_vec(),
-          source: Some(range),
-          quoted,
-          split: false,
-        });
+        self
+          .ready
+          .push(self.text(start..child.start_byte(), quoted));
         start = (child.end_byte() + 1).min(node.end_byte());
       }
     }
-    let range = start..node.end_byte();
-    self.ready.push(Fragment {
+    self.ready.push(self.text(start..node.end_byte(), quoted));
+    self.ready.reverse();
+  }
+
+  fn text(&self, range: Range<usize>, quoted: bool) -> Fragment {
+    Fragment {
       bytes: self.source[range.clone()].to_vec(),
       source: Some(range),
       quoted,
       split: false,
-    });
-    self.ready.reverse();
+    }
   }
 }
+
 impl<'a> Iterator for Parts<'a, '_> {
   type Item = Part<'a>;
   fn next(&mut self) -> Option<Self::Item> {
@@ -998,16 +1067,10 @@ impl<'a> Iterator for Parts<'a, '_> {
       let (node, quoted) = match piece {
         Piece::Node(node, quoted) => (node, quoted),
         Piece::Text(range, quoted) => {
-          return Some(Part::Fragment(self.fragment(Fragment {
-            bytes: self.source[range.clone()].to_vec(),
-            source: Some(range),
-            quoted,
-            split: false,
-          })));
+          return Some(Part::Fragment(self.fragment(self.text(range, quoted))));
         }
       };
-      if crate::interface::application::engine::workspace::parser::damaged(node)
-      {
+      if parser::damaged(node) {
         return Some(Part::Damaged(node));
       }
       let mut protected = quoted;
@@ -1197,7 +1260,8 @@ impl Pattern {
             atoms.push(Atom::Literal('['));
           }
         }
-        // Unquoted backslashes come from expansions and escape the next character.
+        // Unquoted backslashes come from expansions and escape the next
+        // character.
         '\\' => {
           let Some(&(next, false)) = chars.get(i) else {
             return Err(ValueIssue::Unspecified);
@@ -1262,7 +1326,14 @@ impl Pattern {
   /// POSIX leaves leading-dot matches by bracket expressions unspecified.
   fn ambiguous_dot(&self, text: &[char], cancelled: &AtomicBool) -> bool {
     let start = usize::from(self.atoms.first() == Some(&Atom::Star));
-    matches!(self.atoms.get(start), Some(Atom::Class { negated: false, items }) if items.contains(&Item::Character('.')))
+    let dot = match self.atoms.get(start) {
+      Some(Atom::Class {
+        negated: false,
+        items,
+      }) => items.contains(&Item::Character('.')),
+      _ => false,
+    };
+    dot
       && Self::prefixes(&self.atoms[start..], text, false, cancelled)
         .last()
         .copied()
@@ -1357,6 +1428,7 @@ impl Atom {
     }
   }
 }
+
 impl Item {
   fn accepts(&self, c: char) -> bool {
     match self {

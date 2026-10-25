@@ -1,11 +1,12 @@
-use super::super::execution::Environment;
+use super::super::execution::{Environment, children};
 use super::super::expansion::Argument;
 use super::super::{Frame, Resolver};
 use crate::interface::application::engine::word;
 use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
   Access, ArgumentKind, ArgumentRole, AttributeState, ExecutionContextId,
-  Location, Resolution, Snapshot, UseSite, Value, ValueIssue, valid_name,
+  Location, OriginPart, Resolution, Snapshot, UseSite, Value, ValueIssue,
+  valid_name,
 };
 use tree_sitter::Node;
 
@@ -101,9 +102,7 @@ pub(super) fn argument_roles(
 pub(in crate::interface::application::engine::analysis) fn operand_index(
   args: &[Argument<'_>],
 ) -> usize {
-  usize::from(args.first().is_some_and(|arg| {
-    arg.count.boundary().is_ok() && arg.value == Value::Literal(b"--".to_vec())
-  }))
+  usize::from(args.first().and_then(Argument::literal) == Some(b"--"))
 }
 
 pub(in crate::interface::application::engine::analysis) fn syntax_arguments<
@@ -115,17 +114,48 @@ pub(in crate::interface::application::engine::analysis) fn syntax_arguments<
   node
     .child_by_field_name("suffix")
     .into_iter()
-    .flat_map(super::super::execution::children)
+    .flat_map(children)
     .filter(|node| node.kind() == "word")
     .map(|node| syntax_argument(node, source))
     .collect()
+}
+
+/// The first field of the command word names the command; its other fields
+/// precede the operands.
+pub(super) fn syntax_command<'a>(
+  node: Node<'a>,
+  command: Node<'a>,
+  source: &[u8],
+) -> (Value, Vec<Argument<'a>>) {
+  let mut args = syntax_arguments(node, source);
+  let name = syntax_argument(command, source);
+  if name.count.boundary().is_err()
+    && let (fields, _) = word::syntax_fields(command, source)
+    && let [first, rest] = fields.as_slice()
+    && first.count == word::FieldCount::One
+  {
+    args.insert(
+      0,
+      Argument {
+        node: command,
+        value: rest.value(),
+        origins: Vec::new(),
+        count: rest.count,
+        kind: None,
+        expression: None,
+      },
+    );
+    return (first.value(), args);
+  }
+  (name.value, args)
 }
 
 pub(super) fn syntax_argument<'a>(
   node: Node<'a>,
   source: &[u8],
 ) -> Argument<'a> {
-  let (field, boundary_known) = word::syntax_field(node, source);
+  let (mut fields, boundary_known) = word::syntax_fields(node, source);
+  let field = (fields.len() == 1).then(|| fields.remove(0));
   let value = match &field {
     Some(field) if boundary_known => field.value(),
     _ => word::literal_value(node, source),
@@ -143,6 +173,7 @@ pub(super) fn syntax_argument<'a>(
     origins: field.map_or_else(Vec::new, |field| field.origins),
     value,
     kind: None,
+    expression: None,
   }
 }
 
@@ -166,8 +197,9 @@ pub(super) fn classify_arguments(
     b"exec" => {
       let first = operand_index(args);
       if let Some(arg) = args.get_mut(first)
-        && arg.count.boundary().is_ok()
-        && matches!(&arg.value, Value::Literal(name) if !name.is_empty() && (first > 0 || !name.starts_with(b"-")))
+        && arg.literal().is_some_and(|name| {
+          !name.is_empty() && (first > 0 || !name.starts_with(b"-"))
+        })
       {
         arg.kind = Some(ArgumentKind::Command {
           name: arg.value.clone(),
@@ -182,12 +214,13 @@ pub(super) fn classify_arguments(
     b"unset" => {
       if let Some((index, functions, _)) = unset_options(args) {
         for arg in &mut args[index..] {
-          if let Value::Literal(name) = &arg.value
-            && arg.count.boundary().is_ok()
+          if let Some(name) = arg.literal()
             && valid_name(name)
           {
             arg.kind = Some(if functions {
-              ArgumentKind::Function { name: name.clone() }
+              ArgumentKind::Function {
+                name: name.to_vec(),
+              }
             } else {
               variable_role(name, Access::NameReference, false, env)
             });
@@ -200,8 +233,7 @@ pub(super) fn classify_arguments(
         return;
       };
       for arg in &mut args[options.operands..] {
-        if let Value::Literal(name) = &arg.value
-          && arg.count.boundary().is_ok()
+        if let Some(name) = arg.literal()
           && valid_name(name)
         {
           arg.kind = Some(variable_role(name, Access::Write, false, env));
@@ -506,15 +538,14 @@ impl Argument<'_> {
     source: &[u8],
     context: Option<ExecutionContextId>,
   ) -> ArgumentRole {
-    let spelled = self.count.boundary().is_ok()
-      && matches!(word::literal_value(self.node, source), Value::Literal(_));
     let location = Location {
       snapshot,
       bytes: self.node.byte_range(),
     };
     let end = match &kind {
-      Some(ArgumentKind::Variable { name, .. }) => name.len(),
-      _ => usize::MAX,
+      Some(ArgumentKind::Variable { name, .. }) => Some(name.len()),
+      _ => matches!(word::literal_value(self.node, source), Value::Literal(_))
+        .then(|| self.origins.last().map_or(0, |part| part.bytes.end)),
     };
     let spelling = if matches!(&kind, Some(ArgumentKind::Variable { .. }))
       && let Some(name) = self.node.child_by_field_name("name")
@@ -523,17 +554,10 @@ impl Argument<'_> {
         snapshot,
         bytes: name.byte_range(),
       }]
-    } else if spelled {
-      self
-        .origins
-        .iter()
-        .filter_map(|part| {
-          let end = part.bytes.end.min(end);
-          (part.bytes.start < end)
-            .then(|| part.project(part.bytes.start..end))
-            .flatten()
-        })
-        .flatten()
+    } else if let Some(end) = end.filter(|_| self.count.boundary().is_ok()) {
+      OriginPart::project_all(&self.origins, 0..end)
+        .unwrap_or_default()
+        .into_iter()
         .map(|bytes| Location { snapshot, bytes })
         .collect()
     } else {

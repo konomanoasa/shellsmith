@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Value {
   Literal(Vec<u8>),
@@ -16,7 +18,7 @@ pub struct ValueConstraint {
   pub prefix: Vec<u8>,
   pub suffix: Vec<u8>,
   pub minimum: usize,
-  pub required: std::collections::BTreeSet<u8>,
+  pub required: BTreeSet<u8>,
   pub exact: bool,
 }
 
@@ -36,9 +38,19 @@ impl ValueConstraint {
       prefix: Vec::new(),
       suffix: Vec::new(),
       minimum: 0,
-      required: std::collections::BTreeSet::new(),
+      required: BTreeSet::new(),
       exact: false,
     }
+  }
+
+  fn hull_all(choices: impl IntoIterator<Item = Self>) -> Self {
+    choices
+      .into_iter()
+      .reduce(|mut a, b| {
+        a.hull(&b);
+        a
+      })
+      .unwrap_or_else(Self::any)
   }
 
   fn accepts(&self, bytes: &[u8]) -> bool {
@@ -141,8 +153,7 @@ impl Value {
     minimum: usize,
     issue: ValueIssue,
   ) -> Self {
-    let required: std::collections::BTreeSet<_> =
-      prefix.iter().chain(&suffix).copied().collect();
+    let required: BTreeSet<_> = prefix.iter().chain(&suffix).copied().collect();
     let minimum = minimum
       .max(prefix.len())
       .max(suffix.len())
@@ -175,29 +186,24 @@ impl Value {
     }) {
       return Self::Unknown(issue);
     }
-    // First-byte partitions bound loop growth without merging empty and nonempty values.
+    // First-byte partitions bound loop growth without merging empty and
+    // nonempty values.
     let choices = if choices
       .iter()
       .any(|choice| !choice.exact && choice.prefix.is_empty())
     {
       let empty = ValueConstraint::literal(Vec::new());
       let kept = choices.contains(&empty);
-      let hull = choices
-        .into_iter()
-        .filter(|choice| *choice != empty)
-        .reduce(|mut a, b| {
-          a.hull(&b);
-          a
-        })
-        .unwrap_or_else(ValueConstraint::any);
+      let hull = ValueConstraint::hull_all(
+        choices.into_iter().filter(|choice| *choice != empty),
+      );
       if kept && !hull.accepts(&[]) {
         vec![empty, hull]
       } else {
         vec![hull]
       }
     } else {
-      let mut groups =
-        std::collections::BTreeMap::<Option<u8>, ValueConstraint>::new();
+      let mut groups = BTreeMap::<Option<u8>, ValueConstraint>::new();
       for choice in choices {
         groups
           .entry(choice.prefix.first().copied())
@@ -232,14 +238,7 @@ impl Value {
   }
 
   fn hull(&self) -> ValueConstraint {
-    self
-      .constraints()
-      .into_iter()
-      .reduce(|mut a, b| {
-        a.hull(&b);
-        a
-      })
-      .unwrap_or_else(ValueConstraint::any)
+    ValueConstraint::hull_all(self.constraints())
   }
 
   pub(in crate::interface::application::engine) fn known_size(&self) -> usize {
@@ -397,6 +396,20 @@ impl Value {
     if self != other {
       self.join_choice(other, None);
     }
+  }
+
+  /// The join of `values`, or unknown with `issue` when there are none.
+  pub(in crate::interface::application::engine) fn join_all(
+    values: impl IntoIterator<Item = Self>,
+    issue: ValueIssue,
+  ) -> Self {
+    values
+      .into_iter()
+      .reduce(|mut left, right| {
+        left.join(&right);
+        left
+      })
+      .unwrap_or(Self::Unknown(issue))
   }
 
   /// `cause` explains why the choice is undetermined.

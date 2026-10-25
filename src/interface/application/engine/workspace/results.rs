@@ -276,10 +276,8 @@ impl Workspace {
       .document(id)
       .ok_or(Error::UnknownDocument(id))?
       .snapshot();
-    super::AnalysisResults::new(
-      std::iter::once(self).chain(entries.iter().copied()),
-    )
-    .semantic_spans(snapshot)
+    AnalysisResults::new(std::iter::once(self).chain(entries.iter().copied()))
+      .semantic_spans(snapshot)
   }
 
   /// Locations are projected to the requested document.
@@ -381,6 +379,7 @@ impl Workspace {
       })
       .collect()
   }
+
   pub fn resolution_at(
     &self,
     snapshot: Snapshot,
@@ -436,17 +435,18 @@ impl Workspace {
     };
     for site in document.occurrences() {
       if self
-        .project_locations_at(&site.location, snapshot, Some(offset))
+        .project_locations_at([&site.location], snapshot, Some(offset))
         .next()
         .is_none()
       {
         continue;
       }
-      let width = syntax_spelling(document, site)
-        .iter()
-        .flat_map(|location| {
-          self.project_locations_at(location, snapshot, Some(offset))
-        })
+      let width = self
+        .project_locations_at(
+          &syntax_spelling(document, site),
+          snapshot,
+          Some(offset),
+        )
         .map(|location| location.bytes.len())
         .min();
       if let Some(width) = width {
@@ -456,11 +456,12 @@ impl Workspace {
       }
     }
     for role in document.argument_summaries(analysis).into_values() {
-      let width = role
-        .selection_locations()
-        .flat_map(|location| {
-          self.project_locations_at(location, snapshot, Some(offset))
-        })
+      let width = self
+        .project_locations_at(
+          role.selection_locations(),
+          snapshot,
+          Some(offset),
+        )
         .map(|location| location.bytes.len())
         .min();
       if let Some(width) = width {

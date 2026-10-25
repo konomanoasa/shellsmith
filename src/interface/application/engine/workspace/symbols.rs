@@ -249,8 +249,7 @@ impl Workspace {
   pub fn projected_symbols(
     &self,
     id: DocumentId,
-  ) -> impl Iterator<Item = (&Symbol, crate::interface::application::engine::Location)>
-  {
+  ) -> impl Iterator<Item = (&Symbol, Location)> {
     self
       .search_symbol_locations(&[])
       .filter(move |(_, location)| location.snapshot.document == id)
@@ -259,9 +258,7 @@ impl Workspace {
   pub fn search_symbol_locations<'a>(
     &'a self,
     query: &'a [u8],
-  ) -> impl Iterator<
-    Item = (&'a Symbol, crate::interface::application::engine::Location),
-  > {
+  ) -> impl Iterator<Item = (&'a Symbol, Location)> {
     let mut seen = BTreeSet::new();
     self
       .symbol_locations(query)

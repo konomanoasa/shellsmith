@@ -6,12 +6,15 @@ use tree_sitter::{
   StreamingIterator, Tree,
 };
 
+use super::super::analysis::{
+  UnattemptedCommand, invariant_arguments, unattempted_command,
+};
 use crate::interface::application::engine::check_cancelled;
 use crate::interface::application::engine::word;
 use crate::interface::application::engine::{
-  Access, Classification, Context, ContextId, Error, Location, Occurrence,
-  OccurrenceId, OccurrenceKind, Snapshot, Symbol, SymbolId, SymbolKind, Value,
-  ValueIssue,
+  Access, Analysis, ArgumentRole, Classification, Context, ContextId, Error,
+  Location, Occurrence, OccurrenceId, OccurrenceKind, Snapshot, Symbol,
+  SymbolId, SymbolKind, Value, ValueIssue,
 };
 use crate::interface::application::engine::{ReferenceId, SourceReference};
 use std::collections::BTreeMap;
@@ -92,11 +95,8 @@ impl Document {
 
   pub(in crate::interface::application::engine) fn argument_summaries(
     &self,
-    analysis: Option<&crate::interface::application::engine::Analysis>,
-  ) -> BTreeMap<
-    (usize, usize),
-    crate::interface::application::engine::ArgumentRole,
-  > {
+    analysis: Option<&Analysis>,
+  ) -> BTreeMap<(usize, usize), ArgumentRole> {
     let mut roles = analysis.map_or_else(BTreeMap::new, |analysis| {
       analysis.argument_summaries(self.snapshot())
     });
@@ -117,12 +117,12 @@ impl Document {
   pub(in crate::interface::application::engine) fn command_at(
     &self,
     location: &Location,
-  ) -> Option<tree_sitter::Node<'_>> {
+  ) -> Option<Node<'_>> {
     let node = self.tree.root_node().named_descendant_for_byte_range(
       location.bytes.start,
       location.bytes.end,
     )?;
-    std::iter::successors(Some(node), tree_sitter::Node::parent)
+    std::iter::successors(Some(node), Node::parent)
       .find(|node| node.kind() == "simple_command")
   }
 
@@ -130,15 +130,8 @@ impl Document {
   pub(super) fn body_candidates(
     &self,
     cancelled: &AtomicBool,
-  ) -> Result<
-    impl Iterator<
-      Item = (
-        &Occurrence,
-        crate::interface::application::engine::analysis::UnattemptedCommand,
-      ),
-    >,
-    Error,
-  > {
+  ) -> Result<impl Iterator<Item = (&Occurrence, UnattemptedCommand)>, Error>
+  {
     check_cancelled(cancelled)?;
     Ok(
       self
@@ -147,13 +140,13 @@ impl Document {
         .filter(|site| body_candidate(site))
         .filter_map(move |site| {
           let node = self.command_at(&site.location)?;
-          let command = crate::interface::application::engine::analysis::unattempted_command(
+          let command = unattempted_command(
             self.snapshot(),
             node,
             self.source().as_bytes(),
           );
-        Some((site, command))
-      }),
+          Some((site, command))
+        }),
     )
   }
 
@@ -196,9 +189,7 @@ impl Document {
   }
 
   #[must_use]
-  pub fn argument_roles(
-    &self,
-  ) -> &[crate::interface::application::engine::ArgumentRole] {
+  pub fn argument_roles(&self) -> &[ArgumentRole] {
     &self.facts.argument_roles
   }
 
@@ -238,20 +229,20 @@ impl Document {
 
 #[derive(Debug, Default)]
 struct Facts {
-  pub syntax_errors: bool,
-  pub contexts: Vec<Context>,
-  pub occurrences: Vec<Occurrence>,
-  pub symbols: Vec<Symbol>,
-  pub references: Vec<SourceReference>,
-  pub argument_roles: Vec<crate::interface::application::engine::ArgumentRole>,
+  syntax_errors: bool,
+  contexts: Vec<Context>,
+  occurrences: Vec<Occurrence>,
+  symbols: Vec<Symbol>,
+  references: Vec<SourceReference>,
+  argument_roles: Vec<ArgumentRole>,
 }
 
 #[derive(Clone, Copy, Default)]
 struct State {
   context: Option<ContextId>,
-  recovery: bool,
+  excluded: bool,
   transformed: bool,
-  inert: bool,
+  dynamic_arithmetic: bool,
 }
 
 fn extract(
@@ -266,10 +257,13 @@ fn extract(
     check_cancelled(cancelled)?;
     let damaged = damaged(node);
     facts.syntax_errors |= damaged;
-    state.recovery |= damaged;
+    state.excluded |=
+      damaged || matches!(node.kind(), "here_end" | "tilde_expansion");
     state.transformed |=
       matches!(node.kind(), "backquote_substitution" | "here_document_body");
-    state.inert |= matches!(node.kind(), "here_end" | "tilde_expansion");
+    if node.kind() == "arithmetic_expansion" {
+      state.dynamic_arithmetic = dynamic_arithmetic(node);
+    }
     if node == tree.root_node() || structural(node) {
       let id = ContextId {
         snapshot,
@@ -287,17 +281,15 @@ fn extract(
       });
       state.context = Some(id);
     }
-    if !state.recovery && !state.inert {
+    if !state.excluded {
       facts.occurrence(snapshot, node, source, state);
       facts.reference(snapshot, node, source, state);
       if node.kind() == "simple_command"
         && (!state.transformed || !word::transformed(node, source))
       {
-        facts.argument_roles.extend(
-          crate::interface::application::engine::analysis::invariant_arguments(
-            snapshot, node, source,
-          ),
-        );
+        facts
+          .argument_roles
+          .extend(invariant_arguments(snapshot, node, source));
       }
     }
     let mut cursor = node.walk();
@@ -325,6 +317,26 @@ pub(in crate::interface::application::engine) fn command_word(
   node
     .child_by_field_name("name")
     .or_else(|| node.child_by_field_name("word"))
+}
+
+/// Names and roles in such an expansion depend on its expanded text.
+pub(in crate::interface::application::engine) fn dynamic_arithmetic(
+  expansion: Node<'_>,
+) -> bool {
+  let mut pending: Vec<_> =
+    expansion.named_children(&mut expansion.walk()).collect();
+  while let Some(node) = pending.pop() {
+    match node.kind() {
+      "parameter_expansion"
+      | "command_substitution"
+      | "backquote_substitution"
+      | "arithmetic_dynamic_expression"
+      | "parenthesized_arithmetic_dynamic_source"
+      | "arithmetic_expansion" => return true,
+      _ => pending.extend(node.named_children(&mut node.walk())),
+    }
+  }
+  false
 }
 
 pub(in crate::interface::application::engine) fn damaged(
@@ -466,7 +478,9 @@ impl Facts {
       return;
     }
     let name = word::literal_value(command, source);
-    if matches!(&name, Value::Literal(name) if name != b"." && name != b"command")
+    if name
+      .literal()
+      .is_ok_and(|name| name != b"." && name != b"command")
     {
       return;
     }
@@ -536,7 +550,8 @@ impl Facts {
     source: &[u8],
     state: State,
   ) {
-    let Some((kind, access)) = role(node, source) else {
+    let Some((kind, access)) = role(node, source, state.dynamic_arithmetic)
+    else {
       return;
     };
     let Some(context) = state.context else {
@@ -591,7 +606,11 @@ impl Facts {
   }
 }
 
-fn role(node: Node<'_>, source: &[u8]) -> Option<(OccurrenceKind, Access)> {
+fn role(
+  node: Node<'_>,
+  source: &[u8],
+  dynamic_arithmetic: bool,
+) -> Option<(OccurrenceKind, Access)> {
   use OccurrenceKind::{
     Arithmetic, Assignment, Command, DeclarationAssignment, ForVariable,
     FunctionDefinition, PositionalParameter, SpecialParameter,
@@ -634,6 +653,9 @@ fn role(node: Node<'_>, source: &[u8]) -> Option<(OccurrenceKind, Access)> {
     "special_parameter" if parent.kind() == "parameter_expansion" => {
       (SpecialParameter, Access::Read)
     }
+    "arithmetic_variable" if dynamic_arithmetic => {
+      (Arithmetic, Access::Unknown)
+    }
     "arithmetic_variable" => (Arithmetic, arithmetic_access(node, source)),
     _ => return None,
   };
@@ -659,9 +681,6 @@ fn arithmetic_access(mut node: Node<'_>, source: &[u8]) -> Access {
           ) => Access::ReadWrite,
           _ => Access::Unknown,
         };
-      }
-      "arithmetic_dynamic_expression" | "parenthesized_arithmetic_source" => {
-        return Access::Unknown;
       }
       _ => return Access::Read,
     }

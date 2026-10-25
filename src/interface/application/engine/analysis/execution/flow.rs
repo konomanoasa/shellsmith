@@ -2,10 +2,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::Node;
 
+use super::super::command::Redirections;
+use super::super::expansion::Expansion;
 use super::super::{Frame, Resolver};
 use super::alternatives::{Alternatives, StateKey};
 use super::environment::{
-  Binding, CommandFailure, Environment, Flow, Transfer, alternative,
+  Binding, CommandFailure, Environment, Flow, Output, Transfer, alternative,
   definition, merge_value,
 };
 use crate::interface::application::engine::word::{Word, WordContext};
@@ -29,7 +31,7 @@ impl<'a> Resolver<'a> {
         env,
         frame,
         ResolutionIssue::Recovery,
-        Some(ValueIssue::Recovery),
+        None,
       ));
     }
     if !env.alternatives.is_empty() {
@@ -78,14 +80,7 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> BTreeSet<StateKey> {
     let mut names = BTreeSet::new();
-    let mut pending: Vec<_> = nodes.into_iter().collect();
-    while let Some(child) = pending.pop() {
-      if parser::subshell(child.kind()) {
-        continue;
-      }
-      if child.kind() == "io_here" {
-        pending.extend(self.index.heredoc(frame.snapshot, child));
-      }
+    for child in self.expansion_nodes(nodes, frame) {
       if let Some(site) = self
         .site(child, frame)
         .and_then(|id| self.workspace.occurrence(id))
@@ -106,9 +101,31 @@ impl<'a> Resolver<'a> {
       if child.kind() == "tilde_expansion" {
         names.insert(StateKey::Variable(b"HOME".to_vec()));
       }
-      pending.extend(children(child));
     }
     names
+  }
+
+  /// Nodes evaluated in the current environment when `nodes` are expanded,
+  /// with here-document bodies and without subshells.
+  pub(in crate::interface::application::engine::analysis) fn expansion_nodes(
+    &self,
+    nodes: impl IntoIterator<Item = Node<'a>>,
+    frame: Frame,
+  ) -> impl Iterator<Item = Node<'a>> {
+    let mut pending: Vec<_> = nodes.into_iter().collect();
+    std::iter::from_fn(move || {
+      let node = loop {
+        let node = pending.pop()?;
+        if !parser::subshell(node.kind()) {
+          break node;
+        }
+      };
+      if node.kind() == "io_here" {
+        pending.extend(self.index.heredoc(frame.snapshot, node));
+      }
+      pending.extend(children(node));
+      Some(node)
+    })
   }
 
   /// Runs `step` on each side of the choices that `names` depend on and joins
@@ -291,11 +308,11 @@ impl<'a> Resolver<'a> {
         env,
         frame,
         ResolutionIssue::Recovery,
-        Some(ValueIssue::Recovery),
+        None,
       ));
     }
     let source = self.workspace.source(frame.snapshot.document);
-    let io = super::super::command::Redirections::new(
+    let io = Redirections::new(
       &redirects.into_iter().collect::<Vec<_>>(),
       source,
       &mut env,
@@ -340,14 +357,10 @@ impl<'a> Resolver<'a> {
       for state in flow.environments_mut() {
         state.complete_command();
       }
-      let status = flow
-        .environments()
-        .map(Environment::status)
-        .reduce(|mut left, right| {
-          left.join(&right);
-          left
-        })
-        .unwrap_or(Value::Unknown(ValueIssue::Dynamic));
+      let status = Value::join_all(
+        flow.environments().map(Environment::status),
+        ValueIssue::Dynamic,
+      );
       let mut env = env;
       if substitution {
         env.substitution_status = Some(status);
@@ -380,7 +393,7 @@ impl<'a> Resolver<'a> {
     let saved_input = env.io.save_input();
     let mut input = env.clone();
     input.failure = CommandFailure::None;
-    input.io.output = Some(super::environment::Output::default());
+    input.io.output = Some(Output::default());
     input.io.stdout_redirected = false;
     input.io.stderr_captured = false;
     if env.io.stderr_captured
@@ -389,8 +402,9 @@ impl<'a> Resolver<'a> {
       output.fail(ValueIssue::Dynamic);
     }
     let task = self.recovered_sequence(node, children(node), input, inner);
-    task.then(move |_, flow| {
+    task.then(move |resolver, flow| {
       let result = flow.merged();
+      let mut trace = None;
       let value = if let Some(result) = result {
         env.substitution_status = Some(match body {
           SubstitutionBody::Empty => Value::Literal(b"0".to_vec()),
@@ -400,6 +414,7 @@ impl<'a> Resolver<'a> {
           SubstitutionBody::Commands => result.status(),
         });
         env.io.inherit_input(&result.io, saved_input);
+        trace = result.io.output.as_ref().and_then(Output::trace);
         let mut value =
           result.io.output.map_or(
             Value::Unknown(ValueIssue::UnsupportedExpansion),
@@ -415,7 +430,13 @@ impl<'a> Resolver<'a> {
         env.io.restore_input(saved_input);
         Value::Unknown(ValueIssue::UnsupportedExpansion)
       };
-      Task::expanded(super::super::expansion::Expansion {
+      let trace = value.literal().ok().and_then(|bytes| {
+        trace
+          .map(|trace| trace.slice(0..bytes.len()))
+          .and_then(|trace| trace.matching(bytes))
+      });
+      resolver.substitution_trace(&frame.location(node), frame.context, trace);
+      Task::expanded(Expansion {
         word: Word::value(value, quoted),
         env,
       })
@@ -430,13 +451,7 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     if self.index.damaged(frame.snapshot, node) {
-      Task::Done(self.opaque(
-        node,
-        env,
-        frame,
-        ResolutionIssue::Recovery,
-        Some(ValueIssue::Recovery),
-      ))
+      Task::Done(self.opaque(node, env, frame, ResolutionIssue::Recovery, None))
     } else {
       Task::sequence(nodes, env, frame)
     }
@@ -590,7 +605,7 @@ impl<'a> Resolver<'a> {
     let task = if let Some(value) = node.child_by_field_name("value") {
       Task::expand(value, false, env, frame)
     } else {
-      Task::expanded(super::super::expansion::Expansion {
+      Task::expanded(Expansion {
         word: Word::default(),
         env,
       })
@@ -874,6 +889,7 @@ impl<'a> Resolver<'a> {
         Vec::new(),
         env,
         frame,
+        false,
         Box::new(move |resolver, arguments, header| {
           let implicit = node.kind() == "for_clause"
             && !node
@@ -889,13 +905,7 @@ impl<'a> Resolver<'a> {
           } else {
             arguments.into_iter().map(|arg| arg.value).collect()
           };
-          let value = values
-            .into_iter()
-            .reduce(|mut value, next| {
-              value.join(&next);
-              value
-            })
-            .unwrap_or(Value::Unknown(ValueIssue::Dynamic));
+          let value = Value::join_all(values, ValueIssue::Dynamic);
           Self::loop_next(
             node,
             LoopState {
@@ -1225,10 +1235,8 @@ pub(in crate::interface::application::engine::analysis) fn damage_outside<
 type FlowContinuation<'a> =
   Box<dyn FnOnce(&mut Resolver<'a>, Flow) -> Task<'a> + 'a>;
 
-type WordContinuation<'a> = Box<
-  dyn FnOnce(&mut Resolver<'a>, super::super::expansion::Expansion) -> Task<'a>
-    + 'a,
->;
+type WordContinuation<'a> =
+  Box<dyn FnOnce(&mut Resolver<'a>, Expansion) -> Task<'a> + 'a>;
 
 pub(in crate::interface::application::engine::analysis) enum Continuation<'a> {
   Flow(FlowContinuation<'a>),
@@ -1241,7 +1249,7 @@ pub(in crate::interface::application::engine::analysis) enum Task<'a> {
   Arithmetic(Node<'a>, Box<Environment>, Frame),
   Eval(Node<'a>, Box<Environment>, Frame),
   Done(Flow),
-  Expanded(Box<super::super::expansion::Expansion>),
+  Expanded(Box<Expansion>),
   Then(Box<Self>, Continuation<'a>),
 }
 
@@ -1249,6 +1257,7 @@ impl<'a> Task<'a> {
   pub fn arithmetic(node: Node<'a>, env: Environment, frame: Frame) -> Self {
     Self::Arithmetic(node, Box::new(env), frame)
   }
+
   pub fn expand(
     node: Node<'a>,
     quoted: bool,
@@ -1258,7 +1267,7 @@ impl<'a> Task<'a> {
     Self::Expand(node, quoted, Box::new(env), frame)
   }
 
-  pub fn expanded(result: super::super::expansion::Expansion) -> Self {
+  pub fn expanded(result: Expansion) -> Self {
     Self::Expanded(Box::new(result))
   }
 
@@ -1275,11 +1284,7 @@ impl<'a> Task<'a> {
 
   pub fn then_word(
     self,
-    resume: impl FnOnce(
-      &mut Resolver<'a>,
-      super::super::expansion::Expansion,
-    ) -> Self
-    + 'a,
+    resume: impl FnOnce(&mut Resolver<'a>, Expansion) -> Self + 'a,
   ) -> Self {
     Self::Then(Box::new(self), Continuation::Word(Box::new(resume)))
   }

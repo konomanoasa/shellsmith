@@ -1,13 +1,15 @@
 use super::super::execution::{
-  CommandFailure, Environment, Positionals, Transfer, damage_outside,
+  CommandFailure, Environment, Flow, Positionals, Transfer, ValueId,
+  damage_outside,
 };
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::word::{
   self, FieldCount, Part, Parts, Word, WordContext,
 };
 use crate::interface::application::engine::{
-  Access, CharacterEncoding, EffectTarget, InputQuery, InputResult,
-  OccurrenceId, OccurrenceKind, OriginPart, ResolutionIssue, Value, ValueIssue,
+  Access, ArgumentKind, CharacterEncoding, EffectTarget, InputQuery,
+  InputResult, OccurrenceId, OccurrenceKind, OriginPart, ResolutionIssue,
+  Value, ValueIssue,
 };
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -69,7 +71,7 @@ impl<'a> Resolver<'a> {
     let source = self.workspace.source(frame.snapshot.document);
     let mut initial = self.source_word(node, frame);
     if word::transformed(node, source)
-      && std::iter::successors(node.parent(), tree_sitter::Node::parent)
+      && std::iter::successors(node.parent(), Node::parent)
         .any(|parent| parent.kind() == "backquote_substitution")
     {
       initial.fail(ValueIssue::TransformedSource);
@@ -190,12 +192,12 @@ impl<'a> Resolver<'a> {
           _ => Value::Unknown(ValueIssue::Unspecified),
         }
       } else {
-        let (home, absent) = env.parameter(b"HOME");
-        if absent == Some(true) {
-          Value::Unknown(ValueIssue::Unspecified)
-        } else {
-          home
+        let (mut home, absent) = env.parameter(b"HOME");
+        // XCU 2.6.1 leaves the result unspecified on paths where HOME is unset.
+        if absent != Some(false) {
+          home.join(&Value::Unknown(ValueIssue::Unspecified));
         }
+        home
       };
       return Task::expanded(Expansion {
         word: Word::value(value, true),
@@ -319,12 +321,21 @@ impl<'a> Resolver<'a> {
 pub(in crate::interface::application::engine::analysis) struct Argument<'a> {
   pub node: Node<'a>,
   pub value: Value,
+  pub expression: Option<ValueId>,
   pub origins: Vec<OriginPart>,
   pub count: FieldCount,
-  pub kind: Option<super::super::ArgumentKind>,
+  pub kind: Option<ArgumentKind>,
 }
 
 impl Argument<'_> {
+  /// The bytes of an argument that is one field with a known value.
+  pub fn literal(&self) -> Option<&[u8]> {
+    match &self.value {
+      Value::Literal(bytes) if self.count.boundary().is_ok() => Some(bytes),
+      _ => None,
+    }
+  }
+
   pub fn take_first(args: &mut Vec<Self>) -> Value {
     if args[0].count.boundary().is_ok() {
       return args.remove(0).value;
@@ -344,15 +355,10 @@ impl Argument<'_> {
       }
     } else {
       let issue = values.count().issue().expect("uncertain first argument");
-      let value = values
-        .fields
-        .into_iter()
-        .map(|(value, _)| value)
-        .reduce(|mut left, right| {
-          left.join(&right);
-          left
-        })
-        .unwrap_or(Value::Unknown(issue));
+      let value = Value::join_all(
+        values.fields.into_iter().map(|(value, _)| value),
+        issue,
+      );
       args.clear();
       args.push(Self {
         node,
@@ -360,6 +366,7 @@ impl Argument<'_> {
         count: FieldCount::Unknown { minimum: 0, issue },
         origins: Vec::new(),
         kind: None,
+        expression: None,
       });
     }
     name
@@ -378,11 +385,41 @@ impl<'a> Resolver<'a> {
     mut values: Vec<Argument<'a>>,
     env: Environment,
     frame: Frame,
+    shared: bool,
     ready: Ready<'a>,
   ) -> Task<'a> {
     let Some(node) = nodes.next() else {
       return ready(self, values, env);
     };
+    if shared {
+      match self.conditional_value(node, &env, frame) {
+        Ok(Some((expression, dependencies))) => {
+          for id in dependencies {
+            self.read(id, &env, frame);
+          }
+          let value = env
+            .alternatives
+            .expressions()
+            .projected(expression)
+            .as_ref()
+            .clone();
+          values.push(Argument {
+            node,
+            value,
+            expression: Some(expression),
+            origins: Vec::new(),
+            count: FieldCount::One,
+            kind: None,
+          });
+          return self.arguments(nodes, values, env, frame, shared, ready);
+        }
+        Ok(None) => {}
+        Err(error) => {
+          self.error = Some(error);
+          return Task::Done(Flow::default());
+        }
+      }
+    }
     let assignment = node.child_by_field_name("name").is_some();
     let target = if assignment {
       node.child_by_field_name("value")
@@ -397,7 +434,7 @@ impl<'a> Resolver<'a> {
     let task = if let Some(target) = target {
       Task::expand(target, false, env, frame)
     } else {
-      Task::expanded(super::Expansion {
+      Task::expanded(Expansion {
         word: Word::default(),
         env,
       })
@@ -410,6 +447,7 @@ impl<'a> Resolver<'a> {
           origins: field.origins,
           count: field.count,
           kind: None,
+          expression: None,
         })),
         Err(issue) => {
           let source = resolver.workspace.source(frame.snapshot.document);
@@ -418,7 +456,7 @@ impl<'a> Resolver<'a> {
             value: Value::Unknown(issue),
             origins: Vec::new(),
             count: if context == WordContext::Assignment
-              || word::syntax_field(node, source).1
+              || word::syntax_fields(node, source).1
             {
               FieldCount::One
             } else {
@@ -428,10 +466,11 @@ impl<'a> Resolver<'a> {
               }
             },
             kind: None,
+            expression: None,
           });
         }
       }
-      resolver.arguments(nodes, values, result.env, frame, ready)
+      resolver.arguments(nodes, values, result.env, frame, shared, ready)
     })
   }
 }

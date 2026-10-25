@@ -89,12 +89,14 @@ impl std::fmt::Display for Error {
     }
   }
 }
+
 impl std::error::Error for Error {}
 impl From<engine::Error> for Error {
   fn from(error: engine::Error) -> Self {
     Self::Engine(error)
   }
 }
+
 impl From<std::io::Error> for Error {
   fn from(error: std::io::Error) -> Self {
     Self::Message(error.to_string())
@@ -124,7 +126,7 @@ impl Application {
   pub fn new(settings: Settings) -> Result<Self, Error> {
     Ok(Self {
       settings: settings.checked()?,
-      workspace: engine::Workspace::default(),
+      workspace: Workspace::default(),
       entries: BTreeMap::new(),
       opened: BTreeMap::new(),
       inputs: BTreeSet::new(),
@@ -143,15 +145,18 @@ impl Application {
   pub const fn workspace(&self) -> &Workspace {
     &self.workspace
   }
+
   #[must_use]
   pub const fn settings(&self) -> &Settings {
     &self.settings
   }
+
   pub fn configure(&mut self, settings: Settings) -> Result<(), Error> {
     self.settings = settings.checked()?;
     self.invalidate_inputs();
     Ok(())
   }
+
   fn invalidate_inputs(&mut self) {
     self.cache = InputCache::default();
     self.names = None;
@@ -163,18 +168,32 @@ impl Application {
   pub fn failures(&self) -> &[Failure] {
     &self.failures
   }
+
   #[must_use]
   pub fn path(&self, id: DocumentId) -> Option<&Path> {
     files::entry_path(&self.entries, id)
   }
+
   #[must_use]
   pub fn document_id(&self, path: &Path) -> Option<DocumentId> {
+    self.entry_document(&self.absolute(path))
+  }
+
+  pub fn loaded_document(&self, path: &Path) -> Result<DocumentId, Error> {
+    self
+      .document_id(path)
+      .ok_or_else(|| Error::Message(format!("Cannot load {}", path.display())))
+  }
+
+  /// An opened document keeps its identity after its path resolves elsewhere.
+  pub(super) fn entry_document(&self, identity: &Path) -> Option<DocumentId> {
     self
       .entries
-      .get(&self.absolute(path))
+      .get(identity)
       .map(|entry| entry.document)
       .filter(|id| self.workspace.document(*id).is_some())
   }
+
   #[must_use]
   pub fn absolute(&self, path: &Path) -> PathBuf {
     files::absolute(&self.settings.cwd, path)
@@ -304,7 +323,7 @@ impl Application {
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
     check_cancelled(cancelled)?;
-    if let Some(id) = self.document_id(path)
+    if let Some(id) = self.entry_document(path)
       && let Some(document) = self
         .workspace
         .shared_document(id)
@@ -413,14 +432,10 @@ impl Application {
     let selected = if let Some(path) = document {
       BTreeSet::from([self.absolute(path)])
     } else {
-      let (selected, failures) =
-        self.collect_inputs(BTreeSet::new(), cancelled)?;
-      self.cache.selection = Some(InputSelection {
-        explicit: BTreeSet::new(),
-        paths: selected.clone(),
-        failures: failures.clone(),
-      });
-      self.failures = failures;
+      let selection = self.select_inputs(BTreeSet::new(), cancelled)?;
+      self.failures.clone_from(&selection.failures);
+      let selected = selection.paths.clone();
+      self.cache.selection = Some(selection);
       selected
     };
     for path in &selected {
@@ -440,25 +455,21 @@ impl Application {
     Ok(())
   }
 
-  fn collect_inputs(
-    &self,
-    mut selected: BTreeSet<PathBuf>,
-    cancelled: &AtomicBool,
-  ) -> Result<(BTreeSet<PathBuf>, Vec<Failure>), Error> {
-    selected.extend(self.opened.keys().cloned());
-    let inputs = self.discovery_inputs();
-    let (collected, failures) =
-      self.discovery.collect(&inputs, false, cancelled)?;
-    selected.extend(collected);
-    Ok((selected, failures))
-  }
-
   pub(super) fn select_inputs(
     &self,
     explicit: BTreeSet<PathBuf>,
     cancelled: &AtomicBool,
   ) -> Result<InputSelection, Error> {
-    let (paths, failures) = self.collect_inputs(explicit.clone(), cancelled)?;
+    let (collected, failures) =
+      self
+        .discovery
+        .collect(&self.discovery_inputs(), false, cancelled)?;
+    let paths = explicit
+      .iter()
+      .chain(self.opened.keys())
+      .cloned()
+      .chain(collected)
+      .collect();
     Ok(InputSelection {
       explicit,
       paths,

@@ -190,8 +190,8 @@ fn word_and_output_preserve_constraints_across_boundaries() {
   );
   assert!(!word.scalar().may_be_name());
   let mut output = Output::default();
-  output.append(source, usize::MAX);
-  output.append(Value::Literal(b"/tail\n".to_vec()), usize::MAX);
+  output.append(source, None, usize::MAX);
+  output.append(Value::Literal(b"/tail\n".to_vec()), None, usize::MAX);
   let mut result = output.value();
   result.trim_newlines();
   assert!(result.can_equal(b"/tail"));

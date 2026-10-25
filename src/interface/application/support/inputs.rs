@@ -15,7 +15,7 @@ pub(super) struct InputCache {
   pub(super) loaded: BTreeMap<PathBuf, Result<Arc<Document>, String>>,
   failed_inputs: BTreeMap<PathBuf, Result<Arc<[u8]>, String>>,
   pub(super) paths: BTreeMap<SourceInput, Result<PathBuf, String>>,
-  pub(super) evaluated: BTreeMap<engine::InputQuery, engine::InputResult>,
+  pub(super) evaluated: BTreeMap<InputQuery, InputResult>,
   pub(super) frozen: bool,
 }
 

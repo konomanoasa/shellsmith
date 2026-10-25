@@ -33,6 +33,7 @@ impl StateKey {
       Self::Positionals => StateValue::Positionals(env.positional.clone()),
     }
   }
+
   fn restore(&self, env: &mut Environment, value: &StateValue) {
     match (self, value) {
       (Self::Variable(name), StateValue::Binding(value)) => {
@@ -369,10 +370,7 @@ impl Alternatives {
   }
 
   pub fn restore_positionals(&mut self, before: &Self) {
-    self.forget_positionals();
-    if let Some(value) = before.values.get(&StateKey::Positionals) {
-      self.values.insert(StateKey::Positionals, *value);
-    }
+    self.restore_key(StateKey::Positionals, before);
   }
 
   pub fn forget(&mut self, name: &[u8]) {
@@ -380,12 +378,14 @@ impl Alternatives {
   }
 
   pub fn restore(&mut self, name: &[u8], before: &Self) {
-    if let Some(value) = before.values.get(&StateKey::Variable(name.to_vec())) {
-      self
-        .values
-        .insert(StateKey::Variable(name.to_vec()), *value);
+    self.restore_key(StateKey::Variable(name.to_vec()), before);
+  }
+
+  fn restore_key(&mut self, key: StateKey, before: &Self) {
+    if let Some(value) = before.values.get(&key) {
+      self.values.insert(key, *value);
     } else {
-      self.forget(name);
+      self.values.remove(&key);
     }
   }
 

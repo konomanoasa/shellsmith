@@ -1,5 +1,6 @@
 use super::command::operand_index;
 use super::execution::Environment;
+use super::expansion::Argument;
 use super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
   self, DependencyState, EffectTarget, Error, ExecutionContextId,
@@ -58,7 +59,15 @@ impl SourceInput {
   fn normalized(mut self) -> Self {
     if let Value::Literal(value) = &self.operand {
       let absolute_search = !value.contains(&b'/')
-        && matches!(&self.search_path, Some(Value::Literal(path)) if path.split(|byte| *byte == b':').all(|entry| entry.starts_with(b"/")));
+        && self
+          .search_path
+          .as_ref()
+          .and_then(|path| path.literal().ok())
+          .is_some_and(|path| {
+            path
+              .split(|byte| *byte == b':')
+              .all(|entry| entry.starts_with(b"/"))
+          });
       if value.starts_with(b"/") || absolute_search {
         self.cwd = None;
       }
@@ -149,7 +158,7 @@ impl<'a> Resolver<'a> {
   pub(super) fn source(
     &mut self,
     node: Node<'a>,
-    args: &[super::expansion::Argument<'a>],
+    args: &[Argument<'a>],
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
@@ -209,7 +218,7 @@ impl<'a> Resolver<'a> {
   fn source_document(
     &mut self,
     node: Node<'a>,
-    args: &[super::expansion::Argument<'a>],
+    args: &[Argument<'a>],
     mut env: Environment,
     frame: Frame,
     reference: ReferenceId,
@@ -379,10 +388,7 @@ impl<'a> Resolver<'a> {
   }
 }
 
-fn source_input(
-  args: &[super::expansion::Argument<'_>],
-  env: &Environment,
-) -> SourceInput {
+fn source_input(args: &[Argument<'_>], env: &Environment) -> SourceInput {
   let (path, absent) = env.parameter(b"PATH");
   // XBD 8.3 leaves the search implementation-defined when PATH is unset or
   // null or a prefix contains `%`.
@@ -403,7 +409,7 @@ fn source_input(
   .normalized()
 }
 
-fn source_value(args: &[super::expansion::Argument<'_>]) -> Value {
+fn source_value(args: &[Argument<'_>]) -> Value {
   let first = operand_index(args);
   match args.get(first) {
     Some(arg) if arg.value.issue().is_some() => arg.value.clone(),
@@ -419,8 +425,8 @@ fn source_value(args: &[super::expansion::Argument<'_>]) -> Value {
 }
 
 fn source_operand<'a, 'b>(
-  args: &'b [super::expansion::Argument<'a>],
-) -> Option<&'b super::expansion::Argument<'a>> {
+  args: &'b [Argument<'a>],
+) -> Option<&'b Argument<'a>> {
   let first = operand_index(args);
   let operand = args.get(first)?;
   args[..=first]

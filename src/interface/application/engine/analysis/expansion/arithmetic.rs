@@ -18,10 +18,7 @@ type Number = Result<i64, ValueIssue>;
 
 pub(super) fn integer(value: &Value) -> Number {
   let Value::Literal(bytes) = value else {
-    let Some(issue) = value.issue() else {
-      unreachable!()
-    };
-    return Err(issue);
+    return Err(value.issue().expect("unknown value"));
   };
   let text = std::str::from_utf8(bytes).map_err(|_| ValueIssue::Arithmetic)?;
   if text.is_empty() {
@@ -183,7 +180,7 @@ impl<'a> Resolver<'a> {
           return result(integer(&Value::Literal(bytes)), env);
         }
       }
-      if dynamic_arithmetic(node) {
+      if parser::dynamic_arithmetic(node) {
         return self.expanded_arithmetic(node, env, frame);
       }
     }
@@ -761,20 +758,4 @@ fn arithmetic_parts(nodes: Vec<Node<'_>>) -> Vec<Node<'_>> {
     }
   }
   parts
-}
-
-fn dynamic_arithmetic(root: Node<'_>) -> bool {
-  let mut pending = children(root);
-  while let Some(node) = pending.pop() {
-    match node.kind() {
-      "parameter_expansion"
-      | "command_substitution"
-      | "backquote_substitution"
-      | "arithmetic_dynamic_expression"
-      | "parenthesized_arithmetic_dynamic_source"
-      | "arithmetic_expansion" => return true,
-      _ => pending.extend(children(node)),
-    }
-  }
-  false
 }

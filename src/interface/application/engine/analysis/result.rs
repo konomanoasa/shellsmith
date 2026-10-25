@@ -1,3 +1,4 @@
+use crate::interface::application::engine::workspace::derived::DerivedDocuments;
 use crate::interface::application::engine::{
   self, Access, AnalysisRequest, DependencyState, Location, OccurrenceId,
   ReferenceId, Snapshot, SymbolId, SymbolKind, UseSite, Workspace,
@@ -389,8 +390,7 @@ pub struct Analysis {
     BTreeMap<(UseSite, ExecutionContextId), BTreeSet<SymbolId>>,
   pub(in crate::interface::application::engine) effects:
     BTreeMap<EffectKey, UnknownEffect>,
-  pub(in crate::interface::application::engine) derived:
-    engine::workspace::derived::DerivedDocuments,
+  pub(in crate::interface::application::engine) derived: DerivedDocuments,
   pub(in crate::interface::application::engine) attributes:
     BTreeMap<(OccurrenceId, ExecutionContextId), AttributeState>,
   pub(in crate::interface::application::engine) generation: Arc<()>,
@@ -426,7 +426,7 @@ impl Analysis {
       argument_roles: BTreeMap::new(),
       argument_definitions: BTreeMap::new(),
       effects: BTreeMap::new(),
-      derived: engine::workspace::derived::DerivedDocuments::default(),
+      derived: DerivedDocuments::default(),
       attributes: BTreeMap::new(),
       generation: Arc::default(),
       request,
@@ -527,6 +527,7 @@ impl Analysis {
   pub fn argument_roles(&self) -> impl Iterator<Item = &ArgumentRole> {
     self.argument_roles.values()
   }
+
   pub fn unknown_effects(&self) -> impl Iterator<Item = &UnknownEffect> {
     self.effects.values()
   }
@@ -553,6 +554,7 @@ impl Analysis {
       .iter()
       .map(|((id, context), input)| (*id, *context, input))
   }
+
   #[must_use]
   pub fn value(
     &self,
@@ -809,32 +811,32 @@ impl Analysis {
 
 pub(in crate::interface::application::engine) fn argument_resolution(
   analysis: Option<&Analysis>,
-  role: &engine::ArgumentRole,
-) -> Option<engine::Resolution> {
+  role: &ArgumentRole,
+) -> Option<Resolution> {
   if role.spelling.is_empty() {
     return None;
   }
-  let site = engine::UseSite::argument(&role.location);
+  let site = UseSite::argument(&role.location);
   role.context?;
   let analysis = analysis?;
   match &role.kind {
-    Some(engine::ArgumentKind::Variable {
-      access: engine::Access::Write,
+    Some(ArgumentKind::Variable {
+      access: Access::Write,
       ..
     }) => {
       let candidates =
         analysis.written_definitions(site).collect::<BTreeSet<_>>();
-      (!candidates.is_empty()).then_some(engine::Resolution {
+      (!candidates.is_empty()).then_some(Resolution {
         candidates,
         ..Default::default()
       })
     }
     Some(
-      engine::ArgumentKind::Variable {
-        access: engine::Access::Unknown,
+      ArgumentKind::Variable {
+        access: Access::Unknown,
         ..
       }
-      | engine::ArgumentKind::Number,
+      | ArgumentKind::Number,
     )
     | None => None,
     _ => analysis.summarize(site).resolution,
@@ -844,11 +846,11 @@ pub(in crate::interface::application::engine) fn argument_resolution(
 pub(in crate::interface::application::engine) fn syntax_attempted(
   site: &engine::Occurrence,
   analysis: Option<&Analysis>,
-  resolution: Option<&engine::Resolution>,
+  resolution: Option<&Resolution>,
 ) -> bool {
   analysis.is_some_and(|analysis| {
     analysis
-      .resolutions(engine::UseSite::Syntax(site.id))
+      .resolutions(UseSite::Syntax(site.id))
       .next()
       .is_some()
       || resolution.is_some_and(|resolution| {
@@ -856,8 +858,8 @@ pub(in crate::interface::application::engine) fn syntax_attempted(
           analysis
             .writes
             .range(
-              (*symbol, engine::ExecutionContextId(0))
-                ..=(*symbol, engine::ExecutionContextId(usize::MAX)),
+              (*symbol, ExecutionContextId(0))
+                ..=(*symbol, ExecutionContextId(usize::MAX)),
             )
             .next()
             .is_some()
@@ -870,16 +872,13 @@ pub(in crate::interface::application::engine) fn syntax_resolution(
   document: &engine::Document,
   site: &engine::Occurrence,
   analysis: Option<&Analysis>,
-) -> Option<engine::Resolution> {
-  if matches!(
-    site.access,
-    engine::Access::Definition | engine::Access::Write
-  ) {
+) -> Option<Resolution> {
+  if matches!(site.access, Access::Definition | Access::Write) {
     document
       .symbols()
       .iter()
       .find(|symbol| symbol.definition == site.id)
-      .map(|symbol| engine::Resolution {
+      .map(|symbol| Resolution {
         candidates: [symbol.id].into(),
         ..Default::default()
       })
@@ -888,15 +887,15 @@ pub(in crate::interface::application::engine) fn syntax_resolution(
       .then(|| engine::analysis::invariant_command(&site.name))
       .flatten()
       .or_else(|| {
-        let use_site = engine::UseSite::Syntax(site.id);
+        let use_site = UseSite::Syntax(site.id);
         analysis.and_then(|analysis| analysis.summarize(use_site).resolution)
       })
   }
 }
 
 pub(in crate::interface::application::engine) fn join_resolution(
-  left: &mut Option<engine::Resolution>,
-  right: Option<&engine::Resolution>,
+  left: &mut Option<Resolution>,
+  right: Option<&Resolution>,
 ) {
   match (left.as_mut(), right) {
     (Some(left), Some(right)) => left.join(right),

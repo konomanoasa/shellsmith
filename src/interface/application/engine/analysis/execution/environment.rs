@@ -1,3 +1,4 @@
+use super::super::deferred::OutputTrace;
 use super::alternatives::Alternatives;
 use crate::interface::application::engine::word::FieldCount;
 use imbl::{OrdMap, ordmap::DiffItem};
@@ -236,6 +237,13 @@ pub(in crate::interface::application::engine::analysis) struct Positionals {
   pub fields: Vec<(Value, FieldCount)>,
 }
 
+fn field_minimum(fields: &[(Value, FieldCount)]) -> usize {
+  fields
+    .iter()
+    .map(|(_, count)| count.minimum())
+    .fold(0, usize::saturating_add)
+}
+
 impl Positionals {
   pub fn unknown(issue: ValueIssue) -> Self {
     Self {
@@ -247,11 +255,7 @@ impl Positionals {
   }
 
   pub fn minimum(&self) -> usize {
-    self
-      .fields
-      .iter()
-      .map(|(_, count)| count.minimum())
-      .fold(0, usize::saturating_add)
+    field_minimum(&self.fields)
   }
 
   pub fn parameter(&self, index: usize) -> (Value, Option<bool>) {
@@ -381,31 +385,20 @@ impl Positionals {
     let left = &left[known..];
     let right = &right[known..];
     if !left.is_empty() || !right.is_empty() {
-      let minimum = |fields: &[(Value, FieldCount)]| {
-        fields
-          .iter()
-          .map(|(_, count)| count.minimum())
-          .fold(0, usize::saturating_add)
-      };
       let issue = left
         .iter()
         .chain(right)
         .filter_map(|(_, count)| count.boundary().err())
         .reduce(ValueIssue::combine)
         .unwrap_or(ValueIssue::Dynamic);
-      let value = left
-        .iter()
-        .chain(right)
-        .map(|(value, _)| value.clone())
-        .reduce(|mut left, right| {
-          left.join(&right);
-          left
-        })
-        .unwrap_or(Value::Unknown(issue));
+      let value = Value::join_all(
+        left.iter().chain(right).map(|(value, _)| value.clone()),
+        issue,
+      );
       fields.push((
         value,
         FieldCount::Unknown {
-          minimum: minimum(left).min(minimum(right)),
+          minimum: field_minimum(left).min(field_minimum(right)),
           issue,
         },
       ));
@@ -1060,9 +1053,22 @@ pub(in crate::interface::application::engine::analysis) struct Output {
   chunks: imbl::Vector<Vec<u8>>,
   bytes: usize,
   constraint: Option<Value>,
+  trace: Option<imbl::Vector<OutputTrace>>,
 }
 
 impl Output {
+  pub fn trace(&self) -> Option<OutputTrace> {
+    if self.constraint.is_none() && self.bytes == 0 {
+      Some(OutputTrace::default())
+    } else {
+      let mut trace = OutputTrace::default();
+      for chunk in self.trace.as_ref()? {
+        trace.append(chunk.clone());
+      }
+      Some(trace)
+    }
+  }
+
   pub fn fail(&mut self, issue: ValueIssue) {
     self.constraint = Some(Value::Unknown(
       self
@@ -1073,14 +1079,31 @@ impl Output {
     ));
     self.chunks.clear();
     self.bytes = 0;
+    self.trace = None;
   }
-  pub fn append(&mut self, value: Value, limit: usize) {
+
+  pub fn append(
+    &mut self,
+    value: Value,
+    trace: Option<OutputTrace>,
+    limit: usize,
+  ) {
     if let Some(constraint) = &mut self.constraint {
       constraint.concat(&value, limit);
     } else if let Value::Literal(bytes) = value {
       if bytes.len() > limit.saturating_sub(self.bytes) {
         self.fail(ValueIssue::SizeLimit);
       } else if !bytes.is_empty() {
+        if self.bytes == 0 {
+          self.trace = Some(imbl::Vector::new());
+        }
+        if let Some(trace) = trace.and_then(|trace| trace.matching(&bytes)) {
+          if let Some(chunks) = &mut self.trace {
+            chunks.push_back(trace);
+          }
+        } else {
+          self.trace = None;
+        }
         self.bytes += bytes.len();
         self.chunks.push_back(bytes);
       }
@@ -1090,29 +1113,40 @@ impl Output {
       self.chunks.clear();
       self.bytes = 0;
       self.constraint = Some(constraint);
+      self.trace = None;
     }
   }
+
   pub fn value(&self) -> Value {
     self.constraint.clone().unwrap_or_else(|| {
       Value::Literal(self.chunks.iter().flatten().copied().collect())
     })
   }
+
   fn join(&mut self, other: &Self) {
     if self != other {
       let mut value = self.value();
       value.join(&other.value());
+      let trace = (self.trace() == other.trace())
+        .then(|| self.trace())
+        .flatten();
       *self = Self::default();
-      self.append(value, usize::MAX);
+      self.append(value, trace, usize::MAX);
     }
   }
 }
 
 impl Environment {
-  pub fn emit(&mut self, value: Value, limit: usize) {
+  pub fn emit(
+    &mut self,
+    value: Value,
+    trace: Option<OutputTrace>,
+    limit: usize,
+  ) {
     if !self.io.stdout_redirected
       && let Some(output) = &mut self.io.output
     {
-      output.append(value, limit);
+      output.append(value, trace, limit);
     }
   }
 }
@@ -1211,10 +1245,6 @@ impl IntoIterator for Flow {
     self.0.into_iter()
   }
 }
-
-#[cfg(test)]
-#[path = "../../../../../../tests/implementation/state.rs"]
-mod tests;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::interface::application::engine::analysis) struct Io {
@@ -1336,3 +1366,7 @@ impl Io {
     self.input_order_unknown = false;
   }
 }
+
+#[cfg(test)]
+#[path = "../../../../../../tests/implementation/state.rs"]
+mod tests;

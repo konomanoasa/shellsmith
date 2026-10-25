@@ -33,6 +33,12 @@ struct ClientSupport {
   semantic_tokens: Option<lsp::SemanticTokensLegend>,
 }
 
+impl ClientSupport {
+  const fn refreshes_tokens(&self) -> bool {
+    self.refresh && self.semantic_tokens.is_some()
+  }
+}
+
 pub(super) struct Server {
   session: Arc<Session>,
   client: ClientSocket,
@@ -179,7 +185,7 @@ impl Server {
   }
 
   fn initialized(&self) {
-    if self.support.refresh && self.support.semantic_tokens.is_some() {
+    if self.support.refreshes_tokens() {
       match self.session.updates() {
         Ok(mut updates) => {
           let client = self.client.clone();
@@ -189,11 +195,7 @@ impl Server {
               if shutdown.load(Ordering::Relaxed) {
                 break;
               }
-              if let Err(error) =
-                client.request::<req::SemanticTokensRefresh>(()).await
-              {
-                log(&client, error);
-              }
+              refresh_tokens(&client).await;
             }
           });
         }
@@ -249,15 +251,9 @@ impl Server {
     if let Err(error) = self.session.start_index() {
       self.log(error);
     }
-    if self.support.refresh && self.support.semantic_tokens.is_some() {
+    if self.support.refreshes_tokens() {
       let client = self.client.clone();
-      tokio::spawn(async move {
-        if let Err(error) =
-          client.request::<req::SemanticTokensRefresh>(()).await
-        {
-          log(&client, error);
-        }
-      });
+      tokio::spawn(async move { refresh_tokens(&client).await });
     }
   }
 
@@ -398,9 +394,7 @@ impl Server {
       Err(error) => return Box::pin(std::future::ready(Err(error))),
     };
     self.query(scope(path.clone()), move |application, cancelled| {
-      let id = application.document_id(&path).ok_or_else(|| {
-        Error::Message(format!("Cannot load {}", path.display()))
-      })?;
+      let id = application.loaded_document(&path)?;
       operation(application, id, cancelled)
     })
   }
@@ -445,10 +439,11 @@ impl Server {
     let session = self.session.clone();
     Box::pin(async move {
       let outcome = job.await;
-      if outcome.result.is_ok()
-        || matches!(outcome.result, Err(Error::Superseded))
+      if (outcome.result.is_ok()
+        || matches!(outcome.result, Err(Error::Superseded)))
+        && let Err(error) = session.start_index()
       {
-        let _ = session.start_index();
+        log(&client, error);
       }
       for failure in outcome.failures {
         log(
@@ -484,6 +479,7 @@ impl Server {
       },
     )
   }
+
   fn definitions(
     &self,
     params: &lsp::GotoDefinitionParams,
@@ -586,6 +582,12 @@ impl Server {
           .map(Some)
       },
     )
+  }
+}
+
+async fn refresh_tokens(client: &ClientSocket) {
+  if let Err(error) = client.request::<req::SemanticTokensRefresh>(()).await {
+    log(client, error);
   }
 }
 

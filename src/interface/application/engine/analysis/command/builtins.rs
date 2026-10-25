@@ -1,8 +1,9 @@
+use super::super::deferred::OutputTrace;
 use super::super::execution::{
   Binding, Environment, Flow, OptionCursor, StateKey, Transfer, alternative,
 };
-use super::super::expansion::Argument;
-use super::super::{Frame, Resolver, Task};
+use super::super::expansion::{Argument, positional_arguments};
+use super::super::{BindingOrigin, Frame, Resolver, Task};
 use super::arguments::{
   ReadOptions, argument_issue, classify_arguments, decimal_value,
   declaration_operand, declaration_operands, getopts_operands,
@@ -18,6 +19,7 @@ use crate::interface::application::engine::{
   SymbolId, UseSite, Value, ValueIssue,
 };
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::Arc;
 use tree_sitter::Node;
 
@@ -100,9 +102,8 @@ impl<'a> Resolver<'a> {
       self.non_source(node, frame);
     }
     if env.io.output.is_some() {
-      let output =
-        output(name, &args, &env, self.result.request.limits.value_bytes);
-      env.emit(output, self.result.request.limits.value_bytes);
+      let (output, trace) = self.utility_output(node, name, &args, &env, frame);
+      env.emit(output, trace, self.result.request.limits.value_bytes);
       if env.io.stderr_captured
         && let Some(output) = &mut env.io.output
       {
@@ -195,8 +196,7 @@ impl<'a> Resolver<'a> {
       };
       if option == b"--" {
         env.alternatives.forget_positionals();
-        env.positional =
-          super::super::expansion::positional_arguments(arguments.as_slice());
+        env.positional = positional_arguments(arguments.as_slice());
         return Flow::next(env);
       }
       if !matches!(option.first(), Some(b'-' | b'+')) {
@@ -204,7 +204,7 @@ impl<'a> Resolver<'a> {
           .chain(arguments.cloned())
           .collect::<Vec<_>>();
         env.alternatives.forget_positionals();
-        env.positional = super::super::expansion::positional_arguments(&rest);
+        env.positional = positional_arguments(&rest);
         return Flow::next(env);
       }
       env.special.remove(b"-".as_slice());
@@ -279,6 +279,7 @@ impl<'a> Resolver<'a> {
     mut env: Environment,
     frame: Frame,
   ) -> Flow {
+    let source = self.workspace.source(frame.snapshot.document);
     let Some(start) = declaration_operands(args) else {
       let attributes =
         (utility == b"readonly").then_some(EffectTarget::Attributes);
@@ -297,7 +298,13 @@ impl<'a> Resolver<'a> {
       let mut definition =
         variable.and_then(|variable| self.site(variable, frame));
       let name = if let Some(variable) = variable {
-        self.write(variable, &mut env, frame, false, argument.value.clone());
+        if self.write(variable, &mut env, frame, false, argument.value.clone())
+          && let Some(expression) = argument.expression
+        {
+          let spelling = word::lexical(variable, source);
+          let resolution = env.variables.get(&spelling).resolution.clone();
+          env.alternatives.store(&spelling, expression, resolution);
+        }
         definition
           .and_then(|id| self.workspace.occurrence(id))
           .map(|site| site.name.clone())
@@ -390,11 +397,7 @@ impl<'a> Resolver<'a> {
       return Flow::next(env);
     };
     for arg in &args[index..] {
-      let name = match &arg.value {
-        Value::Literal(name) if arg.count.boundary().is_ok() => Some(name),
-        _ => None,
-      };
-      let Some(name) = name else {
+      let Some(name) = arg.literal() else {
         let targets = if !explicit {
           vec![
             argument_target(arg, NameTarget::Variable),
@@ -453,7 +456,7 @@ impl<'a> Resolver<'a> {
           .issues
           .insert(ResolutionIssue::UnknownEffect);
       }
-      bindings.values.insert(name.clone(), after);
+      bindings.values.insert(name.to_vec(), after);
       if function_unset {
         env.alternatives.forget_function(name);
         let mut function = env.functions.get(name).clone();
@@ -461,7 +464,7 @@ impl<'a> Resolver<'a> {
           alternative(Alternative::Unset)
             .in_context(self.result.binding_context(frame.context)),
         ));
-        env.functions.values.insert(name.clone(), function);
+        env.functions.values.insert(name.to_vec(), function);
       }
     }
     Flow::next(env)
@@ -798,13 +801,14 @@ impl Resolver<'_> {
     }
     let mut failed = None;
     for (offset, arg) in args[options.operands..].iter().enumerate() {
+      let name = arg.literal();
       if failed.is_none()
-        && !matches!(&arg.value, Value::Literal(name) if arg.count.boundary().is_ok() && valid_name(name) && env.readonly(name).is_none())
+        && !name
+          .is_some_and(|name| valid_name(name) && env.readonly(name).is_none())
       {
         failed = Some(env.clone());
       }
-      if let Value::Literal(name) = &arg.value
-        && arg.count.boundary().is_ok()
+      if let Some(name) = name
         && valid_name(name)
       {
         if let Some(id) = self.write_argument(
@@ -825,9 +829,7 @@ impl Resolver<'_> {
         ) {
           self.record_attribute(id, frame.context, &env);
         }
-      } else if matches!(arg.value, Value::Literal(_))
-        && arg.count.boundary().is_ok()
-      {
+      } else if name.is_some() {
         self.gap(node, frame, ResolutionIssue::DynamicName);
       } else {
         self.invalidate(
@@ -904,11 +906,9 @@ impl Resolver<'_> {
         );
       } else if computed.is_err() {
         binding.resolution.alternatives.insert(Alternative::Unset);
-        binding.resolution.origins.insert(
-          super::super::BindingOrigin::Context(
-            self.result.binding_context(frame.context),
-          ),
-        );
+        binding.resolution.origins.insert(BindingOrigin::Context(
+          self.result.binding_context(frame.context),
+        ));
       }
       env.variables.values.insert(b"OPTARG".to_vec(), binding);
     }
@@ -1073,21 +1073,63 @@ fn exit_status(args: &[Argument<'_>], previous: Value) -> Value {
   }
 }
 
-pub(super) fn output(
+impl Resolver<'_> {
+  pub(super) fn utility_output(
+    &self,
+    node: Node<'_>,
+    name: &[u8],
+    args: &[Argument<'_>],
+    env: &Environment,
+    frame: Frame,
+  ) -> (Value, Option<OutputTrace>) {
+    let mut arguments = vec![None; args.len()];
+    let mut trace = (env.io.output.is_some() && !env.io.stdout_redirected)
+      .then(OutputTrace::default);
+    let value = output(
+      name,
+      args,
+      env,
+      self.result.request.limits.value_bytes,
+      &mut |index, range, bytes| {
+        if trace.is_none() {
+          return;
+        }
+        let part = if let Some(index) = index {
+          arguments[index]
+            .get_or_insert_with(|| {
+              Self::argument_output_trace(&args[index], frame)
+            })
+            .as_ref()
+            .map(|trace| trace.slice(range))
+        } else {
+          parser::command_word(node).and_then(|command| {
+            self.literal_output_trace(&frame.location(command), frame.context)
+          })
+        };
+        if let Some(mut part) = part {
+          part.replace_bytes(bytes);
+          trace.as_mut().expect("output trace").append(part);
+        } else {
+          trace = None;
+        }
+      },
+    );
+    let trace = value
+      .literal()
+      .ok()
+      .and_then(|bytes| trace?.matching(bytes));
+    (value, trace)
+  }
+}
+
+fn output(
   name: &[u8],
   args: &[Argument<'_>],
   env: &Environment,
   limit: usize,
+  emit: &mut impl FnMut(Option<usize>, Range<usize>, &[u8]),
 ) -> Value {
-  let known: Option<Vec<_>> = args
-    .iter()
-    .map(|arg| match &arg.value {
-      Value::Literal(bytes) if arg.count.boundary().is_ok() => {
-        Some(bytes.as_slice())
-      }
-      _ => None,
-    })
-    .collect();
+  let known: Option<Vec<_>> = args.iter().map(Argument::literal).collect();
   let unknown = || {
     Value::Unknown(
       argument_issue(args).unwrap_or(ValueIssue::UnsupportedExpansion),
@@ -1112,14 +1154,12 @@ pub(super) fn output(
     }
     b"set"
       if !args.is_empty()
-        && (args.first().is_some_and(|arg| {
-          arg.count.boundary().is_ok()
-            && arg.value == Value::Literal(b"--".to_vec())
-        }) || known.as_ref().is_some_and(|args| {
-          !args
-            .iter()
-            .any(|arg| arg.starts_with(b"-") || arg.starts_with(b"+"))
-        })) =>
+        && (args.first().and_then(Argument::literal) == Some(b"--")
+          || known.as_ref().is_some_and(|args| {
+            !args
+              .iter()
+              .any(|arg| arg.starts_with(b"-") || arg.starts_with(b"+"))
+          })) =>
     {
       Value::Literal(Vec::new())
     }
@@ -1148,11 +1188,20 @@ pub(super) fn output(
       if size > limit {
         return Value::Unknown(ValueIssue::SizeLimit);
       }
-      let mut bytes = args.join(&b' ');
+      let mut bytes = Vec::with_capacity(size);
+      for (index, argument) in args.iter().enumerate() {
+        if index != 0 {
+          emit(None, 0..0, b" ");
+          bytes.push(b' ');
+        }
+        emit(Some(index), 0..argument.len(), argument);
+        bytes.extend_from_slice(argument);
+      }
+      emit(None, 0..0, b"\n");
       bytes.push(b'\n');
       Value::Literal(bytes)
     }
-    b"printf" => formatted_output(args, limit),
+    b"printf" => formatted_output(args, limit, emit),
     b"pwd"
       if known.as_ref().is_some_and(|args| {
         args.is_empty() || args.as_slice() == [b"-L".as_slice()]
@@ -1179,7 +1228,11 @@ pub(super) fn output(
   }
 }
 
-fn formatted_output(args: &[Argument<'_>], limit: usize) -> Value {
+fn formatted_output(
+  args: &[Argument<'_>],
+  limit: usize,
+  emit: &mut impl FnMut(Option<usize>, Range<usize>, &[u8]),
+) -> Value {
   let Some((format, operands)) = args.split_first() else {
     return Value::Unknown(ValueIssue::Unspecified);
   };
@@ -1208,10 +1261,15 @@ fn formatted_output(args: &[Argument<'_>], limit: usize) -> Value {
   let mut operand = 0;
   loop {
     let before = operand;
-    let mut bytes = format.iter().copied();
-    while let Some(byte) = bytes.next() {
+    let mut bytes = format.iter().copied().enumerate();
+    while let Some((start, byte)) = bytes.next() {
+      let mut end = start + 1;
+      let mut argument = 0;
       let value = match byte {
-        b'%' => match bytes.next() {
+        b'%' => match bytes.next().map(|(index, byte)| {
+          end = index + 1;
+          byte
+        }) {
           Some(b'%') => Value::Literal(vec![b'%']),
           Some(b's') => {
             let value = if boundaries_known {
@@ -1224,12 +1282,16 @@ fn formatted_output(args: &[Argument<'_>], limit: usize) -> Value {
                 argument_issue(operands).unwrap_or(ValueIssue::Dynamic),
               )
             };
+            argument = operand + 1;
             operand += 1;
             value
           }
           _ => return unsupported(&output),
         },
-        b'\\' => Value::Literal(vec![match bytes.next() {
+        b'\\' => Value::Literal(vec![match bytes.next().map(|(index, byte)| {
+          end = index + 1;
+          byte
+        }) {
           Some(b'n') => b'\n',
           Some(b't') => b'\t',
           Some(b'r') => b'\r',
@@ -1239,6 +1301,13 @@ fn formatted_output(args: &[Argument<'_>], limit: usize) -> Value {
         _ => Value::Literal(vec![byte]),
       };
       output.concat(&value, limit);
+      if let (Value::Literal(_), Value::Literal(bytes)) = (&output, &value) {
+        if argument == 0 {
+          emit(Some(0), start..end, bytes);
+        } else if !bytes.is_empty() {
+          emit(Some(argument), 0..bytes.len(), bytes);
+        }
+      }
     }
     if !boundaries_known || operand == before || operand >= operands.len() {
       break;
@@ -1257,10 +1326,9 @@ impl Resolver<'_> {
     let operands = &args[options.operands..];
     if options.delimiter
       || operands.is_empty()
-      || operands.iter().any(|arg| {
-        arg.count.boundary().is_err()
-          || !matches!(&arg.value, Value::Literal(name) if valid_name(name))
-      })
+      || !operands
+        .iter()
+        .all(|arg| arg.literal().is_some_and(valid_name))
     {
       env.io.consume_input(None);
       return Err(argument_issue(args).unwrap_or(ValueIssue::Dynamic));
@@ -1284,8 +1352,12 @@ impl Resolver<'_> {
     );
     env.io.consume_input(Some(offset));
     let word = word?;
-    let fields = word.split(&ifs, utf8, operands.len())?;
-    if operands.iter().all(|arg| matches!(&arg.value, Value::Literal(name) if env.readonly(name).is_none())) {
+    let (fields, _) = word.split(&ifs, utf8, operands.len())?;
+    if operands
+      .iter()
+      .filter_map(Argument::literal)
+      .all(|name| env.readonly(name).is_none())
+    {
       env.set_status(Value::Literal(b"0".to_vec()));
     }
     Ok(fields.iter().map(word::Field::value).collect())
@@ -1355,6 +1427,7 @@ struct OptionValues {
   argument: Option<Value>,
   cursor: OptionCursor,
 }
+
 fn option_values(
   args: &[Argument<'_>],
   env: &Environment,
@@ -1389,7 +1462,7 @@ fn option_values(
   let arguments = if args.len() == 2 {
     env.positional.clone()
   } else {
-    super::super::expansion::positional_arguments(&args[2..])
+    positional_arguments(&args[2..])
   };
   let (mut index, mut offset) = if env.options_reset {
     (1, 1)

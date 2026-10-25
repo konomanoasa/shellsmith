@@ -1,12 +1,13 @@
 use super::engine::{
   self, Access, Alternative, EffectTarget, ExecutionContextId, Location, Name,
-  NameEnvironment, NameId, ResolutionIssue, SymbolId, SymbolKind,
+  NameEnvironment, NameId, NameSite, ResolutionIssue, SymbolId, SymbolKind,
   check_cancelled, optional_reserved_word, reserved_word, special_builtin,
   unspecified_command, valid_name,
 };
 use super::support::NameCollection;
 use super::{Application, Error};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -30,14 +31,11 @@ struct SourceRange {
   end: usize,
 }
 
-type Site = (usize, usize);
-type Member = (usize, NameId);
-
 struct Selection {
   target: RenameTarget,
   kind: SymbolKind,
-  sites: BTreeSet<Site>,
-  members: BTreeSet<Member>,
+  sites: BTreeSet<NameSite>,
+  members: BTreeSet<(usize, NameId)>,
 }
 
 fn refused(message: &str) -> Error {
@@ -144,22 +142,9 @@ impl Application {
     offset: usize,
     cancelled: &AtomicBool,
   ) -> Result<Option<Selection>, Error> {
-    let path = self.absolute(path);
-    let id = self
-      .document_id(&path)
-      .ok_or_else(|| refused("The requested document is unavailable"))?;
-    let document = self
-      .workspace
-      .document(id)
-      .ok_or(engine::Error::UnknownDocument(id))?;
-    if !document.source().is_char_boundary(offset) {
-      return Err(engine::Error::InvalidPosition.into());
-    }
-    let candidates =
-      names
-        .results
-        .at(document.snapshot(), offset, true, cancelled)?;
-    let candidates: Vec<_> = candidates
+    let candidates: Vec<_> = self
+      .name_sites(names, path, offset, true, cancelled)?
+      .ok_or_else(|| refused("The requested document is unavailable"))?
       .into_iter()
       .filter(|site| !names.results.occurrence(*site).names.is_empty())
       .collect();
@@ -187,22 +172,20 @@ impl Application {
         .clone(),
       placeholder: String::from_utf8(name.text.clone()).expect("portable name"),
     };
-    let mut selection = Selection {
-      target,
-      kind: name.kind,
-      sites: BTreeSet::new(),
-      members: BTreeSet::new(),
-    };
     let related = names.results.related_occurrences(candidates, cancelled)?;
-    selection.sites = related.sites;
-    selection.members = related.members;
-    if !selection.members.iter().any(|(entry, id)| {
+    if !related.members.iter().any(|(entry, id)| {
       !names.results.entries[*entry].relations.names[id.0]
         .definitions
         .is_empty()
     }) {
       return Ok(None);
     }
+    let selection = Selection {
+      target,
+      kind: name.kind,
+      sites: related.sites,
+      members: related.members,
+    };
     selection.validate(names, cancelled)?;
     Ok(Some(selection))
   }
@@ -381,8 +364,8 @@ struct Relationships {
 }
 
 struct Shift {
-  old: std::ops::Range<usize>,
-  new: std::ops::Range<usize>,
+  old: Range<usize>,
+  new: Range<usize>,
 }
 
 struct SourceMap(BTreeMap<PathBuf, Vec<Shift>>);

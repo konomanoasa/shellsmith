@@ -4,6 +4,7 @@ use super::{
 use crate::interface::application::engine::{
   Access, Error, Location, Snapshot, SymbolId, SymbolKind, check_cancelled,
 };
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 
@@ -222,16 +223,14 @@ impl NameResults {
           check_cancelled(cancelled)?;
           let Some(identity) = *identity else { continue };
           match targets.entry(entry) {
-            std::collections::btree_map::Entry::Vacant(slot) => {
+            Entry::Vacant(slot) => {
               slot.insert(identity);
               pending.push_back((entry, identity));
             }
-            std::collections::btree_map::Entry::Occupied(slot)
-              if *slot.get() != identity =>
-            {
+            Entry::Occupied(slot) if *slot.get() != identity => {
               return Ok(None);
             }
-            std::collections::btree_map::Entry::Occupied(_) => {}
+            Entry::Occupied(_) => {}
           }
         }
       }
@@ -243,6 +242,7 @@ impl NameResults {
         .then_some(targets),
     )
   }
+
   fn definition_owners(
     &self,
     cancelled: &AtomicBool,

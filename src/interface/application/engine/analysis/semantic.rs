@@ -74,24 +74,6 @@ impl Document {
         | OccurrenceKind::SpecialParameter => SemanticKind::Parameter,
         _ => SemanticKind::Variable,
       };
-      let mut modifiers = BTreeSet::new();
-      match site.access {
-        Access::Definition => {
-          modifiers.insert(Modifier::Definition);
-        }
-        Access::Write | Access::ReadWrite | Access::ReadConditionalWrite => {
-          modifiers.extend([Modifier::Definition, Modifier::Modification]);
-        }
-        _ => {}
-      }
-      if site.kind == OccurrenceKind::DeclarationAssignment {
-        modifiers.insert(Modifier::Declaration);
-      }
-      if site.kind == OccurrenceKind::Command {
-        let resolution = syntax_resolution(self, site, None)
-          .or_else(|| resolved(inputs, site.id.index));
-        kind = command_kind(resolution.as_ref(), &mut modifiers);
-      }
       let readonly = inputs
         .iter()
         .flat_map(|(document, analysis)| {
@@ -104,8 +86,15 @@ impl Document {
         })
         .reduce(AttributeState::join)
         .unwrap_or(AttributeState::Unknown);
-      if readonly == AttributeState::Known(true) {
-        modifiers.insert(Modifier::Readonly);
+      let mut modifiers = name_modifiers(
+        site.access,
+        site.kind == OccurrenceKind::DeclarationAssignment,
+        readonly,
+      );
+      if site.kind == OccurrenceKind::Command {
+        let resolution = syntax_resolution(self, site, None)
+          .or_else(|| resolved(inputs, site.id.index));
+        kind = command_kind(resolution.as_ref(), &mut modifiers);
       }
       if kind == SemanticKind::Variable
         && resolved(inputs, site.id.index)
@@ -177,16 +166,8 @@ impl Document {
           readonly: attribute,
           ..
         } => {
-          if declaration {
-            modifiers.insert(Modifier::Declaration);
-          }
-          if access == Access::Write {
-            modifiers.extend([Modifier::Definition, Modifier::Modification]);
-          }
           readonly = attribute;
-          if readonly == AttributeState::Known(true) {
-            modifiers.insert(Modifier::Readonly);
-          }
+          modifiers = name_modifiers(access, declaration, readonly);
           SemanticKind::Variable
         }
         ArgumentKind::Command { .. } => {
@@ -256,6 +237,30 @@ fn resolved(
       left.join(&right);
       left
     })
+}
+
+fn name_modifiers(
+  access: Access,
+  declaration: bool,
+  readonly: AttributeState,
+) -> BTreeSet<Modifier> {
+  let mut modifiers = BTreeSet::new();
+  match access {
+    Access::Definition => {
+      modifiers.insert(Modifier::Definition);
+    }
+    Access::Write | Access::ReadWrite | Access::ReadConditionalWrite => {
+      modifiers.extend([Modifier::Definition, Modifier::Modification]);
+    }
+    _ => {}
+  }
+  if declaration {
+    modifiers.insert(Modifier::Declaration);
+  }
+  if readonly == AttributeState::Known(true) {
+    modifiers.insert(Modifier::Readonly);
+  }
+  modifiers
 }
 
 fn command_kind(

@@ -4,7 +4,7 @@ use tree_sitter::Node;
 
 use super::super::execution::{Environment, Flow, Transfer, alternative};
 use super::super::execution::{children, damage_outside};
-use super::super::expansion::Argument;
+use super::super::expansion::{Argument, positional_arguments};
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::word;
 use crate::interface::application::engine::workspace::parser;
@@ -178,31 +178,57 @@ impl<'a> Resolver<'a> {
       .into_iter()
       .filter(|word| word.kind() == "word")
       .collect();
-    self.arguments(
-      vec![command].into_iter(),
-      Vec::new(),
-      env,
+    let call = CallArguments {
+      node,
+      command,
+      arguments,
+      words: Vec::new(),
       frame,
+    };
+    self.expand_call(command, call, env)
+  }
+
+  /// Expands `node` after the words of `call` before classifying the rest.
+  fn expand_call(
+    &mut self,
+    node: Node<'a>,
+    mut call: CallArguments<'a>,
+    env: Environment,
+  ) -> Task<'a> {
+    let words = std::mem::take(&mut call.words);
+    self.arguments(
+      vec![node].into_iter(),
+      words,
+      env,
+      call.frame,
+      false,
       Box::new(move |resolver, words, env| {
-        resolver.command_arguments(
-          CallArguments {
-            node,
-            command,
-            arguments,
-            words,
-            frame,
-          },
-          env,
-        )
+        resolver.command_arguments(CallArguments { words, ..call }, env)
       }),
     )
   }
 
   fn command_arguments(
     &mut self,
-    call: CallArguments<'a>,
+    mut call: CallArguments<'a>,
     env: Environment,
   ) -> Task<'a> {
+    // Later state changes must not reintroduce choices captured by an argument.
+    let shared = !env.alternatives.is_empty()
+      && call.node.child_by_field_name("prefix").is_none()
+      && redirects(call.node).is_empty()
+      && self
+        .expansion_targets(
+          call.arguments.iter().copied().filter_map(|node| {
+            if node.child_by_field_name("name").is_some() {
+              node.child_by_field_name("value")
+            } else {
+              Some(node)
+            }
+          }),
+          call.frame,
+        )
+        .is_empty();
     if !env.alternatives.is_empty() {
       let source = self.workspace.source(call.frame.snapshot.document);
       let usage = argument_use(&call.words, &call.arguments, source, &env);
@@ -215,39 +241,32 @@ impl<'a> Resolver<'a> {
           .then_some(argument)
         },
       );
-      let names = self.value_dependencies(needed, call.frame);
+      let needed: Vec<_> = needed.collect();
+      let mut names = BTreeSet::new();
+      for argument in needed {
+        if !shared {
+          names.extend(self.value_dependencies([argument], call.frame));
+          continue;
+        }
+        match self.conditional_value(argument, &env, call.frame) {
+          Ok(Some(_)) => {}
+          Ok(None) => {
+            names.extend(self.value_dependencies([argument], call.frame));
+          }
+          Err(error) => {
+            self.error = Some(error);
+            return Task::Done(Flow::default());
+          }
+        }
+      }
       if env.alternatives.choice(&names).is_some() {
         return self.each_alternative(env, names, move |resolver, env| {
           resolver.command_arguments(call.clone(), env)
         });
       }
       if matches!(usage, ArgumentUse::Command) && !call.arguments.is_empty() {
-        let CallArguments {
-          node,
-          command,
-          mut arguments,
-          words,
-          frame,
-        } = call;
-        let first = arguments.remove(0);
-        return self.arguments(
-          vec![first].into_iter(),
-          words,
-          env,
-          frame,
-          Box::new(move |resolver, words, env| {
-            resolver.command_arguments(
-              CallArguments {
-                node,
-                command,
-                arguments,
-                words,
-                frame,
-              },
-              env,
-            )
-          }),
-        );
+        let first = call.arguments.remove(0);
+        return self.expand_call(first, call, env);
       }
     }
     let CallArguments {
@@ -262,6 +281,7 @@ impl<'a> Resolver<'a> {
       words,
       env,
       frame,
+      shared,
       Box::new(move |resolver, words, env| {
         resolver.expanded_command(node, command, words, env, frame)
       }),
@@ -702,7 +722,7 @@ impl<'a> Resolver<'a> {
     let args = args.to_vec();
     let mut call = env.clone();
     call.alternatives.forget_positionals();
-    call.positional = super::super::expansion::positional_arguments(&args);
+    call.positional = positional_arguments(&args);
     self
       .invoke_candidates(node, candidates, &call, Flow::default(), frame)
       .then(move |resolver, mut flow| {
@@ -712,37 +732,30 @@ impl<'a> Resolver<'a> {
         }
         let task = if resolution.alternatives.contains(&Alternative::Builtin) {
           let names = builtin_names(&name, &env, search != Search::Normal);
-          resolver.invoke_builtins(node, names.into_iter(), args.clone(), env.clone(), Flow::default(), frame)
-        } else { Task::Done(Flow::default()) };
+          resolver.invoke_builtins(
+            node,
+            names.into_iter(),
+            args.clone(),
+            env.clone(),
+            Flow::default(),
+            frame,
+          )
+        } else {
+          Task::Done(Flow::default())
+        };
         task.then(move |resolver, builtin| {
           flow.join(builtin);
           if resolution
             .alternatives
             .contains(&Alternative::ExternalCommand)
           {
-            let mut external = env.clone();
-            let output = if search == Search::Standard {
-              if let Value::Literal(name) = &name {
-                super::builtins::output(
-                  name,
-                  &args,
-                  &external,
-                  resolver.result.request.limits.value_bytes,
-                )
-              } else {
-                Value::Unknown(ValueIssue::Dynamic)
-              }
-            } else {
-              Value::Unknown(ValueIssue::UnsupportedExpansion)
-            };
-            external.emit(output, resolver.result.request.limits.value_bytes);
-            if search != Search::Standard || !matches!(&name, Value::Literal(name) if super::builtins::preserves_input(name)) {
-              external.io.consume_input(None);
-            }
-            if external.io.stderr_captured && let Some(output) = &mut external.io.output { output.fail(ValueIssue::Dynamic); }
-            external.set_status(Value::Unknown(
-                ValueIssue::Dynamic,
-              ),
+            let external = resolver.external_command(
+              node,
+              &name,
+              &args,
+              env.clone(),
+              search,
+              frame,
             );
             flow.add(Transfer::Next, external);
           }
@@ -759,6 +772,41 @@ impl<'a> Resolver<'a> {
           Task::Done(flow)
         })
       })
+  }
+
+  /// Output is known only for standard utilities that `command -p` selects.
+  fn external_command(
+    &self,
+    node: Node<'_>,
+    name: &Value,
+    args: &[Argument<'_>],
+    mut env: Environment,
+    search: Search,
+    frame: Frame,
+  ) -> Environment {
+    let limit = self.result.request.limits.value_bytes;
+    let standard = match name {
+      Value::Literal(name) if search == Search::Standard => Some(name),
+      _ => None,
+    };
+    let (output, trace) = match standard {
+      Some(name) => self.utility_output(node, name, args, &env, frame),
+      None if search == Search::Standard => {
+        (Value::Unknown(ValueIssue::Dynamic), None)
+      }
+      None => (Value::Unknown(ValueIssue::UnsupportedExpansion), None),
+    };
+    env.emit(output, trace, limit);
+    if !standard.is_some_and(|name| super::builtins::preserves_input(name)) {
+      env.io.consume_input(None);
+    }
+    if env.io.stderr_captured
+      && let Some(output) = &mut env.io.output
+    {
+      output.fail(ValueIssue::Dynamic);
+    }
+    env.set_status(Value::Unknown(ValueIssue::Dynamic));
+    env
   }
 
   fn invoke_builtins(
@@ -931,7 +979,7 @@ impl<'a> Resolver<'a> {
         self.argument_role(&arg, None, frame);
       }
     }
-    env.emit(output, self.result.request.limits.value_bytes);
+    env.emit(output, None, self.result.request.limits.value_bytes);
     self.non_source(node, frame);
     env.set_status(Value::Unknown(ValueIssue::Dynamic));
     Task::Done(Flow::next(env))
@@ -1159,12 +1207,12 @@ pub(super) fn builtin_names(
 
 fn query_output(name: &Value, resolution: &Resolution) -> Value {
   let issue = name.issue().unwrap_or(ValueIssue::Dynamic);
+  let mut line = name.clone();
+  line.concat(&Value::Literal(vec![b'\n']), usize::MAX);
   if let Value::Literal(bytes) = name
     && (special_builtin(bytes) || reserved_word(bytes))
   {
-    let mut output = name.clone();
-    output.concat(&Value::Literal(vec![b'\n']), usize::MAX);
-    return output;
+    return line;
   }
   let mut outputs = Vec::new();
   let unknown = unknown_utility(resolution);
@@ -1174,9 +1222,7 @@ fn query_output(name: &Value, resolution: &Resolution) -> Value {
         .alternatives
         .contains(&Alternative::ExternalCommand));
   if !resolution.candidates.is_empty() || unknown || bare_builtin {
-    let mut output = name.clone();
-    output.concat(&Value::Literal(vec![b'\n']), usize::MAX);
-    outputs.push(output);
+    outputs.push(line.clone());
   }
   for reserved in RESERVED
     .iter()
@@ -1194,9 +1240,7 @@ fn query_output(name: &Value, resolution: &Resolution) -> Value {
     ValueIssue::Dynamic,
   )) && !matches!(name, Value::Literal(bytes) if !colon_word(bytes))
   {
-    let mut output = name.clone();
-    output.concat(&Value::Literal(vec![b'\n']), usize::MAX);
-    outputs.push(output);
+    outputs.push(line);
   }
   if unknown
     || resolution
@@ -1207,13 +1251,7 @@ fn query_output(name: &Value, resolution: &Resolution) -> Value {
     path.join(&Value::Literal(Vec::new()));
     outputs.push(path);
   }
-  outputs
-    .into_iter()
-    .reduce(|mut left, right| {
-      left.join(&right);
-      left
-    })
-    .unwrap_or(Value::Unknown(issue))
+  Value::join_all(outputs, issue)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

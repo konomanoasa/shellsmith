@@ -239,7 +239,7 @@ mod extraction {
     let document = parse(
       1,
       1,
-      "cat <<'$not_used'\nbody\n$not_used\n: ~${not_used}\necho \"$((x $operator y))\"\n",
+      "cat <<'$not_used'\nbody\n$not_used\n: ~${not_used}\necho \"$((x $operator y))\"\n: $((z=$n))\n",
     );
     assert!(!document.has_syntax_errors());
     assert!(
@@ -254,7 +254,10 @@ mod extraction {
       .filter(|site| site.kind == OccurrenceKind::Arithmetic)
       .map(|site| site.access)
       .collect();
-    assert_eq!(arithmetic, vec![Access::Unknown, Access::Unknown]);
+    assert_eq!(
+      arithmetic,
+      vec![Access::Unknown, Access::Unknown, Access::Unknown]
+    );
     assert_eq!(document.symbols(), []);
   }
 

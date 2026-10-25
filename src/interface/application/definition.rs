@@ -1,4 +1,4 @@
-use super::engine::{DocumentId, Location, check_cancelled};
+use super::engine::{self, DocumentId, Location, check_cancelled};
 use super::{Application, Error};
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
@@ -12,17 +12,16 @@ impl Application {
   ) -> Result<Vec<Location>, Error> {
     let path = self
       .path(id)
-      .ok_or(super::engine::Error::UnknownDocument(id))?
+      .ok_or(engine::Error::UnknownDocument(id))?
       .to_path_buf();
     let analyses = self.prepare_position(&path, cancelled)?;
     let document = self
       .workspace
       .document(id)
-      .ok_or(super::engine::Error::UnknownDocument(id))?;
+      .ok_or(engine::Error::UnknownDocument(id))?;
     let snapshot = document.snapshot();
-    let resolution =
-      super::engine::AnalysisResults::new(analyses.entries.values())
-        .resolution_at(snapshot, offset)?;
+    let resolution = engine::AnalysisResults::new(analyses.entries.values())
+      .resolution_at(snapshot, offset)?;
     check_cancelled(cancelled)?;
     let mut locations = BTreeMap::new();
     if let Some(resolution) = resolution.filter(|result| {

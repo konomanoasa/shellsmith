@@ -44,11 +44,17 @@ impl Values {
   }
 
   pub fn literal(&mut self, value: Arc<Value>) -> ValueId {
-    let (width, ascii) = match value.as_ref() {
-      Value::Literal(bytes) => (Some(bytes.len()), bytes.is_ascii()),
-      _ => (None, false),
+    let (width, maximum, ascii) = match value.as_ref() {
+      Value::Literal(bytes) => {
+        let width = bytes.len();
+        (
+          Some(width),
+          (!bytes.contains(&0)).then_some(width),
+          bytes.is_ascii(),
+        )
+      }
+      _ => (None, None, false),
     };
-    let maximum = width.filter(|_| !matches!(value.as_ref(), Value::Literal(bytes) if bytes.contains(&0)));
     self.intern(Entry {
       expression: Expression::Literal(value.clone()),
       projected: value,

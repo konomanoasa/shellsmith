@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use engine::check_cancelled;
-use engine::{Analysis, AnalysisRequest};
+use engine::{Analysis, AnalysisInputs, AnalysisRequest};
 use engine::{
   Change, DependencyState, DocumentId, Error, ReferenceId, Revision, Snapshot,
   SourceReference,
@@ -54,6 +54,7 @@ impl Workspace {
     self.generation = Arc::new(());
     self.analysis = None;
   }
+
   #[must_use]
   pub fn document(&self, id: DocumentId) -> Option<&Document> {
     self.documents.get(&id).map(AsRef::as_ref)
@@ -383,7 +384,7 @@ impl Workspace {
   pub fn analyze(
     &mut self,
     request: AnalysisRequest,
-    inputs: &mut dyn super::super::AnalysisInputs,
+    inputs: &mut dyn AnalysisInputs,
     cancelled: &AtomicBool,
   ) -> Result<Analysis, Error> {
     check_cancelled(cancelled)?;
@@ -393,7 +394,7 @@ impl Workspace {
     staged.changed();
     staged.index_document(request.entry.document, request.limits, cancelled)?;
     let arena = typed_arena::Arena::new();
-    let mut result = super::super::analysis::analyze(
+    let mut result = engine::analysis::analyze(
       &mut staged,
       request,
       &arena,
@@ -403,7 +404,6 @@ impl Workspace {
     staged.prune_derived(result.request().entry.document, &result.derived);
     result.synchronize(&staged);
     check_cancelled(cancelled)?;
-    staged.analysis = None;
     *self = staged;
     Ok(result)
   }

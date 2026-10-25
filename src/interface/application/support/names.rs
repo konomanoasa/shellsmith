@@ -132,6 +132,32 @@ impl Application {
     )
   }
 
+  /// Name sites at `offset`, or `None` when no document is open at `path`.
+  pub(in crate::interface::application) fn name_sites(
+    &self,
+    collection: &NameCollection,
+    path: &Path,
+    offset: usize,
+    editable: bool,
+    cancelled: &AtomicBool,
+  ) -> Result<Option<Vec<engine::NameSite>>, Error> {
+    let Some(document) = self
+      .document_id(path)
+      .and_then(|id| self.workspace.document(id))
+    else {
+      return Ok(None);
+    };
+    if !document.source().is_char_boundary(offset) {
+      return Err(engine::Error::InvalidPosition.into());
+    }
+    Ok(Some(collection.results.at(
+      document.snapshot(),
+      offset,
+      editable,
+      cancelled,
+    )?))
+  }
+
   pub(in crate::interface::application) fn check_name_inputs(
     &mut self,
     collection: &NameCollection,

@@ -1,5 +1,6 @@
 use super::super::execution::{CommandFailure, Environment, Flow};
 use super::super::execution::{children, damage_outside};
+use super::super::expansion::Expansion;
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
   Document, Error, ResolutionIssue, Snapshot, Value, ValueIssue,
@@ -32,52 +33,48 @@ impl<'a> Resolver<'a> {
         if target == Value::Literal(Vec::new()) {
           env.failure = CommandFailure::Definite;
         } else {
-          env.failure.uncertain(target.issue().unwrap_or(ValueIssue::Dynamic));
+          env
+            .failure
+            .uncertain(target.issue().unwrap_or(ValueIssue::Dynamic));
         }
       } else {
         let known = matches!(
-          (fd, operator.as_slice(), &target),
-          (_, b"<&" | b">&", Value::Literal(target)) if target == b"-"
-        ) || matches!(
-          (fd, operator.as_slice(), &target),
-          (0, b"<&", Value::Literal(target)) if target == b"0"
-        ) || matches!(
-          (fd, operator.as_slice(), &target),
-          (1 | 2, b">&", Value::Literal(target)) if matches!(target.as_slice(), b"1" | b"2")
+          (fd, operator.as_slice(), target.literal().ok()),
+          (_, b"<&" | b">&", Some(b"-"))
+            | (0, b"<&", Some(b"0"))
+            | (1 | 2, b">&", Some(b"1" | b"2"))
         );
         if !known {
-          env.failure.uncertain(target.issue().unwrap_or(ValueIssue::Dynamic));
+          env
+            .failure
+            .uncertain(target.issue().unwrap_or(ValueIssue::Dynamic));
         }
       }
-      match (fd, operator.as_slice(), &target) {
-        (0, b"<&", Value::Literal(target)) if target == b"0" => {}
+      match (fd, operator.as_slice(), target.literal().ok()) {
+        (0, b"<&", Some(b"0"))
+        | (1, b">&", Some(b"1"))
+        | (2, b">&", Some(b"2")) => {}
         (0, b"<" | b"<>" | b">" | b">>" | b">|", _) => {
           env
             .io
             .connect_input(Err(target.issue().unwrap_or(ValueIssue::Dynamic)));
         }
-        (0, b"<&", Value::Literal(target)) if target == b"-" => {
+        (0, b"<&", Some(b"-")) => {
           env.io.connect_input(Err(ValueIssue::Dynamic));
         }
-        (1, b"<" | b"<>" | b">" | b">>" | b">|", _) => {
+        (1, b"<" | b"<>" | b">" | b">>" | b">|", _)
+        | (1, b">&", Some(b"-")) => {
           env.io.stdout_redirected = true;
         }
-        (2, b"<" | b"<>" | b">" | b">>" | b">|", _) => {
+        (2, b"<" | b"<>" | b">" | b">>" | b">|", _)
+        | (2, b">&", Some(b"-")) => {
           env.io.stderr_captured = false;
         }
-        (1, b">&", Value::Literal(target)) if target == b"2" => {
+        (1, b">&", Some(b"2")) => {
           env.io.stdout_redirected = !env.io.stderr_captured;
         }
-        (2, b">&", Value::Literal(target)) if target == b"1" => {
+        (2, b">&", Some(b"1")) => {
           env.io.stderr_captured = !env.io.stdout_redirected;
-        }
-        (1, b">&", Value::Literal(target)) if target == b"1" => {}
-        (2, b">&", Value::Literal(target)) if target == b"2" => {}
-        (1, b">&", Value::Literal(target)) if target == b"-" => {
-          env.io.stdout_redirected = true;
-        }
-        (2, b">&", Value::Literal(target)) if target == b"-" => {
-          env.io.stderr_captured = false;
         }
         _ => {
           env
@@ -114,7 +111,7 @@ impl<'a> Resolver<'a> {
     let rest = damage_outside(document, &["body"]);
     let task = match document.child_by_field_name("body") {
       Some(body) => self.expand_start(body, false, env, frame),
-      None => Task::expanded(super::super::expansion::Expansion {
+      None => Task::expanded(Expansion {
         word: word::Word::value(Value::Literal(Vec::new()), true),
         env,
       }),
@@ -172,12 +169,8 @@ pub(in crate::interface::application::engine::analysis) fn index_heredocs<
       "here_end" | "tilde_expansion" => continue,
       _ => {}
     }
-    pending.extend(
-      super::super::execution::children(node)
-        .into_iter()
-        .rev()
-        .map(|child| (child, owner)),
-    );
+    pending
+      .extend(children(node).into_iter().rev().map(|child| (child, owner)));
   }
   let mut bodies = Vec::new();
   for (owner, mut headers) in headers {
@@ -238,6 +231,7 @@ pub(in crate::interface::application::engine::analysis) struct Redirections {
   /// Redirections that may also persist leave their descriptors unknown.
   may_persist: bool,
 }
+
 impl Redirections {
   pub(in crate::interface::application::engine::analysis) fn new(
     nodes: &[Node<'_>],
@@ -268,6 +262,7 @@ impl Redirections {
     }
     saved
   }
+
   pub(in crate::interface::application::engine::analysis) fn restore(
     &self,
     flow: &mut Flow,

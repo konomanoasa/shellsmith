@@ -1,4 +1,4 @@
-use super::engine::{DocumentId, SymbolDetails};
+use super::engine::{self, DocumentId, SymbolDetails};
 use super::{Application, Error};
 use std::collections::BTreeMap;
 
@@ -17,7 +17,7 @@ impl Application {
     self
       .workspace
       .document(id)
-      .ok_or(super::engine::Error::UnknownDocument(id))?;
+      .ok_or(engine::Error::UnknownDocument(id))?;
     let mut entries = self.workspace.document_symbol_details(id);
     entries.sort_by_key(|entry| {
       (

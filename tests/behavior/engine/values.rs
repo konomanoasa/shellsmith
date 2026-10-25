@@ -115,6 +115,11 @@ mod assignments {
       "read suffix; tool=$(command -v \"/bin/$suffix\"); \"$tool\"",
       "tool=$(command -v missing); copy=$tool; \"$copy\"",
       "read name; \"/bin/$name\"",
+      "read name; /bin/$name",
+      "read suffix; cd$suffix",
+      "prefix=/usr/local; read name; $prefix/bin/$name",
+      "tool='ex port'; read name; ${tool}$name",
+      "f() { /bin/$1; if condition; then f x; fi; }; f",
       "read a b; \"$a/middle/$b\"",
       "read name; command \"/bin/$name\"",
       "read name; command -- \"/bin/$name\"",
@@ -164,6 +169,8 @@ mod assignments {
       "tool=$(command -v missing); name=${tool##*/}; \"$name\"",
       "read name; \"$name\"",
       "tool=$(command -v missing); $tool",
+      "read name; $name/bin",
+      "tool=ex; read name; ${tool}$name keep=no",
       "tool=$(command -V missing); \"$tool\"",
       "read name; \"/bin/$((1/0))\"",
     ] {
@@ -954,6 +961,8 @@ mod assignments {
       "set -eeuu",
       "set -o errexit -o nounset",
       "set +o errexit +o nounset",
+      "set -oerrexit -onounset -onoglob",
+      "set +oerrexit +onounset +onoglob",
       "set -euo nounset",
       "set -uoerrexit",
       "set +eonounset",
@@ -1102,6 +1111,23 @@ mod assignments {
   }
 
   #[test]
+  fn recursion_summaries_include_any_variable_dynamic_arithmetic_may_write() {
+    for (source, expected) in [
+      (
+        "y=1; f() { : $((x+$1)); if c; then f '-(y=2)'; fi; }; f 0; : \"$y\"",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "y=1; f() { : $((x+1)); if c; then f; fi; }; f; : \"$y\"",
+        Value::Literal(b"1".to_vec()),
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      assert_eq!(reads(&workspace, &analysis, b"y"), [expected], "{source}");
+    }
+  }
+
+  #[test]
   fn recursion_summaries_include_any_function_an_undecoded_definition_may_name()
   {
     use shellsmith::interface::application::engine::{
@@ -1196,6 +1222,8 @@ mod assignments {
     for command in [
       "set -euo unknown",
       "set -o hashall",
+      "set -onoglobx",
+      "set +eonounsetx",
       "set -z",
       "set -",
       "flags=$(echo -eu); set \"$flags\"",
@@ -1391,6 +1419,49 @@ mod assignments {
         };
         assert_eq!(actual_issue, issue, "{source}");
       }
+    }
+  }
+
+  #[test]
+  fn tilde_values_are_unspecified_on_every_path_where_home_may_be_unset() {
+    let (workspace, result) =
+      analyze("HOME=/home/user; path=~/lib; : \"$path\"");
+    assert_eq!(
+      reads(&workspace, &result, b"path"),
+      [Value::Literal(b"/home/user/lib".to_vec())]
+    );
+    let (workspace, result) = analyze(
+      "HOME=/a; while condition; do HOME=/b; done; path=~; : \"$path\"",
+    );
+    let values = reads(&workspace, &result, b"path");
+    let [Value::Partial(value)] = values.as_slice() else {
+      panic!("{values:?}");
+    };
+    assert_eq!(value.issue, ValueIssue::Dynamic);
+    for (source, causes) in [
+      (
+        "unset HOME; path=~/lib; : \"$path\"",
+        [ValueIssue::Unspecified].as_slice(),
+      ),
+      (
+        "HOME=; while condition; do unset HOME; done; path=~; : \"$path\"",
+        &[ValueIssue::Unspecified],
+      ),
+      (
+        "HOME=/home/user; while condition; do unset HOME; done; path=~/lib; : \"$path\"",
+        &[ValueIssue::Dynamic, ValueIssue::Unspecified],
+      ),
+      (
+        "if condition; then HOME=/home/user; else unset HOME; fi; path=~/lib; : \"$path\"",
+        &[ValueIssue::Unspecified],
+      ),
+    ] {
+      let (workspace, result) = analyze(source);
+      let values = reads(&workspace, &result, b"path");
+      let [Value::Unknown(issue)] = values.as_slice() else {
+        panic!("{source}: {values:?}");
+      };
+      assert_eq!(issue.causes().collect::<Vec<_>>(), causes, "{source}");
     }
   }
 
@@ -1820,6 +1891,52 @@ mod expansion {
 
   fn last_value(source: &str, initial: InitialEnvironment) -> Value {
     last_value_with_limit(source, initial, 1024 * 1024)
+  }
+
+  #[test]
+  fn named_set_options_switch_flags_and_preserve_argument_boundaries() {
+    for (options, expected) in [
+      ("-o errexit -o nounset -o noglob", "1:kept:/work/*.sh"),
+      ("-oerrexit -onounset -onoglob", "1:kept:/work/*.sh"),
+      ("+o errexit +o nounset +o noglob", "0:kept:/work/a.sh"),
+      ("+oerrexit +onounset +onoglob", "0:kept:/work/a.sh"),
+      ("-oerrexit +onounset -onoglob", "0:kept:/work/*.sh"),
+      ("+oerrexit -onounset +onoglob", "1:kept:/work/a.sh"),
+      ("-euonoglob", "1:kept:/work/*.sh"),
+      ("+euonoglob", "0:kept:/work/a.sh"),
+      ("-euo noglob replacement", "1:replacement:/work/*.sh"),
+      ("-euonoglob replacement", "1:replacement:/work/*.sh"),
+      ("+euo noglob -- replacement", "0:replacement:/work/a.sh"),
+      ("+euonoglob -- replacement", "0:replacement:/work/a.sh"),
+    ] {
+      for enabled in [false, true] {
+        let initial = InitialEnvironment {
+          errexit: Some(enabled),
+          nounset: Some(enabled),
+          noglob: Some(enabled),
+          ..InitialEnvironment::empty()
+        };
+        let mut inputs = support::Inputs::default();
+        inputs.evaluated.insert(
+          InputQuery::Glob {
+            cwd: Vec::new(),
+            pattern: b"/work/*.sh".to_vec(),
+            quoted: vec![false; 10],
+            utf8: false,
+            portable_collation: true,
+          },
+          InputResult::Paths(vec![b"/work/a.sh".to_vec()]),
+        );
+        let source = format!(
+          "set -- kept; set {options}; first=$1; : \"$missing\"; status=$?; set -- /work/*.sh; result=\"$status:$first:$1\"; : \"$result\""
+        );
+        assert_eq!(
+          last_value_with_inputs(&source, initial, 1024, &mut inputs),
+          Value::Literal(expected.as_bytes().to_vec()),
+          "{source}, initially enabled: {enabled}"
+        );
+      }
+    }
   }
 
   #[test]
@@ -2439,21 +2556,87 @@ mod expansion {
   }
 
   #[test]
-  fn branch_appends_of_different_widths_keep_each_path_exact() {
-    let appends = "if [ -d d ]; then PATH=\"$PATH:d\"; fi\n".repeat(40);
-    for (tail, expected) in [
-      ("n=${#PATH}; result=$(((n - 4) % 2)); : \"$result\"", "0"),
-      (
-        "joined=\"$PATH$PATH\"; n=${#joined}; result=$((n % 4)); : \"$result\"",
-        "0",
-      ),
+  fn declaration_choices_preserve_argument_time_values_and_readonly_writes() {
+    for body in [
+      "export x=$a y=$b; result=$((x-y))",
+      "export a=3 saved=$a; result=$((saved-b))",
+      "command export x=$a y=$b; result=$((x-y))",
+      "readonly x=$a y=$b; x=9; result=$((x-y))",
+      "a=$((a+1)) export saved=$a; result=$((a-saved-1))",
+      "export saved=$a >\"$((a+=1))\"; result=$((a-saved-1))",
+      "export saved=$a changed=${other:=5}; result=$((saved-b))",
+      "export x=$((a+1)) y=$((b+1)); result=$((x-y))",
+      "export x=${a#?} y=${b#?}; result=$((x-y))",
     ] {
-      let source = format!("PATH=/bin\n{appends}{tail}");
+      let source = format!(
+        "if condition; then a=1; b=1; else a=2; b=2; fi; {body}; : \"$result\""
+      );
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(b"0".to_vec()),
+        "{body}"
+      );
+    }
+    assert_eq!(
+      last_value(
+        "readonly result=kept; if c; then a=one; else a=two; fi; export result=$a; : \"$result\"",
+        InitialEnvironment::empty()
+      ),
+      Value::Literal(b"kept".to_vec())
+    );
+    assert_eq!(
+      last_value_with_limit(
+        "if c; then a=abcde; else a=fghij; fi; export result=$a$a; : \"$result\"",
+        InitialEnvironment::empty(),
+        8
+      ),
+      Value::Unknown(ValueIssue::SizeLimit)
+    );
+  }
+
+  #[test]
+  fn pattern_choices_preserve_quotes_and_correlated_operands() {
+    for (body, expected) in [
+      ("result=${p#*/}", "path.txt"),
+      ("export result=${p##*/}", "path.txt"),
+      ("trimmed=${p%.txt}; result=${trimmed##*/}", "path"),
+      ("prefix=${p%%/*}; result=${p#\"$prefix/\"}", "path.txt"),
+      ("copy=${p#'*/'}; result=$((${#copy}-${#p}))", "0"),
+      ("copy=${p#}; result=$((${#copy}-${#p}))", "0"),
+      ("result=${p#${prefix:=*/}}", "path.txt"),
+    ] {
+      let source = format!(
+        "if c; then p=left/path.txt; else p=right/path.txt; fi; {body}; : \"$result\""
+      );
       assert_eq!(
         last_value(&source, InitialEnvironment::empty()),
         Value::Literal(expected.as_bytes().to_vec()),
-        "{tail}"
+        "{body}"
       );
+    }
+  }
+
+  #[test]
+  fn branch_appends_of_different_widths_keep_each_path_exact() {
+    for declaration in ["", "export "] {
+      let appends =
+        format!("if [ -d d ]; then {declaration}PATH=\"$PATH:d\"; fi\n")
+          .repeat(40);
+      for (tail, expected) in [
+        ("n=${#PATH}; result=$(((n - 4) % 2)); : \"$result\"", "0"),
+        (
+          "joined=\"$PATH$PATH\"; n=${#joined}; result=$((n % 4)); : \"$result\"",
+          "0",
+        ),
+        ("result=${PATH%%:*}; : \"$result\"", "/bin"),
+      ] {
+        let source = format!("PATH=/bin\n{appends}{tail}");
+        assert_eq!(
+          last_value(&source, InitialEnvironment::empty()),
+          Value::Literal(expected.as_bytes().to_vec()),
+          "{declaration}{tail}"
+        );
+      }
     }
   }
 
@@ -3380,10 +3563,57 @@ EOF
       ),
       (
         "read x; set -- a $x; set -- \"$@\"tail; result=$1",
-        Value::Unknown(ValueIssue::Dynamic),
+        Value::Partial(PartialValue {
+          choices: vec![ValueConstraint {
+            prefix: b"a".to_vec(),
+            suffix: Vec::new(),
+            minimum: 1,
+            required: b"a".iter().copied().collect(),
+            exact: false,
+          }],
+          issue: ValueIssue::Dynamic,
+        }),
       ),
       (
         "read x; set -- $x tail; set -- pre\"$@\"; result=$2",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+      (
+        "r='a b'; read x; set -- $r$x; result=$1",
+        Value::Literal(b"a".to_vec()),
+      ),
+      (
+        "r='a '; read x; set -- $r$x; result=$1",
+        Value::Literal(b"a".to_vec()),
+      ),
+      (
+        "r='a b'; read x; set -- $r$x; result=$2",
+        Value::Partial(PartialValue {
+          choices: vec![ValueConstraint {
+            prefix: b"b".to_vec(),
+            suffix: Vec::new(),
+            minimum: 1,
+            required: b"b".iter().copied().collect(),
+            exact: false,
+          }],
+          issue: ValueIssue::Dynamic,
+        }),
+      ),
+      (
+        "IFS=:; r='a b'; read x; set -- $r$x; result=$1",
+        Value::Partial(PartialValue {
+          choices: vec![ValueConstraint {
+            prefix: b"a b".to_vec(),
+            suffix: Vec::new(),
+            minimum: 3,
+            required: b"a b".iter().copied().collect(),
+            exact: false,
+          }],
+          issue: ValueIssue::Dynamic,
+        }),
+      ),
+      (
+        "r='a '; read x; set -- $r$x; result=$2",
         Value::Unknown(ValueIssue::Dynamic),
       ),
       (
@@ -4034,8 +4264,8 @@ mod excluded_effects {
   use crate::support;
 
   use shellsmith::interface::application::engine::{
-    Analysis, DocumentId, InitialBinding, InitialEnvironment, OccurrenceKind,
-    ResolutionIssue, Value, Workspace,
+    Analysis, Document, DocumentId, InitialBinding, InitialEnvironment,
+    OccurrenceKind, ResolutionIssue, Value, Workspace,
   };
 
   fn analyze(source: &str) -> (Workspace, Analysis) {
@@ -4240,6 +4470,183 @@ mod excluded_effects {
         "{call}"
       );
     }
+  }
+
+  #[test]
+  fn self_reproducing_traps_stop_at_recurring_material_without_changing_the_caller()
+   {
+    for body in [
+      r#"H="$H EXIT"; trap "$H" EXIT"#,
+      r#"copy="$H EXIT"; H=$copy; trap "$H" EXIT"#,
+      r#"H=$(command -p printf "%s%s" "$H" " EXIT"); trap "$H" EXIT"#,
+      r#"H=$(command -p printf "%s" "$H" " EXIT"); trap "$H" EXIT"#,
+      r#"H=$(command -p printf "%s\n" "$H EXIT"); trap "$H" EXIT"#,
+      r#"H=$(command -p echo "$H EXIT"); trap "$H" EXIT"#,
+      r#"H=$(command -p printf "%s" "$H"; command -p printf " EXIT"); trap "$H" EXIT"#,
+      r#"H=$(command -p printf "%s" "$(command -p printf "%s" "$H")" " EXIT"); trap "$H" EXIT"#,
+    ] {
+      let source =
+        format!(r#"kept=original; H='{body}'; trap "${{H}}" EXIT; : "$kept""#);
+      let (workspace, analysis) = analyze(&source);
+      assert_eq!(workspace.documents().count(), 4, "{body}");
+      assert_eq!(
+        analysis
+          .gaps()
+          .iter()
+          .filter(|gap| gap.issue == ResolutionIssue::Recursion)
+          .count(),
+        1,
+        "{body}"
+      );
+      assert!(
+        !analysis
+          .gaps()
+          .iter()
+          .any(|gap| gap.issue == ResolutionIssue::ValueLimit),
+        "{body}"
+      );
+      assert_eq!(
+        last_value(&workspace, &analysis, b"kept"),
+        Value::Literal(b"original".to_vec()),
+        "{body}"
+      );
+    }
+    let (workspace, analysis) = analyze(
+      r#"A='copy="$B EXIT"; B=$copy; trap "$B" EXIT'; B='copy="$A EXIT"; A=$copy; trap "$A" EXIT'; trap "${A}" EXIT"#,
+    );
+    assert_eq!(workspace.documents().count(), 5);
+    assert_eq!(
+      analysis
+        .gaps()
+        .iter()
+        .filter(|gap| gap.issue == ResolutionIssue::Recursion)
+        .count(),
+      1
+    );
+  }
+
+  #[test]
+  fn finite_traps_keep_distinct_material_even_when_the_registration_is_reused()
+  {
+    for (source, expected) in [
+      (
+        r#"h0='marker=ok; : "$marker"; : padding_to_make_the_final_body_larger'; h1='H=$h0; trap "$H" EXIT EXIT'; h2='H=$h1; trap "$H" EXIT'; H=$h2; trap "${H}" EXIT"#,
+        1,
+      ),
+      (
+        r#"register() { trap "$H" EXIT; }; h0='marker=ok; : "$marker"'; h1='H=$h0; register'; H='H=$h1; register'; register"#,
+        1,
+      ),
+      (
+        r#"register() { H=$next; trap "$H" EXIT; }; h0='marker=ok; : "$marker"'; next='next=$h0; register'; register"#,
+        1,
+      ),
+      (
+        r#"register() { H=$(command -p printf "%s" "$next"); trap "$H" EXIT; }; h0='marker=ok; : "$marker"'; next='next=$h0; register'; register"#,
+        1,
+      ),
+      (
+        r#"h='marker=ok; : "$marker"'; trap "$h" EXIT; trap "$h" INT"#,
+        2,
+      ),
+      (
+        r#"if condition; then H='marker=ok; : "$marker"'; else H='marker=ok; : "$marker"'; fi; trap "$H" EXIT"#,
+        1,
+      ),
+      (
+        r#"H=$(if condition >/dev/null; then command -p printf "%s" 'marker=ok; : "$marker"'; else command -p printf "%s" 'marker=ok; : "$marker"'; fi); trap "$H" EXIT"#,
+        1,
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      let markers: Vec<_> = workspace
+        .documents()
+        .flat_map(Document::occurrences)
+        .filter(|site| {
+          site.kind == OccurrenceKind::VariableExpansion
+            && site.name == Value::Literal(b"marker".to_vec())
+        })
+        .flat_map(|site| {
+          analysis.values(site.id).map(|(_, value)| value.clone())
+        })
+        .collect();
+      assert_eq!(
+        markers,
+        vec![Value::Literal(b"ok".to_vec()); expected],
+        "{source}"
+      );
+      assert!(
+        !analysis
+          .gaps()
+          .iter()
+          .any(|gap| gap.issue == ResolutionIssue::Recursion),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn untraced_trap_transformations_require_the_body_to_repeat_before_recursion()
+  {
+    let base = r#"H=${H% EXIT}; trap "$H""#;
+    let body = format!("{base}{}", " EXIT".repeat(12));
+    let (workspace, analysis) =
+      analyze(&format!(r#"H='{body}'; trap "$H" EXIT"#));
+    for count in 0..=12 {
+      let expected = format!("{base}{}", " EXIT".repeat(count));
+      assert!(
+        workspace
+          .documents()
+          .any(|document| document.source() == expected),
+        "{expected}"
+      );
+    }
+    assert_eq!(workspace.documents().count(), 15);
+    assert_eq!(
+      analysis
+        .gaps()
+        .iter()
+        .filter(|gap| gap.issue == ResolutionIssue::Recursion)
+        .count(),
+      1
+    );
+  }
+
+  #[test]
+  fn trap_provenance_follows_long_copy_chains_without_using_the_call_stack() {
+    std::thread::Builder::new()
+      .stack_size(512 * 1024)
+      .spawn(|| {
+        let mut source = String::from("h0='marker=ok; : \"$marker\"'; ");
+        for index in 1..=512 {
+          use std::fmt::Write;
+          write!(source, "h{index}=$h{}; ", index - 1).unwrap();
+        }
+        source.push_str("trap \"$h512\" EXIT");
+        let (workspace, analysis) = analyze(&source);
+        assert_eq!(workspace.documents().count(), 2);
+        let markers: Vec<_> = workspace
+          .documents()
+          .flat_map(Document::occurrences)
+          .filter(|site| {
+            site.kind == OccurrenceKind::VariableExpansion
+              && site.name == Value::Literal(b"marker".to_vec())
+          })
+          .flat_map(|site| {
+            analysis.values(site.id).map(|(_, value)| value.clone())
+          })
+          .collect();
+        assert_eq!(markers, [Value::Literal(b"ok".to_vec())]);
+        assert!(
+          !analysis
+            .gaps()
+            .iter()
+            .any(|gap| gap.issue == ResolutionIssue::Recursion)
+        );
+      })
+      .unwrap()
+      .join()
+      .unwrap();
   }
 
   #[test]

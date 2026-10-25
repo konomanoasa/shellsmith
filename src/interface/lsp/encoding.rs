@@ -2,7 +2,7 @@ use crate::interface::application::engine::{
   self, DocumentId, Modifier, SemanticKind, SemanticSpan, SymbolDetails,
   SymbolKind,
 };
-use crate::interface::application::{Application, Error};
+use crate::interface::application::{Application, Error, RenameEdit};
 use async_lsp::lsp_types as lsp;
 use async_lsp::{ErrorCode, ResponseError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,7 +96,7 @@ pub(super) fn document_offset(
 
 pub(super) fn workspace_edit(
   application: &Application,
-  edits: Vec<crate::interface::application::RenameEdit>,
+  edits: Vec<RenameEdit>,
   opened: &BTreeMap<PathBuf, OpenDocument>,
   document_changes: bool,
 ) -> Result<lsp::WorkspaceEdit, Error> {
@@ -330,6 +330,7 @@ struct Lines<'a> {
   ends: Vec<usize>,
   excess: Vec<(usize, usize)>,
 }
+
 impl<'a> Lines<'a> {
   fn new(source: &'a str) -> Self {
     let mut total = 0;
@@ -394,10 +395,12 @@ impl<'a> Lines<'a> {
       lsp::Position::new(el, ec),
     ))
   }
+
   fn excess_at(&self, offset: usize) -> usize {
     let index = self.excess.partition_point(|(end, _)| *end <= offset);
     index.checked_sub(1).map_or(0, |index| self.excess[index].1)
   }
+
   /// Nonempty segments as (line, UTF-16 column, UTF-16 length).
   fn segments(
     &self,
@@ -570,6 +573,7 @@ const fn token_kind(kind: SemanticKind) -> &'static str {
     SemanticKind::Command => "command",
   }
 }
+
 const fn token_modifier(modifier: Modifier) -> &'static str {
   match modifier {
     Modifier::Declaration => "declaration",

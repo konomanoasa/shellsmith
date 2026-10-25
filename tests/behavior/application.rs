@@ -491,10 +491,14 @@ mod documents {
     let settings = Settings::new(fixture.root.clone());
     let mut app = Application::new(settings).unwrap();
     app.open(&lib, "opened=1\n", &cancel).unwrap();
+    app.open(&other, "other=1\n", &cancel).unwrap();
     std::fs::remove_file(&lib).unwrap();
     std::os::unix::fs::symlink(&other, &lib).unwrap();
     app.change(&lib, "edited=1\n", &cancel).unwrap();
     assert_eq!(app.workspace().symbols_named(b"edited").count(), 1);
+    app.change(&lib, "other=1\n", &cancel).unwrap();
+    assert_eq!(app.workspace().symbols_named(b"edited").count(), 0);
+    assert_eq!(app.workspace().symbols_named(b"other").count(), 2);
     app.close(&lib, &cancel).unwrap();
     let names: Vec<_> = app
       .workspace()
@@ -3529,6 +3533,8 @@ mod definitions {
       ("x=1; read x; : \"$x\"", "x\"", &["x; :"]),
       ("read x", "x", &["x"]),
       ("export 'x=1'; : \"$x\"", "x\"", &["x=1"]),
+      ("read v; export \"x=$v\"", "x=", &["x="]),
+      ("read v; readonly x\"=$v\"", "x\"", &["x\""]),
       ("getopts a x; : \"$x\"", "x\"", &["x; :"]),
       ("readonly x=1; read x; : \"$x\"", "x\"", &["x=1"]),
       (
@@ -3595,6 +3601,8 @@ mod definitions {
     assert_definitions(&[
       ("x=1; n=2; : $((x+$n))", "x+$n", &["x=1"]),
       ("x=1; n=2; : $((x=$n)); : \"$x\"", "x\"", &["x=$n"]),
+      ("read n; : $((x=$n)); : \"$x\"", "x=$n", &[]),
+      ("n=1; trap ': $((x=$n))' EXIT; : \"$x\"", "x=$n", &["x=$n"]),
       ("x=1; f() { : $((x+$1)); }; f 1; f 2", "x+$1", &["x=1"]),
       ("x=1; f() { : $((x $1 2)); }; f +; f =", "x $1", &[]),
       (
@@ -4381,6 +4389,11 @@ mod references {
   fn references_preserve_namespaces_environments_and_certain_inheritance() {
     for (source, query, expected) in [
       (
+        "if c; then value=one; else value=two; fi; readonly copy=$value; : \"$value\"",
+        "value=one",
+        vec![2, 3],
+      ),
+      (
         "value=1; read name; read \"$name\"; value=2 read result <\"$(: \"$value\")\"; : \"$value\"",
         "value=1",
         vec![2, 3],
@@ -4520,6 +4533,13 @@ mod references {
         "work()",
         vec![1, 2],
         vec![0, 1, 2],
+      ),
+      (
+        "read v; export \"value=$v/suffix\"; : \"$value\"",
+        "value",
+        "value=",
+        vec![1],
+        vec![0, 1],
       ),
     ] {
       assert_references(source, name, query, false, &uses);
@@ -5403,6 +5423,12 @@ mod rename {
   fn rename_preserves_names_and_source_delimiters() {
     for (source, query, new_name, expected) in [
       (
+        "if c; then x=one; else x=two; fi; readonly copy=$x; export x=${x#?}; : \"$x\"",
+        "x=one",
+        "value",
+        "if c; then value=one; else value=two; fi; readonly copy=$value; export value=${value#?}; : \"$value\"",
+      ),
+      (
         "x=1; x=2; : $x ${x}",
         "x=1",
         "value",
@@ -5513,6 +5539,12 @@ mod rename {
         "fun()",
         "run",
         "run() { :; }; trap 'run' EXIT",
+      ),
+      (
+        "n=1; trap ': $((x=$n))' EXIT; : \"$x\"",
+        "x=$n",
+        "value",
+        "n=1; trap ': $((value=$n))' EXIT; : \"$value\"",
       ),
     ] {
       assert_renamed(source, query, new_name, expected);
@@ -5702,6 +5734,12 @@ mod rename {
         "y",
         "y=body; trap \"$y\" INT; trap ': \"$other\"' EXIT",
       ),
+      (
+        "read v; export \"x=$v\"; readonly x\"=$v/\"; : \"$x\"",
+        "x=",
+        "value",
+        "read v; export \"value=$v\"; readonly value\"=$v/\"; : \"$value\"",
+      ),
     ] {
       assert_renamed(source, query, new_name, expected);
     }
@@ -5712,8 +5750,12 @@ mod rename {
     for body in [
       "tool=$(command -v missing); \"$tool\"",
       "read name; \"/bin/$name\"",
+      "read name; /bin/$name",
+      "prefix=/usr/local; read name; $prefix/bin/$name",
       "tool=$(command -v missing); copy=$(command -p printf '%s' \"$tool\"); command \"$copy\"",
       "idle() { \"/bin/$name\"; }",
+      "idle() { /bin/$name; }",
+      "n=2; trap ': $((other=$n))' EXIT",
     ] {
       assert_renamed(
         &format!("x=1; {body}; : $x"),

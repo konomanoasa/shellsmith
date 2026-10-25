@@ -1214,6 +1214,40 @@ mod classification {
   }
 
   #[test]
+  fn arithmetic_write_modifiers_require_a_static_or_expanded_expression() {
+    for (source, expected) in [
+      ("n=2; : $((x=$n))", true),
+      ("read n; : $((x=$n))", false),
+      ("read n; : $((x=1)) \"$n\"", true),
+    ] {
+      let start = source.find("x=").unwrap();
+      let spans = workspace(source).semantic_spans(DocumentId(1)).unwrap();
+      assert_eq!(
+        spans
+          .iter()
+          .any(|span| span.location.bytes == (start..start + 1)
+            && span.kind == SemanticKind::Variable
+            && span.modifiers.contains(&Modifier::Definition)),
+        expected,
+        "{source}"
+      );
+    }
+    for source in [
+      "n=1; trap ': $((x=$n))' EXIT",
+      "n=1; trap 'trap \": \\$((x=\\$n))\" INT' EXIT",
+    ] {
+      let start = source.find("x=").unwrap();
+      let spans = workspace(source).semantic_spans(DocumentId(1)).unwrap();
+      let definitions: Vec<_> = spans
+        .iter()
+        .filter(|span| span.location.bytes == (start..start + 1))
+        .map(|span| span.modifiers.contains(&Modifier::Definition))
+        .collect();
+      assert_eq!(definitions, [true], "{source}");
+    }
+  }
+
+  #[test]
   fn utility_write_tokens_keep_readonly_and_only_project_spelled_variable_names()
    {
     for source in ["readonly x; read x", "readonly 'x=value'"] {

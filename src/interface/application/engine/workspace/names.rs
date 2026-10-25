@@ -373,6 +373,8 @@ struct Relationships<'a> {
   unattempted: BTreeMap<UseSite, engine::ArgumentRole>,
   deferred: BTreeMap<UseSite, SyntaxName>,
   scope_nodes: BTreeMap<(Snapshot, usize, usize), NameEnvironment>,
+  projections:
+    BTreeMap<Snapshot, BTreeMap<(usize, usize), ProjectedResolution>>,
 }
 
 #[derive(Clone, Debug)]
@@ -399,12 +401,12 @@ struct SyntaxNames {
   scope_nodes: BTreeMap<(Snapshot, usize, usize), NameEnvironment>,
   dependencies: Vec<NameDependency>,
   effects: Vec<NameEffect>,
-  pub commands:
+  commands:
     BTreeMap<engine::OccurrenceId, engine::analysis::UnattemptedCommand>,
 }
 
 impl SyntaxNames {
-  pub fn collect(
+  fn collect(
     document: &Document,
     cancelled: &AtomicBool,
   ) -> Result<Self, Error> {
@@ -509,7 +511,7 @@ impl SyntaxNames {
   fn deferred_arguments(
     &mut self,
     document: &Document,
-    occurrence: &engine::Occurrence,
+    occurrence: &Occurrence,
     environment: NameEnvironment,
   ) {
     let Some(command) = document.command_at(&occurrence.location) else {
@@ -708,6 +710,7 @@ impl<'a> Relationships<'a> {
       unattempted: BTreeMap::new(),
       deferred: BTreeMap::new(),
       scope_nodes: BTreeMap::new(),
+      projections: BTreeMap::new(),
     }
   }
 
@@ -743,24 +746,31 @@ impl<'a> Relationships<'a> {
     attempted: &BTreeSet<UseSite>,
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
+    let source = self.workspace.source_snapshot(document.snapshot());
     let projected = self
-      .workspace
-      .projected_resolutions(document.snapshot(), None);
+      .projections
+      .remove(&source)
+      .unwrap_or_else(|| self.workspace.projected_resolutions(source, None));
     self.check_projected_names(analyzed, &projected, cancelled)?;
     let mut pending = Vec::new();
     for occurrence in document.occurrences() {
       check_cancelled(cancelled)?;
       if !attempted.contains(&UseSite::Syntax(occurrence.id))
-        && projected
-          .get(&(
-            occurrence.location.bytes.start,
-            occurrence.location.bytes.end,
-          ))
-          .is_none_or(|result| result.resolution.is_none())
+        && self
+          .workspace
+          .navigation_location(&occurrence.location)
+          .and_then(|location| {
+            projected.get(&(location.bytes.start, location.bytes.end))
+          })
+          .is_none_or(|result| {
+            result.resolution.is_none()
+              || result.derived_from(document.snapshot().document)
+          })
       {
         pending.push(occurrence);
       }
     }
+    self.projections.insert(source, projected);
     let deferred = SyntaxNames::collect(document, cancelled)?;
     for (id, scope) in &deferred.scopes {
       self.result.scopes.insert(
@@ -771,36 +781,26 @@ impl<'a> Relationships<'a> {
         },
       );
     }
-    self.scope_nodes.extend(
-      deferred
-        .scope_nodes
-        .iter()
-        .map(|(key, value)| (*key, *value)),
-    );
+    self.scope_nodes.extend(&deferred.scope_nodes);
     let locations: BTreeSet<_> = pending
       .iter()
       .map(|site| (site.location.bytes.start, site.location.bytes.end))
       .collect();
+    let pending_at = |location: &Location| {
+      locations.contains(&(location.bytes.start, location.bytes.end))
+    };
     self.result.dependencies.extend(
       deferred
         .dependencies
         .iter()
-        .filter(|dependency| {
-          locations.contains(&(
-            dependency.location.bytes.start,
-            dependency.location.bytes.end,
-          ))
-        })
+        .filter(|dependency| pending_at(&dependency.location))
         .cloned(),
     );
     self.result.effects.extend(
       deferred
         .effects
         .iter()
-        .filter(|effect| {
-          locations
-            .contains(&(effect.location.bytes.start, effect.location.bytes.end))
-        })
+        .filter(|effect| pending_at(&effect.location))
         .cloned(),
     );
     for occurrence in &pending {
@@ -903,16 +903,17 @@ impl<'a> Relationships<'a> {
             | "command_substitution"
             | "backquote_substitution"
         ) && let Some(location) = outer
+          && let Some(source) = self.workspace.navigation_location(location)
           && covered.insert((
-            location.snapshot,
-            location.bytes.start,
-            location.bytes.end,
+            source.snapshot,
+            source.bytes.start,
+            source.bytes.end,
           ))
         {
           self.result.dependencies.push(NameDependency {
             environment: self.deferred_environment(document, location),
             location: location.clone(),
-            targets: [engine::EffectTarget::Variables].into(),
+            targets: [EffectTarget::Variables].into(),
           });
         }
       }
@@ -1353,10 +1354,10 @@ impl<'a> Relationships<'a> {
 }
 
 pub(in crate::interface::application::engine) fn syntax_spelling(
-  document: &super::Document,
+  document: &Document,
   site: &Occurrence,
 ) -> Vec<Location> {
-  if site.kind != engine::OccurrenceKind::Command {
+  if site.kind != OccurrenceKind::Command {
     return vec![site.location.clone()];
   }
   if !matches!(site.name, Value::Literal(_)) {

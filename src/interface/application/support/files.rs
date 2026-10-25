@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use super::Error;
 use crate::interface::application::engine::word::Pattern;
 use crate::interface::application::engine::{
-  InputQuery, InputResult, Value, ValueIssue, check_cancelled,
+  CharacterEncoding, InputQuery, InputResult, SourceInput, Value, ValueIssue,
+  check_cancelled,
 };
 
 pub(super) fn absolute(cwd: &Path, path: &Path) -> PathBuf {
@@ -119,8 +120,8 @@ pub(super) fn entry_path(
 }
 
 pub(super) fn resolve(
-  input: &crate::interface::application::engine::SourceInput,
-  opened: &BTreeMap<PathBuf, std::sync::Arc<str>>,
+  input: &SourceInput,
+  opened: &BTreeMap<PathBuf, Arc<str>>,
   entries: &BTreeMap<PathBuf, Snapshot>,
 ) -> Result<PathBuf, String> {
   if input.needs_annotation()
@@ -538,13 +539,9 @@ fn encoding(name: &[u8]) -> InputResult {
     libc::freelocale(locale);
   }
   let encoding = match codeset.as_slice() {
-    b"UTF-8" | b"UTF8" => {
-      crate::interface::application::engine::CharacterEncoding::Utf8
-    }
-    b"US-ASCII" | b"ASCII" | b"ANSI_X3.4-1968" => {
-      crate::interface::application::engine::CharacterEncoding::Ascii
-    }
-    _ => crate::interface::application::engine::CharacterEncoding::Other,
+    b"UTF-8" | b"UTF8" => CharacterEncoding::Utf8,
+    b"US-ASCII" | b"ASCII" | b"ANSI_X3.4-1968" => CharacterEncoding::Ascii,
+    _ => CharacterEncoding::Other,
   };
   InputResult::Encoding(encoding)
 }

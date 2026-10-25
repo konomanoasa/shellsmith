@@ -56,6 +56,36 @@ impl OriginPart {
     contiguous
   }
 
+  /// Fails unless every byte of `bytes` projects to the source.
+  pub(in crate::interface::application::engine) fn project_all(
+    parts: &[Self],
+    bytes: Range<usize>,
+  ) -> Option<Vec<Range<usize>>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut covered = bytes.start;
+    for part in parts {
+      let start = part.bytes.start.max(bytes.start);
+      let end = part.bytes.end.min(bytes.end);
+      if start >= end {
+        continue;
+      }
+      if start != covered {
+        return None;
+      }
+      for range in part.project(start..end)? {
+        if let Some(last) = ranges.last_mut()
+          && last.end == range.start
+        {
+          last.end = range.end;
+        } else {
+          ranges.push(range);
+        }
+      }
+      covered = end;
+    }
+    (covered == bytes.end && !ranges.is_empty()).then_some(ranges)
+  }
+
   pub(in crate::interface::application::engine) fn project(
     &self,
     bytes: Range<usize>,
@@ -90,37 +120,16 @@ impl DerivedOrigin {
         .project_point(bytes.start)
         .map(|location| vec![location]);
     }
-    let mut ranges: Vec<Range<usize>> = Vec::new();
-    let mut covered = bytes.start;
-    for part in &self.parts {
-      let start = part.bytes.start.max(bytes.start);
-      let end = part.bytes.end.min(bytes.end);
-      if start >= end {
-        continue;
-      }
-      if start != covered {
-        return None;
-      }
-      for range in part.project(start..end)? {
-        if let Some(last) = ranges.last_mut()
-          && last.end == range.start
-        {
-          last.end = range.end;
-        } else {
-          ranges.push(range);
-        }
-      }
-      covered = end;
-    }
-    (covered == bytes.end && !ranges.is_empty()).then(|| {
+    let ranges = OriginPart::project_all(&self.parts, bytes)?;
+    Some(
       ranges
         .into_iter()
         .map(|bytes| Location {
           snapshot: self.argument.snapshot,
           bytes,
         })
-        .collect()
-    })
+        .collect(),
+    )
   }
 
   fn project_point(&self, point: usize) -> Option<Location> {
@@ -241,7 +250,7 @@ impl DerivedKey {
   fn new(
     mut origin: DerivedOrigin,
     body: &[u8],
-    units: &std::collections::BTreeMap<DocumentId, DerivedUnit>,
+    units: &BTreeMap<DocumentId, DerivedUnit>,
   ) -> (Self, DerivedOrigin) {
     let parent = units.get(&origin.argument.snapshot.document);
     let range = (origin.argument.bytes.start, origin.argument.bytes.end);
@@ -632,10 +641,7 @@ impl Workspace {
   }
 
   #[must_use]
-  pub fn derived_origin(
-    &self,
-    id: DocumentId,
-  ) -> Option<&crate::interface::application::engine::DerivedOrigin> {
+  pub fn derived_origin(&self, id: DocumentId) -> Option<&DerivedOrigin> {
     self.derived.get(&id).map(|unit| &unit.origin)
   }
 
@@ -650,8 +656,8 @@ impl Workspace {
   #[must_use]
   pub fn project_locations(
     &self,
-    location: &crate::interface::application::engine::Location,
-  ) -> Option<Vec<crate::interface::application::engine::Location>> {
+    location: &Location,
+  ) -> Option<Vec<Location>> {
     self.document(location.snapshot.document)?.text(location)?;
     let locations = match self.derived_origin(location.snapshot.document) {
       Some(origin) => origin.project(location.bytes.clone())?,
@@ -666,14 +672,11 @@ impl Workspace {
   }
 
   #[must_use]
-  pub fn navigation_location(
-    &self,
-    location: &crate::interface::application::engine::Location,
-  ) -> Option<crate::interface::application::engine::Location> {
+  pub fn navigation_location(&self, location: &Location) -> Option<Location> {
     let locations = self.project_locations(location)?;
     let first = locations.first()?;
     let last = locations.last()?;
-    Some(crate::interface::application::engine::Location {
+    Some(Location {
       snapshot: first.snapshot,
       bytes: first.bytes.start..last.bytes.end,
     })

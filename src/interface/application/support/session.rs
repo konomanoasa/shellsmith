@@ -163,6 +163,7 @@ impl Session {
   pub fn document_path(&self, path: &Path) -> Result<PathBuf, Error> {
     lock(&self.state)?.application.document_path(path)
   }
+
   pub fn new(settings: Settings) -> Result<Self, Error> {
     Ok(Self {
       state: Arc::new(Mutex::new(State {
@@ -466,10 +467,8 @@ impl Preparation {
           match &scope {
             RequestScope::Analysis(path) => {
               application.refresh_for(Some(path), flag)?;
-              let id = application.document_id(path).ok_or_else(|| {
-                Error::Message(format!("Cannot load {}", path.display()))
-              })?;
-              application.analyze_document(id, flag)?;
+              application
+                .analyze_document(application.loaded_document(path)?, flag)?;
             }
             RequestScope::Results(path) => {
               application.prepare_analysis(path, flag)?;
@@ -566,10 +565,7 @@ impl Application {
           self.refresh_for(path, flag)?;
           self.outdated = true;
           if let RequestScope::Analysis(path) = scope {
-            let id = self.document_id(path).ok_or_else(|| {
-              Error::Message(format!("Cannot load {}", path.display()))
-            })?;
-            self.analyze_document(id, flag)?;
+            self.analyze_document(self.loaded_document(path)?, flag)?;
           }
         }
       }

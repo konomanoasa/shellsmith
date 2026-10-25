@@ -1,4 +1,4 @@
-use super::engine::{self, Location, check_cancelled};
+use super::engine::{Location, check_cancelled};
 use super::{Application, Error};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -14,20 +14,11 @@ impl Application {
   ) -> Result<Vec<Location>, Error> {
     let names = self.prepare_names(path, cancelled)?;
     self.check_name_inputs(&names, cancelled)?;
-    let id = self.document_id(path).ok_or_else(|| {
-      Error::Message("The requested document is unavailable".into())
-    })?;
-    let document = self
-      .workspace
-      .document(id)
-      .ok_or(engine::Error::UnknownDocument(id))?;
-    if !document.source().is_char_boundary(offset) {
-      return Err(engine::Error::InvalidPosition.into());
-    }
-    let selected =
-      names
-        .results
-        .at(document.snapshot(), offset, false, cancelled)?;
+    let selected = self
+      .name_sites(&names, path, offset, false, cancelled)?
+      .ok_or_else(|| {
+        Error::Message("The requested document is unavailable".into())
+      })?;
     let targets = names.results.identities(&selected);
     let mut locations = BTreeMap::new();
     if let Some(selected) = targets

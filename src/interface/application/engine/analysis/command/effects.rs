@@ -4,7 +4,7 @@ use super::super::expansion::Argument;
 use super::super::{Frame, Resolver};
 use super::arguments::{
   argument_roles, classify_arguments, declaration_operands, getopts_operands,
-  read_options, syntax_argument, syntax_arguments, trap_action, unset_options,
+  read_options, syntax_arguments, syntax_command, trap_action, unset_options,
 };
 use super::dispatch::{
   Search, builtin_candidates, builtin_names, command_options, only_builtin,
@@ -39,17 +39,9 @@ impl<'a> Resolver<'a> {
     nodes: impl IntoIterator<Item = Node<'a>>,
     frame: Frame,
   ) -> BTreeSet<EffectTarget> {
-    let mut pending: Vec<_> = nodes.into_iter().collect();
     let mut targets = BTreeSet::new();
-    while let Some(node) = pending.pop() {
-      if parser::subshell(node.kind()) {
-        continue;
-      }
-      if node.kind() == "io_here" {
-        pending.extend(self.index.heredoc(frame.snapshot, node));
-      }
+    for node in self.expansion_nodes(nodes, frame) {
       self.node_writes(node, frame, &mut targets);
-      pending.extend(children(node));
     }
     targets
   }
@@ -61,11 +53,8 @@ impl<'a> Resolver<'a> {
     frame: Frame,
     targets: &mut BTreeSet<EffectTarget>,
   ) {
-    if matches!(
-      node.kind(),
-      "arithmetic_dynamic_expression"
-        | "parenthesized_arithmetic_dynamic_source"
-    ) {
+    if node.kind() == "arithmetic_expansion" && parser::dynamic_arithmetic(node)
+    {
       targets.insert(EffectTarget::Variables);
     }
     if let Some(site) = self
@@ -157,8 +146,7 @@ impl Resolver<'_> {
     let Some(command) = parser::command_word(node) else {
       return Some(());
     };
-    let mut name = syntax_argument(command, source).value;
-    let mut args = syntax_arguments(node, source);
+    let (mut name, mut args) = syntax_command(node, command, source);
     let mut suppress = false;
     while name == Value::Literal(b"command".to_vec()) {
       let resolution = Self::command_resolution(&name, env, suppress);
@@ -270,15 +258,33 @@ pub(in crate::interface::application::engine) struct UnattemptedCommand {
   pub incomplete_body: bool,
 }
 
+impl UnattemptedCommand {
+  /// A command that `command` runs but syntax cannot identify.
+  fn unknown_command(&mut self) {
+    self
+      .dependencies
+      .extend([EffectTarget::Variables, EffectTarget::Functions]);
+    self.targets.extend([
+      EffectTarget::Variables,
+      EffectTarget::Functions,
+      EffectTarget::Sources,
+    ]);
+  }
+}
+
 pub(in crate::interface::application::engine) fn unattempted_command(
   snapshot: Snapshot,
   node: Node<'_>,
   source: &[u8],
 ) -> UnattemptedCommand {
-  let name = parser::command_word(node)
-    .map(|command| syntax_argument(command, source).value);
+  let (name, mut args) = match parser::command_word(node) {
+    Some(command) => {
+      let (name, args) = syntax_command(node, command, source);
+      (Some(name), args)
+    }
+    None => (None, syntax_arguments(node, source)),
+  };
   let mut result = UnattemptedCommand::default();
-  let mut args = syntax_arguments(node, source);
   if let Some(name) = &name {
     if let Some(dependency) = command_dependency(name) {
       result.dependencies.insert(dependency);
@@ -317,14 +323,7 @@ fn unattempted_utilities(
     for candidate in builtin_candidates(name) {
       if candidate == b"command" {
         let Ok(options) = command_options(args) else {
-          result
-            .dependencies
-            .extend([EffectTarget::Variables, EffectTarget::Functions]);
-          result.targets.extend([
-            EffectTarget::Variables,
-            EffectTarget::Functions,
-            EffectTarget::Sources,
-          ]);
+          result.unknown_command();
           continue;
         };
         let operands = &args[options.operands..];
@@ -343,14 +342,7 @@ fn unattempted_utilities(
           if command.count.boundary().is_ok() {
             pending.push((&command.value, rest));
           } else {
-            result
-              .dependencies
-              .extend([EffectTarget::Variables, EffectTarget::Functions]);
-            result.targets.extend([
-              EffectTarget::Variables,
-              EffectTarget::Functions,
-              EffectTarget::Sources,
-            ]);
+            result.unknown_command();
           }
         }
       } else {

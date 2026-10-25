@@ -8,9 +8,10 @@ use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
 use engine::check_cancelled;
+use engine::workspace::parser;
 use engine::{
-  Access, Error, Location, OccurrenceId, ReferenceId, Snapshot, SymbolId,
-  SymbolKind, UseSite, Workspace,
+  Access, AttributeState, Error, Location, OccurrenceId, ReferenceId, Snapshot,
+  SymbolId, SymbolKind, UseSite, Value, Workspace,
 };
 use engine::{
   Analysis, AnalysisGap, AnalysisInputs, AnalysisRequest, DerivedOrigin,
@@ -327,7 +328,6 @@ impl Resolver<'_> {
     context: ExecutionContextId,
     env: &Environment,
   ) {
-    use engine::{AttributeState, Value};
     let state =
       self
         .workspace
@@ -602,10 +602,10 @@ impl<'a> Index<'a> {
     let mut pending = vec![(document.tree.root_node(), None)];
     while let Some((node, mut owner)) = pending.pop() {
       check_cancelled(cancelled)?;
-      if engine::workspace::parser::damage_unit(node.kind()) {
+      if parser::damage_unit(node.kind()) {
         owner = Some(node.id());
       }
-      if engine::workspace::parser::damaged(node)
+      if parser::damaged(node)
         || (matches!(node.kind(), "here_end" | "tilde_expansion")
           && node.has_error())
       {

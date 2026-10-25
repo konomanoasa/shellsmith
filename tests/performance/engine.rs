@@ -50,6 +50,10 @@ fn main() {
     for case in [
       "commands",
       "trap",
+      "trap_recursive",
+      "trap_substitution",
+      "trap_copies",
+      "substitution_copies",
       "independent_arguments",
       "branches",
       "loops",
@@ -71,6 +75,8 @@ fn main() {
       measure("branch_sum", size);
       measure("branch_concat", size);
       measure("branch_append", size);
+      measure("branch_export", size);
+      measure("branch_trim", size);
       measure("branch_merges", size);
       measure("branch_loop", size);
     }
@@ -197,6 +203,27 @@ fn uncalled_source(case: &str, size: usize) -> String {
 
 fn branch_values(case: &str, size: usize) -> String {
   let mut source = String::new();
+  if matches!(case, "branch_append" | "branch_export" | "branch_trim") {
+    source.push_str("PATH=/bin\n");
+    let declaration = if case == "branch_export" {
+      "export "
+    } else {
+      ""
+    };
+    for _ in 0..size {
+      writeln!(
+        source,
+        "if condition; then {declaration}PATH=\"$PATH:/opt/bin\"; fi"
+      )
+      .unwrap();
+    }
+    source.push_str(if case == "branch_trim" {
+      "x=${PATH%%:*}\n"
+    } else {
+      "x=${#PATH}\n"
+    });
+    return source;
+  }
   let mut expression = String::new();
   for index in 0..size {
     writeln!(source, "if condition; then v{index}=1; else v{index}=2; fi")
@@ -211,6 +238,49 @@ fn branch_values(case: &str, size: usize) -> String {
     writeln!(source, "x=$((0{expression}))").unwrap();
   } else {
     writeln!(source, "joined=\"{expression}\"; x=${{#joined}}").unwrap();
+  }
+  source
+}
+
+fn copied_source(size: usize, output: bool) -> String {
+  let mut source = String::from("h0='x=2; '\n");
+  for index in 1..=size {
+    writeln!(source, "h{index}=$h{}", index - 1).unwrap();
+  }
+  if output {
+    source.push_str("out=$(\n");
+    source.push_str(
+      &format!("command -p printf \"%s\" \"$h{size}\"\n").repeat(size),
+    );
+    source.push_str("); : \"$out\"\n");
+  } else {
+    writeln!(source, "trap \"$h{size}\" EXIT").unwrap();
+  }
+  source
+}
+
+fn trap_source(case: &str, size: usize) -> String {
+  let mut source = String::new();
+  match case {
+    "trap" => {
+      source.push_str("trap 'x=2; cleanup; trap \"$action\" EXIT' INT EXIT\n");
+      source.push_str(&": \"$x\"\n".repeat(size));
+    }
+    "trap_recursive" | "trap_substitution" => {
+      let append = if case == "trap_recursive" {
+        r#"H="$H EXIT""#
+      } else {
+        r#"H=$(command -p printf "%s%s" "$H" " EXIT")"#
+      };
+      writeln!(
+        source,
+        r#"H='{}{append}; trap "$H" EXIT'; trap "${{H}}" EXIT"#,
+        ":; ".repeat(size)
+      )
+      .unwrap();
+    }
+    "trap_copies" => source = copied_source(size, false),
+    _ => unreachable!("trap fixture"),
   }
   source
 }
@@ -231,15 +301,9 @@ fn fixture(
     "branch_merges" | "branch_loop" => {
       source.push_str(&branch_merges(size, case == "branch_loop"));
     }
-    "branch_sum" | "branch_concat" => {
+    "branch_sum" | "branch_concat" | "branch_append" | "branch_export"
+    | "branch_trim" => {
       source.push_str(&branch_values(case, size));
-    }
-    "branch_append" => {
-      source.push_str("PATH=/bin\n");
-      source.push_str(
-        &"if condition; then PATH=\"$PATH:/opt/bin\"; fi\n".repeat(size),
-      );
-      source.push_str("x=${#PATH}\n");
     }
     "independent_arguments" => {
       for index in 0..size {
@@ -253,9 +317,9 @@ fn fixture(
       source.push('\n');
     }
     "commands" => source.push_str(&": \"$x\"\n".repeat(size)),
-    "trap" => {
-      source.push_str("trap 'x=2; cleanup; trap \"$action\" EXIT' INT EXIT\n");
-      source.push_str(&": \"$x\"\n".repeat(size));
+    "substitution_copies" => source.push_str(&copied_source(size, true)),
+    "trap" | "trap_recursive" | "trap_substitution" | "trap_copies" => {
+      source.push_str(&trap_source(case, size));
     }
     "loop_chain" => {
       source.push_str("v0=seed\n");

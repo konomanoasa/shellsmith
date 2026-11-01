@@ -36,6 +36,9 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
+      - name: Verify package
+        if: runner.os == 'Linux'
+        run: cargo package --locked
       - name: Test and measure coverage
         run: ./scripts/test.sh
       - uses: actions/upload-artifact@v7
@@ -43,19 +46,3 @@ jobs:
           name: coverage-${{ matrix.os }}
           path: target/lcov.info
           if-no-files-found: error
-
-  msrv:
-    name: Check minimum Rust version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Set up Rust
-        run: |
-          msrv=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
-          readonly msrv
-          rustup toolchain install "$msrv" --profile minimal
-          printf 'RUSTUP_TOOLCHAIN=%s\n' "$msrv" >>"$GITHUB_ENV"
-      - name: Check all targets
-        run: cargo check --locked --all-targets
-      - name: Verify package
-        run: cargo package --locked

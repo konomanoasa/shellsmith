@@ -227,7 +227,7 @@ impl Workspace {
   }
 }
 
-/// Units derived from one argument site; a group is never empty.
+/// A group is never empty.
 pub(super) struct ProjectedDocuments<'a> {
   pub(super) site: &'a DerivedSite,
   pub(super) documents: Vec<&'a DerivedUnit>,

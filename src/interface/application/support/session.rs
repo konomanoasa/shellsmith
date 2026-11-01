@@ -276,7 +276,6 @@ impl Session {
     Ok(lock(&self.state)?.updates.subscribe())
   }
 
-  /// Indexes syntax, then analyzes each entry.
   pub fn start_index(&self) -> Result<(), Error> {
     let mut state = lock(&self.state)?;
     if state

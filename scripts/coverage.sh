@@ -3,6 +3,7 @@
 CDPATH='' cd -P "$(dirname "$0")/.." || exit 1
 
 [ "$#" -le 1 ] || exit 1
+
 case "${1-}" in
   '' | --clean) ;;
   *) exit 1 ;;

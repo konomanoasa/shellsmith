@@ -1139,7 +1139,6 @@ impl<'a> Relationships<'a> {
     local.then_some(scope)
   }
 
-  /// The innermost temporary assignment of `text` around `context`.
   fn nearest_temporary(
     &self,
     context: ExecutionContextId,

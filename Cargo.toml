@@ -1,13 +1,11 @@
 [package]
 name = "konomanoasa-shellsmith"
 version = "0.4.0"
-edition = "2024"
-rust-version = "1.95"
-description = "LSP for shell scripts."
-license = "MIT"
+description = "CLI and LSP for shell scripts."
 readme = "README.md"
+license = "MIT"
 repository = "https://github.com/konomanoasa/shellsmith"
-keywords = ["language-server", "lsp", "posix", "shell"]
+edition = "2024"
 
 [lib]
 name = "shellsmith"
@@ -27,6 +25,7 @@ tower = { version = "=0.5.3", default-features = false }
 typed-arena = "=2.0.2"
 tree-sitter = "=0.27.1"
 tree-sitter-sh = "=0.27.0"
+unicode-width = { version = "=0.2.3", default-features = false }
 url = "=2.5.8"
 
 [target.'cfg(unix)'.dependencies]

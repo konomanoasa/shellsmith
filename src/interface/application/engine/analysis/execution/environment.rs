@@ -501,8 +501,6 @@ impl ExportAttributes {
     })
   }
 
-  /// Sets the attribute, or joins it with the previous state when the change
-  /// may not happen.
   pub fn mark(&mut self, name: &[u8], exported: bool, certain: bool) {
     let before = self.get(name);
     let state = if certain {
@@ -815,7 +813,6 @@ impl Environment {
     self.functions.values.insert(name.to_vec(), binding);
   }
 
-  /// Either binding may be the one in effect.
   pub(in crate::interface::application::engine::analysis) fn join_uncertain(
     &mut self,
     name: &[u8],
@@ -1478,7 +1475,6 @@ fn input_issue(left: &Input, right: &Input) -> ValueIssue {
 }
 
 impl Io {
-  /// Diagnostics reach the output when standard error is captured.
   pub fn may_write_stderr(&mut self) {
     if self.stderr_captured
       && let Some(output) = &mut self.output
@@ -1487,7 +1483,6 @@ impl Io {
     }
   }
 
-  /// Later output may or may not be captured.
   pub fn unknown_descriptors(&mut self) {
     if let Some(output) = &mut self.output {
       output.fail(ValueIssue::Dynamic);

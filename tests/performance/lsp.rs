@@ -51,6 +51,14 @@ fn main() {
       ("references_documents".into(), 400),
       ("references_sources".into(), 100),
       ("references_sources".into(), 400),
+      ("formatting".into(), 1200),
+      ("formatting".into(), 4800),
+      ("formatting_comments".into(), 4800),
+      ("formatting_arguments".into(), 1000),
+      ("formatting_chain".into(), 1000),
+      ("formatting_nested".into(), 100),
+      ("formatting_heredoc".into(), 4000),
+      ("formatting_longword".into(), 1000),
     ]
   };
   let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -61,25 +69,51 @@ fn main() {
   });
 }
 
+fn formatting_source(case: &str, size: usize) -> Option<String> {
+  Some(match case {
+    "formatting" => "if check; then echo \"$x\"; fi\n".repeat(size),
+    "formatting_comments" => {
+      "if check # condition\nthen # body\necho \"$x\" # value\nfi\n"
+        .repeat(size)
+    }
+    "formatting_arguments" => {
+      format!("cmd {}\n", vec!["argument"; size].join(" "))
+    }
+    "formatting_chain" => {
+      format!("{}\n", vec!["echo \"$x\""; size].join(" | "))
+    }
+    "formatting_nested" => {
+      format!("{}echo x{}\n", "out=\"$(".repeat(size), ")\"".repeat(size))
+    }
+    "formatting_heredoc" => {
+      format!("cat <<EOF\n{}EOF\n", "    $literal  text\n".repeat(size))
+    }
+    "formatting_longword" => format!("cmd '{}'\n", "x".repeat(size * 128)),
+    _ => return None,
+  })
+}
+
 fn fixture(case: &str, size: usize) -> (Fixture, String) {
   assert!(size > 0, "fixture size must be positive");
+  let formatting = formatting_source(case, size);
   assert!(
-    matches!(
-      case,
-      "lines"
-        | "uncalled_body"
-        | "uncalled_branches"
-        | "long_line"
-        | "documents"
-        | "workspace_tokens"
-        | "workspace_calls"
-        | "sources"
-        | "concurrent_requests"
-        | "rename"
-        | "references"
-        | "references_documents"
-        | "references_sources"
-    ),
+    formatting.is_some()
+      || matches!(
+        case,
+        "lines"
+          | "uncalled_body"
+          | "uncalled_branches"
+          | "long_line"
+          | "documents"
+          | "workspace_tokens"
+          | "workspace_calls"
+          | "sources"
+          | "concurrent_requests"
+          | "rename"
+          | "references"
+          | "references_documents"
+          | "references_sources"
+      ),
     "unknown fixture: {case}"
   );
   let fixture = Fixture(
@@ -88,7 +122,9 @@ fn fixture(case: &str, size: usize) -> (Fixture, String) {
       .join(format!("lsp-benchmark-{}", std::process::id())),
   );
   std::fs::create_dir_all(&fixture.0).unwrap();
-  let source = if case == "sources" {
+  let source = if let Some(source) = formatting {
+    source
+  } else if case == "sources" {
     for index in 0..size {
       let body = if index + 1 < size {
         format!("value={index}\n. ./lib{}.sh\n", index + 1)
@@ -159,23 +195,13 @@ fn fixture(case: &str, size: usize) -> (Fixture, String) {
   (fixture, source)
 }
 
-async fn measure(case: &str, size: usize) {
-  let (fixture, source) = fixture(case, size);
-  if case == "workspace_calls" {
-    workspace_calls(&fixture, size).await;
-    return;
-  }
-  let file = fixture.0.join("main.sh");
-  let uri = Url::from_file_path(&file).unwrap().to_string();
-  let startup = Instant::now();
-  let mut settings = Settings::new(fixture.0.clone());
-  settings.initial = InitialEnvironment::empty();
-  let mut server = Client::new(settings);
-  server.request("initialize", json!({"rootUri":Url::from_file_path(&fixture.0).unwrap().to_string(),"capabilities":{"textDocument":{"semanticTokens":{
-    "requests":{"full":true},"formats":["relative"],"tokenTypes":["comment","keyword","operator","string","number","variable","parameter","function","command"],
-    "tokenModifiers":["declaration","definition","modification","readonly","defaultLibrary"]}}}})).await;
-  server.notify("initialized", json!({})).await;
-  let (method, params) = if case == "documents" {
+fn request_params(case: &str, uri: &str) -> (&'static str, Value) {
+  if case.starts_with("formatting") {
+    (
+      "textDocument/formatting",
+      json!({"textDocument":{"uri":uri},"options":{"tabSize":2,"insertSpaces":true}}),
+    )
+  } else if case == "documents" {
     ("workspace/symbol", json!({"query":"x"}))
   } else if matches!(
     case,
@@ -195,17 +221,37 @@ async fn measure(case: &str, size: usize) {
       "textDocument/semanticTokens/full",
       json!({"textDocument":{"uri":uri}}),
     )
-  };
+  }
+}
+
+async fn measure(case: &str, size: usize) {
+  let (fixture, source) = fixture(case, size);
+  if case == "workspace_calls" {
+    workspace_calls(&fixture, size).await;
+    return;
+  }
+  let file = fixture.0.join("main.sh");
+  let uri = Url::from_file_path(&file).unwrap().to_string();
+  let startup = Instant::now();
+  let mut settings = Settings::new(fixture.0.clone());
+  settings.initial = InitialEnvironment::empty();
+  let mut server = Client::new(settings);
+  server.request("initialize", json!({"rootUri":Url::from_file_path(&fixture.0).unwrap().to_string(),"capabilities":{"textDocument":{"semanticTokens":{
+    "requests":{"full":true},"formats":["relative"],"tokenTypes":["comment","keyword","operator","string","number","variable","parameter","function","command"],
+    "tokenModifiers":["declaration","definition","modification","readonly","defaultLibrary"]}}}})).await;
+  server.notify("initialized", json!({})).await;
+  let (method, params) = request_params(case, &uri);
   let started = Instant::now();
   server.notify("textDocument/didOpen", json!({"textDocument":{"uri":uri,"languageId":"shellscript","version":1,"text":source}})).await;
   let response = request(&mut server, method, &params, case).await;
   assert!(response.get("error").is_none(), "{response}");
   let initial = started.elapsed();
   let startup = startup.elapsed();
-  let repeat = if matches!(
-    case,
-    "references" | "references_documents" | "references_sources"
-  ) {
+  let repeat = if case.starts_with("formatting")
+    || matches!(
+      case,
+      "references" | "references_documents" | "references_sources"
+    ) {
     let started = Instant::now();
     let repeated = request(&mut server, method, &params, case).await;
     assert_eq!(repeated["result"], response["result"]);
@@ -213,7 +259,11 @@ async fn measure(case: &str, size: usize) {
   } else {
     None
   };
-  let changed = source.replacen("x=1", "x=2", 1);
+  let changed = if case.starts_with("formatting") {
+    format!("{source}\n: $updated\n")
+  } else {
+    source.replacen("x=1", "x=2", 1)
+  };
   let started = Instant::now();
   server.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":changed}]})).await;
   let response = request(&mut server, method, &params, case).await;

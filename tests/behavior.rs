@@ -1,5 +1,7 @@
 #[path = "behavior/application.rs"]
 mod application;
+#[path = "behavior/formatting.rs"]
+mod formatting;
 #[path = "behavior/engine"]
 mod engine {
   mod resolution;

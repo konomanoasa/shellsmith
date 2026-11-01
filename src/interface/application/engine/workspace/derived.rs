@@ -599,7 +599,7 @@ impl Workspace {
     Ok(())
   }
 
-  /// Reverses `add_derived`; a program stays while another unit shares its body.
+  /// Keep programs whose bodies are still shared by other units.
   pub(super) fn discard_derived(&mut self, id: DocumentId) {
     if let Some(unit) = self.derived.remove(&id) {
       self.derived_keys.remove(&unit.key);

@@ -1204,7 +1204,6 @@ impl<'a> Resolver<'a> {
   }
 }
 
-/// Assignment words, including declaration operands in assignment form.
 fn assignment_form(node: Node<'_>) -> bool {
   node.kind() == "assignment_word"
     || node.kind() == "word" && node.child_by_field_name("name").is_some()

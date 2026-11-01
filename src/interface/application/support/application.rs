@@ -55,7 +55,6 @@ impl Settings {
   }
 }
 
-/// Workspace inputs together with the explicitly requested documents.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct InputSelection {
   pub(super) explicit: BTreeSet<PathBuf>,
@@ -74,6 +73,7 @@ pub enum Error {
   Message(String),
   InvalidName(String),
   RenameRefused(String),
+  FormattingRefused(String),
   Engine(engine::Error),
   Superseded,
 }
@@ -83,7 +83,8 @@ impl std::fmt::Display for Error {
     match self {
       Self::Message(message)
       | Self::InvalidName(message)
-      | Self::RenameRefused(message) => f.write_str(message),
+      | Self::RenameRefused(message)
+      | Self::FormattingRefused(message) => f.write_str(message),
       Self::Engine(error) => error.fmt(f),
       Self::Superseded => f.write_str("Analysis inputs changed"),
     }
@@ -445,7 +446,6 @@ impl Application {
     self.workspace.clear_analysis();
   }
 
-  /// Name results derive from the analyses and end with them.
   pub(super) fn set_analyses(
     &mut self,
     analyses: Option<Arc<AnalysisCollection>>,

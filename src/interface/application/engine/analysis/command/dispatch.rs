@@ -498,7 +498,6 @@ impl<'a> Resolver<'a> {
     inner
   }
 
-  /// Literal names of prefix assignments, with their name occurrences.
   fn assigned_names(
     &self,
     assignments: &[Node<'_>],

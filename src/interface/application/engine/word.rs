@@ -108,7 +108,6 @@ pub(in crate::interface::application::engine) struct Fragment {
 }
 
 impl Fragment {
-  /// Even empty quotes preserve a field.
   fn guarantees_field(&self) -> bool {
     self.quoted || (!self.split && !self.bytes.is_empty())
   }
@@ -401,7 +400,6 @@ impl Word {
     }
   }
 
-  /// Fragments in `range` with their unknown parts, without field state.
   fn slice(&self, range: Range<usize>) -> Self {
     Self {
       fragments: self.fragments[range.clone()].to_vec(),
@@ -869,7 +867,6 @@ pub(in crate::interface::application::engine) fn lexical(
   value
 }
 
-/// Visits the bytes of `node` outside its line continuations, in order.
 fn continued_ranges(node: Node<'_>, mut visit: impl FnMut(Range<usize>)) {
   let mut start = node.start_byte();
   for child in node.named_children(&mut node.walk()) {

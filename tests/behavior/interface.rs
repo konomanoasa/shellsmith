@@ -28,6 +28,106 @@ mod lsp {
   }
 
   #[tokio::test]
+  async fn formatting_uses_unsaved_text_fixed_style_and_utf16_edits() {
+    let fixture = Fixture::new();
+    let path = fixture.write("format.sh", "echo $disk\n");
+    let uri = Url::from_file_path(&path).unwrap();
+    let mut settings = Settings::new(fixture.root.clone());
+    settings.limits.work = 1;
+    let mut server = Client::new(settings);
+    let initialized = initialize(&mut server, true).await;
+    let capabilities = &initialized["result"]["capabilities"];
+    assert_eq!(capabilities["documentFormattingProvider"], true);
+    assert!(
+      capabilities
+        .get("documentRangeFormattingProvider")
+        .is_none()
+    );
+    assert!(
+      capabilities
+        .get("documentOnTypeFormattingProvider")
+        .is_none()
+    );
+    server.notify("textDocument/didOpen", json!({"textDocument":{
+      "uri":uri,"languageId":"sh","version":1,"text":"printf '😀日本' $value\r\n"
+    }})).await;
+    let expected = json!([
+      {"range":{"start":{"line":0,"character":15},"end":{"line":0,"character":15}},"newText":"{"},
+      {"range":{"start":{"line":0,"character":20},"end":{"line":0,"character":20}},"newText":"}"}
+    ]);
+    for options in [
+      json!({"tabSize":2,"insertSpaces":true}),
+      json!({"tabSize":8,"insertSpaces":false,"trimTrailingWhitespace":true,"insertFinalNewline":true,"trimFinalNewlines":true}),
+    ] {
+      let response = server
+        .request(
+          "textDocument/formatting",
+          json!({"textDocument":{"uri":uri},"options":options}),
+        )
+        .await;
+      assert_eq!(response["result"], expected, "{response}");
+    }
+    server
+      .notify(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri,"version":2},
+      "contentChanges":[{"text":"printf '😀日本' ${value}\r\n"}]}),
+      )
+      .await;
+    let params = json!({"textDocument":{"uri":uri},"options":{"tabSize":4,"insertSpaces":false,"insertFinalNewline":true}});
+    assert_eq!(
+      server
+        .request("textDocument/formatting", params.clone())
+        .await["result"],
+      json!([])
+    );
+    server
+      .notify(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri,"version":3},
+      "contentChanges":[{"text":"if true; then"}]}),
+      )
+      .await;
+    let refused = server
+      .request("textDocument/formatting", params.clone())
+      .await;
+    assert_eq!(refused["error"]["code"], -32803, "{refused}");
+    assert!(
+      refused["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("syntax")
+    );
+    server
+      .notify(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri,"version":4},
+      "contentChanges":[{"text":"echo ${x}"}]}),
+      )
+      .await;
+    assert_eq!(
+      server
+        .request("textDocument/formatting", params.clone())
+        .await["result"],
+      json!([])
+    );
+    server
+      .notify("textDocument/didClose", json!({"textDocument":{"uri":uri}}))
+      .await;
+    assert_eq!(
+      server.request("textDocument/formatting", params).await["result"],
+      json!([
+        {"range":{"start":{"line":0,"character":6},"end":{"line":0,"character":6}},"newText":"{"},
+        {"range":{"start":{"line":0,"character":10},"end":{"line":0,"character":10}},"newText":"}"}
+      ])
+    );
+    let invalid = server.request("textDocument/formatting",
+      json!({"textDocument":{"uri":"untitled:buffer"},"options":{"tabSize":2,"insertSpaces":true}})).await;
+    assert_eq!(invalid["error"]["code"], -32602);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "echo $disk\n");
+  }
+
+  #[tokio::test]
   async fn analysis_limit_returns_syntax_rejects_complete_requests_and_recovers_after_edit()
    {
     let fixture = Fixture::new();
@@ -1935,14 +2035,15 @@ mod lsp {
 }
 
 mod cli {
-  use std::process::Command;
+  use crate::fixtures::Fixture;
+  use std::process::{Command, Stdio};
 
   #[test]
   fn cli_help_and_version_succeed_without_starting_lsp() {
     for (argument, expected) in [
       (
         "--help",
-        "shellsmith lsp\nshellsmith --help | --version\n".to_owned(),
+        "shellsmith lsp\nshellsmith format PATH\nshellsmith --help | --version\n".to_owned(),
       ),
       (
         "--version",
@@ -1969,6 +2070,12 @@ mod cli {
       vec!["lsp", "main.sh"],
       vec!["--help", "extra"],
       vec!["--version", "extra"],
+      vec!["format"],
+      vec!["format", ""],
+      vec!["format", "-"],
+      vec!["format", "--check"],
+      vec!["format", "--write", "main.sh"],
+      vec!["format", "one.sh", "two.sh"],
     ] {
       let output = Command::new(env!("CARGO_BIN_EXE_shellsmith"))
         .args(&args)
@@ -1978,10 +2085,218 @@ mod cli {
       assert_eq!(output.stdout, Vec::<u8>::new(), "{args:?}");
       assert_eq!(
         output.stderr,
-        b"shellsmith: Usage:\nshellsmith lsp\nshellsmith --help | --version\n\n",
+        b"shellsmith: Usage:\nshellsmith lsp\nshellsmith format PATH\nshellsmith --help | --version\n\n",
         "{args:?}"
       );
     }
+  }
+
+  fn format(fixture: &Fixture, path: &std::ffi::OsStr, code: i32) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellsmith"));
+    command
+      .arg("format")
+      .arg(path)
+      .current_dir(&fixture.root)
+      .env_clear()
+      .env("PATH", "/usr/bin:/bin")
+      .env("LC_ALL", "C")
+      .stdin(Stdio::null());
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+      command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(code), "{output:?}");
+    assert_eq!(output.stdout, b"");
+    if code == 0 {
+      assert_eq!(output.stderr, b"");
+    }
+    String::from_utf8(output.stderr).unwrap()
+  }
+
+  #[test]
+  fn formatting_overwrites_an_explicit_file_and_leaves_unchanged_files_unwritten()
+   {
+    let fixture = Fixture::new();
+    let path =
+      fixture.write("日本 script", ". ./missing.sh\nprintf '😀' \"$value\"\n");
+    format(&fixture, path.as_os_str(), 0);
+    assert_eq!(
+      std::fs::read_to_string(&path).unwrap(),
+      ". ./missing.sh\nprintf '😀' \"${value}\"\n"
+    );
+    let modified = std::time::SystemTime::UNIX_EPOCH
+      + std::time::Duration::from_secs(1_600_000_000);
+    std::fs::File::options()
+      .write(true)
+      .open(&path)
+      .unwrap()
+      .set_times(std::fs::FileTimes::new().set_modified(modified))
+      .unwrap();
+    format(&fixture, path.as_os_str(), 0);
+    assert_eq!(
+      std::fs::metadata(&path).unwrap().modified().unwrap(),
+      modified
+    );
+    assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 1);
+  }
+
+  #[test]
+  fn formatting_a_directory_uses_workspace_selection_and_ignore_rules() {
+    let fixture = Fixture::new();
+    fixture.write(".gitignore", "ignored.sh\nignored/\n");
+    fixture.write("nested/.gitignore", "skip.sh\n");
+    fixture.write(".ignore", "ordinary.sh\n");
+    fixture.write(".git/info/exclude", "env-runner\n");
+    let cases = [
+      ("ordinary.sh", "echo $x\n", "echo ${x}\n"),
+      (".hidden.sh", "echo $x\n", "echo ${x}\n"),
+      ("nested/yes.sh", "echo $x\n", "echo ${x}\n"),
+      ("nested/skip.sh", "echo $x\n", "echo $x\n"),
+      ("ignored.sh", "echo $x\n", "echo $x\n"),
+      ("ignored/main.sh", "echo $x\n", "echo $x\n"),
+      (".git/hidden.sh", "echo $x\n", "echo $x\n"),
+      (
+        "runner",
+        "#!/bin/sh -eu\necho $x\n",
+        "#!/bin/sh -eu\necho ${x}\n",
+      ),
+      (
+        "env-runner",
+        "#!/usr/bin/env sh\necho $x\n",
+        "#!/usr/bin/env sh\necho ${x}\n",
+      ),
+      (
+        "bash.sh",
+        "#!/bin/bash\necho $x\n",
+        "#!/bin/bash\necho $x\n",
+      ),
+      (
+        "python.sh",
+        "#!/usr/bin/python3\nprint('x')\n",
+        "#!/usr/bin/python3\nprint('x')\n",
+      ),
+      (
+        "env-options.sh",
+        "#!/usr/bin/env -S sh\necho $x\n",
+        "#!/usr/bin/env -S sh\necho $x\n",
+      ),
+      ("notes", "echo $x\n", "echo $x\n"),
+      ("upper.SH", "echo $x\n", "echo $x\n"),
+    ];
+    for (name, source, _) in cases {
+      fixture.write(name, source);
+    }
+    format(&fixture, std::ffi::OsStr::new("."), 0);
+    for (name, _, expected) in cases {
+      assert_eq!(
+        std::fs::read_to_string(fixture.root.join(name)).unwrap(),
+        expected,
+        "{name}"
+      );
+    }
+    format(&fixture, std::ffi::OsStr::new("ignored.sh"), 0);
+    assert_eq!(
+      std::fs::read_to_string(fixture.root.join("ignored.sh")).unwrap(),
+      "echo ${x}\n"
+    );
+  }
+
+  #[test]
+  fn formatting_continues_after_invalid_files_and_reports_failure() {
+    let fixture = Fixture::new();
+    let invalid = fixture.write("a-invalid.sh", "if true; then\n");
+    let encoding = fixture.root.join("b-encoding.sh");
+    std::fs::write(&encoding, b"echo \xff\n").unwrap();
+    let valid = fixture.write("z-valid.sh", "echo $x\n");
+    let errors = format(&fixture, std::ffi::OsStr::new("."), 1);
+    assert!(errors.contains("a-invalid.sh"), "{errors}");
+    assert!(errors.contains("b-encoding.sh"), "{errors}");
+    assert_eq!(std::fs::read_to_string(invalid).unwrap(), "if true; then\n");
+    assert_eq!(std::fs::read(encoding).unwrap(), b"echo \xff\n");
+    assert_eq!(std::fs::read_to_string(valid).unwrap(), "echo ${x}\n");
+    assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 3);
+  }
+
+  #[test]
+  fn formatting_empty_directories_succeeds_and_missing_paths_fail() {
+    let fixture = Fixture::new();
+    format(&fixture, std::ffi::OsStr::new("."), 0);
+    let errors = format(&fixture, std::ffi::OsStr::new("missing.sh"), 1);
+    assert!(errors.contains("missing.sh"));
+    assert!(!fixture.root.join("missing.sh").exists());
+  }
+
+  #[test]
+  #[cfg(unix)]
+  fn formatting_follows_symlinks_and_keeps_executable_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let fixture = Fixture::new();
+    let target = fixture.write("external/script", "#!/bin/sh\necho $x\n");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+      .unwrap();
+    let directory = fixture.root.join("input");
+    std::fs::create_dir(&directory).unwrap();
+    symlink(&target, directory.join("first")).unwrap();
+    symlink(&target, directory.join("second")).unwrap();
+    symlink(&directory, directory.join("cycle")).unwrap();
+    format(&fixture, directory.as_os_str(), 0);
+    assert_eq!(
+      std::fs::read_to_string(&target).unwrap(),
+      "#!/bin/sh\necho ${x}\n"
+    );
+    assert_eq!(
+      std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+      0o755
+    );
+    assert!(
+      std::fs::symlink_metadata(directory.join("first"))
+        .unwrap()
+        .is_symlink()
+    );
+    assert!(
+      std::fs::symlink_metadata(directory.join("second"))
+        .unwrap()
+        .is_symlink()
+    );
+    assert_eq!(
+      std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+      1
+    );
+  }
+
+  #[test]
+  #[cfg(unix)]
+  fn formatting_keeps_read_only_files_and_continues_with_writable_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let locked = fixture.write("a-locked.sh", "echo $x\n");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444))
+      .unwrap();
+    if std::fs::File::options().write(true).open(&locked).is_ok() {
+      return;
+    }
+    let valid = fixture.write("z-valid.sh", "echo $x\n");
+    let errors = format(&fixture, std::ffi::OsStr::new("."), 1);
+    assert!(errors.contains("a-locked.sh"));
+    assert_eq!(std::fs::read_to_string(&locked).unwrap(), "echo $x\n");
+    assert_eq!(std::fs::read_to_string(valid).unwrap(), "echo ${x}\n");
+    assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 2);
+  }
+
+  #[test]
+  #[cfg(unix)]
+  fn formatting_reports_dangling_links_and_rejects_special_files() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+    let fixture = Fixture::new();
+    symlink("absent.sh", fixture.root.join("missing.sh")).unwrap();
+    let valid = fixture.write("valid.sh", "echo $x\n");
+    let errors = format(&fixture, std::ffi::OsStr::new("."), 1);
+    assert!(errors.contains("missing.sh"));
+    assert_eq!(std::fs::read_to_string(valid).unwrap(), "echo ${x}\n");
+    let socket = fixture.root.join("socket");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let errors = format(&fixture, socket.as_os_str(), 1);
+    assert!(errors.contains("regular file"));
   }
 }
 
@@ -2088,6 +2403,8 @@ mod transport {
       (true, "textDocument/prepareRename"),
       (false, "textDocument/rename"),
       (true, "textDocument/rename"),
+      (false, "textDocument/formatting"),
+      (true, "textDocument/formatting"),
     ] {
       let mut child = Command::new(env!("CARGO_BIN_EXE_shellsmith"))
         .arg("lsp")
@@ -2118,7 +2435,7 @@ mod transport {
       );
       send(
         &mut batch,
-        &json!({"jsonrpc":"2.0","id":2,"method":method,"params":{"textDocument":{"uri":uri},"position":{"line":0,"character":0},"newName":"value"}}),
+        &json!({"jsonrpc":"2.0","id":2,"method":method,"params":{"textDocument":{"uri":uri},"position":{"line":0,"character":0},"newName":"value","options":{"tabSize":2,"insertSpaces":true}}}),
       );
       if changed {
         send(

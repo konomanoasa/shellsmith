@@ -387,7 +387,6 @@ pub(in crate::interface::application::engine::analysis) struct Argument<'a> {
 }
 
 impl Argument<'_> {
-  /// The bytes of an argument that is one field with a known value.
   pub fn literal(&self) -> Option<&[u8]> {
     match &self.value {
       Value::Literal(bytes) if self.count.boundary().is_ok() => Some(bytes),

@@ -3,7 +3,7 @@
 [![CI](https://github.com/konomanoasa/shellsmith/actions/workflows/ci.yaml/badge.svg)](https://github.com/konomanoasa/shellsmith/actions/workflows/ci.yaml)
 [![crates.io](https://img.shields.io/crates/v/konomanoasa-shellsmith.svg)](https://crates.io/crates/konomanoasa-shellsmith)
 
-Language server for shell scripts.
+Command-line interface and language server for shell scripts.
 
 ## Supported shells
 
@@ -14,6 +14,7 @@ Language server for shell scripts.
 - Document links
 - Document symbols
 - Find references
+- Formatting
 - Go to definition
 - Rename
 - Semantic tokens
@@ -37,6 +38,13 @@ cargo install konomanoasa-shellsmith --locked
 ```
 
 ## Usage
+
+Format shell files in place, respecting `.gitignore` when scanning directories.
+
+```sh
+shellsmith format script.sh
+shellsmith format .
+```
 
 Start the LSP server.
 

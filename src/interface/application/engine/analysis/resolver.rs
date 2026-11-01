@@ -230,8 +230,7 @@ impl<'a> Resolver<'a> {
     })
   }
 
-  /// Evaluates an entry or body root; its symbolic values are charged to the
-  /// request budget.
+  /// Charge root symbolic values to the request budget.
   pub(super) fn run_root(
     &mut self,
     root: Node<'a>,

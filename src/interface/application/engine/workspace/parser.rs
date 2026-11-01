@@ -162,6 +162,10 @@ impl Document {
     &self.source
   }
 
+  pub(in crate::interface::application) fn syntax(&self) -> Node<'_> {
+    self.tree.root_node()
+  }
+
   #[must_use]
   pub fn has_syntax_errors(&self) -> bool {
     self.facts.syntax_errors

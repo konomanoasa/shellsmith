@@ -1,5 +1,5 @@
 use super::{
-  Application, Error, Failure,
+  Application, Error, Failure, Settings,
   application::InputSelection,
   inputs::{InputCache, Inputs},
 };
@@ -15,17 +15,44 @@ use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub(in crate::interface::application) struct AnalysisCollection {
-  pub entries: BTreeMap<PathBuf, Workspace>,
+  outcome: Result<BTreeMap<PathBuf, Workspace>, AnalysisRequest>,
   collected: Instant,
   pub(super) selection: InputSelection,
   failures: Vec<Failure>,
   paths: BTreeMap<PathBuf, Snapshot>,
   cache: InputCache,
+  settings: Settings,
 }
 
 impl AnalysisCollection {
+  pub(super) fn cache_has_document(&self, path: &Path) -> bool {
+    self.cache.loaded.get(path).is_some_and(Result::is_ok)
+  }
+
+  pub(in crate::interface::application) fn entries(
+    &self,
+  ) -> Result<&BTreeMap<PathBuf, Workspace>, Error> {
+    self
+      .outcome
+      .as_ref()
+      .map_err(|_| engine::Error::AnalysisLimit.into())
+  }
+
+  pub(super) fn limited(&self) -> Option<&AnalysisRequest> {
+    self.outcome.as_ref().err()
+  }
+
   pub(super) fn supersedes(&self, previous: Option<&Self>) -> bool {
-    previous.is_none_or(|previous| previous.collected < self.collected)
+    previous.is_none_or(|previous| {
+      if self.selection.explicit == previous.selection.explicit {
+        previous.collected < self.collected
+      } else {
+        self
+          .selection
+          .explicit
+          .is_superset(&previous.selection.explicit)
+      }
+    })
   }
 }
 
@@ -34,6 +61,13 @@ impl Application {
     &mut self,
     cancelled: &AtomicBool,
   ) -> Result<Arc<AnalysisCollection>, Error> {
+    if let Some(collection) = self.analyses.clone()
+      && collection.selection.explicit.is_empty()
+      && self.analysis_inputs_current(&collection, cancelled)?
+    {
+      self.share_analyses(collection.clone());
+      return Ok(collection);
+    }
     match self.collect_analysis(BTreeSet::new(), cancelled) {
       Err(Error::Superseded) => {
         self.refresh_for(None, cancelled)?;
@@ -53,26 +87,38 @@ impl Application {
   ) -> Result<Arc<AnalysisCollection>, Error> {
     let selection = self.select_inputs(explicit, cancelled)?;
     let mut entries = BTreeMap::new();
+    let mut limited = None;
     for path in &selection.paths {
       check_cancelled(cancelled)?;
       match self.cache.loaded.get(path) {
-        Some(Ok(_)) => {
-          entries.insert(path.clone(), self.analyze_entry(path, cancelled)?);
-        }
+        Some(Ok(_)) => match self.analyze_entry(path, cancelled) {
+          Ok(workspace) => {
+            entries.insert(path.clone(), workspace);
+          }
+          Err(Error::Engine(engine::Error::AnalysisLimit)) => {
+            limited = Some(self.limited.clone().expect("limited entry"));
+            break;
+          }
+          Err(error) => return Err(error),
+        },
         Some(Err(_)) => {}
         None => return Err(Error::Superseded),
       }
     }
     let collection = AnalysisCollection {
-      entries,
+      outcome: limited.map_or(Ok(entries), Err),
       collected: Instant::now(),
       selection,
       failures: self.failures.clone(),
       paths: self.entries.clone(),
       cache: self.cache.clone(),
+      settings: self.settings.clone(),
     };
     if !self.analysis_inputs_current(&collection, cancelled)? {
       return Err(Error::Superseded);
+    }
+    if collection.limited().is_some() {
+      self.workspace.clear_analysis();
     }
     let collection = Arc::new(collection);
     self.set_analyses(Some(collection.clone()));
@@ -87,10 +133,17 @@ impl Application {
     let path = self.absolute(path);
     if self.request_prepared {
       self.check_inputs(cancelled)?;
+      if let Some(collection) = &self.analyses {
+        collection.entries()?;
+      }
       return self
         .analyses
         .clone()
-        .filter(|collection| collection.entries.contains_key(&path))
+        .filter(|collection| {
+          collection
+            .entries()
+            .is_ok_and(|entries| entries.contains_key(&path))
+        })
         .ok_or_else(|| {
           Error::Message(
             "Workspace results were not prepared for this request".into(),
@@ -112,24 +165,23 @@ impl Application {
         self.refresh_for(None, cancelled)?;
       }
     }
+    let selection =
+      self.select_inputs(BTreeSet::from([path.clone()]), cancelled)?;
     if self
       .analyses
       .as_ref()
-      .is_none_or(|collection| !collection.entries.contains_key(&path))
+      .is_none_or(|collection| collection.selection != selection)
     {
       if !self.cache.loaded.get(&path).is_some_and(Result::is_ok) {
         self.load(&path, cancelled)?;
       }
-      let mut explicit = self
-        .analyses
-        .as_ref()
-        .map(|collection| collection.selection.explicit.clone())
-        .unwrap_or_default();
-      explicit.insert(path);
-      self.collect_analysis(explicit, cancelled)?;
+      self.collect_analysis(selection.explicit, cancelled)?;
     }
     self.restore_analysis_documents(cancelled)?;
-    Ok(self.analyses.clone().expect("completed workspace analysis"))
+    let collection =
+      self.analyses.clone().expect("collected workspace analysis");
+    collection.entries()?;
+    Ok(collection)
   }
 
   pub(in crate::interface::application) fn prepare_position(
@@ -210,7 +262,8 @@ impl Application {
     if let Some(workspace) = self
       .analyses
       .as_ref()
-      .and_then(|analyses| analyses.entries.get(path))
+      .filter(|collection| collection.settings == self.settings)
+      .and_then(|analyses| analyses.entries().ok()?.get(path))
       && workspace
         .analysis()
         .is_some_and(|analysis| analysis.request().entry == document.snapshot())
@@ -234,7 +287,9 @@ impl Application {
     collection: &AnalysisCollection,
     cancelled: &AtomicBool,
   ) -> Result<bool, Error> {
-    if !self.selection_current(&collection.selection, cancelled)? {
+    if self.settings != collection.settings
+      || !self.selection_current(&collection.selection, cancelled)?
+    {
       return Ok(false);
     }
     for (path, current) in &self.cache.loaded {
@@ -293,7 +348,15 @@ impl Application {
     let mut request = AnalysisRequest::new(snapshot);
     request.initial = self.initial_environment(id)?;
     request.limits = self.settings.limits;
-    if self.limited.as_ref() == Some(&request) {
+    if self.limited.as_ref() == Some(&request)
+      || self
+        .analyses
+        .as_ref()
+        .and_then(|collection| collection.limited())
+        == Some(&request)
+    {
+      self.workspace.clear_analysis();
+      self.limited = Some(request);
       return Err(engine::Error::AnalysisLimit.into());
     }
     if self

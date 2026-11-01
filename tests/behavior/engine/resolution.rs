@@ -1903,6 +1903,48 @@ mod bindings {
   }
 
   #[test]
+  fn background_terminators_are_recomputed_after_document_updates() {
+    let mut workspace = Workspace::default();
+    for (revision, source, expected) in [
+      (1, "x=1; { x=2 & }; : \"$x\"", 0),
+      (2, "x=1; { x=2; }; : \"$x\"", 1),
+      (3, "x=1; { : && x=2 & }; : \"$x\"", 0),
+    ] {
+      let document = support::parse(1, revision, source);
+      let snapshot = document.snapshot();
+      workspace.insert(document).unwrap();
+      let mut request = AnalysisRequest::new(snapshot);
+      request.initial = InitialEnvironment::empty();
+      let analysis = workspace
+        .analyze(
+          request,
+          &mut support::Inputs::default(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
+      let ids: Vec<_> = workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
+        .map(|symbol| symbol.id)
+        .collect();
+      assert_eq!(
+        reads(&workspace, &analysis, b"x")[0].resolution.status(),
+        ResolutionStatus::Resolved(ids[expected]),
+        "{source}"
+      );
+      assert_eq!(
+        analysis
+          .contexts()
+          .iter()
+          .any(|context| context.kind == ExecutionKind::Asynchronous),
+        expected == 0,
+        "{source}"
+      );
+      workspace.publish_analysis(analysis).unwrap();
+    }
+  }
+
+  #[test]
   fn unknown_sources_and_recursive_calls_do_not_claim_one_definition() {
     for source in [
       "x=1; . missing; : \"$x\"",

@@ -528,71 +528,67 @@ fn encode(
   spans: &[SemanticSpan],
   legend: &lsp::SemanticTokensLegend,
 ) -> Vec<lsp::SemanticToken> {
-  let mut events: BTreeMap<usize, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
-  for (index, span) in spans.iter().enumerate() {
-    let range = &span.location.bytes;
-    if range.is_empty()
-      || !source.is_char_boundary(range.start)
-      || !source.is_char_boundary(range.end)
-      || !legend
+  let encoded: Vec<_> = spans
+    .iter()
+    .filter(|span| {
+      let range = &span.location.bytes;
+      !range.is_empty()
+        && source.is_char_boundary(range.start)
+        && source.is_char_boundary(range.end)
+    })
+    .filter_map(|span| {
+      let kind = legend
         .token_types
         .iter()
-        .any(|name| name.as_str() == token_kind(span.kind))
-    {
-      continue;
-    }
+        .position(|name| name.as_str() == token_kind(span.kind))?;
+      let bits = span
+        .modifiers
+        .iter()
+        .filter_map(|modifier| {
+          legend
+            .token_modifiers
+            .iter()
+            .position(|name| name.as_str() == token_modifier(*modifier))
+        })
+        .fold(0_u32, |bits, index| bits | (1 << index));
+      Some((span, u32::try_from(kind).ok()?, bits))
+    })
+    .collect();
+  let mut events: BTreeMap<usize, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
+  for (index, (span, ..)) in encoded.iter().enumerate() {
+    let range = &span.location.bytes;
     events.entry(range.start).or_default().0.push(index);
     events.entry(range.end).or_default().1.push(index);
   }
+  let priority = |index: usize| {
+    let span = encoded[index].0;
+    (
+      span.semantic,
+      std::cmp::Reverse(span.location.bytes.len()),
+      index,
+    )
+  };
   let mut active = BTreeSet::new();
   let mut ranges = Vec::new();
   let mut previous = 0;
   for (offset, (starts, ends)) in events {
     if previous < offset
-      && let Some((_, _, index)) = active.last()
+      && let Some(&(_, _, index)) = active.last()
     {
-      ranges.push((previous, offset, *index));
+      ranges.push((previous, offset, index));
     }
     for index in ends {
-      let span = &spans[index];
-      active.remove(&(
-        span.semantic,
-        std::cmp::Reverse(span.location.bytes.len()),
-        index,
-      ));
+      active.remove(&priority(index));
     }
     for index in starts {
-      let span = &spans[index];
-      active.insert((
-        span.semantic,
-        std::cmp::Reverse(span.location.bytes.len()),
-        index,
-      ));
+      active.insert(priority(index));
     }
     previous = offset;
   }
   let lines = Lines::new(source);
   let mut tokens: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
   for (start, end, index) in ranges {
-    let span = &spans[index];
-    let Some(kind) = legend
-      .token_types
-      .iter()
-      .position(|name| name.as_str() == token_kind(span.kind))
-      .and_then(|i| u32::try_from(i).ok())
-    else {
-      continue;
-    };
-    let bits = span
-      .modifiers
-      .iter()
-      .filter_map(|modifier| {
-        legend
-          .token_modifiers
-          .iter()
-          .position(|name| name.as_str() == token_modifier(*modifier))
-      })
-      .fold(0, |bits, index| bits | (1 << index));
+    let (_, kind, bits) = encoded[index];
     for (line, column, length) in lines.segments(start..end) {
       if let Some(last) = tokens.last_mut()
         && last.0 == line

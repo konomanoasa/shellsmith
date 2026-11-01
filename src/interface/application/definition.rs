@@ -20,7 +20,7 @@ impl Application {
       .document(id)
       .ok_or(engine::Error::UnknownDocument(id))?;
     let snapshot = document.snapshot();
-    let resolution = engine::AnalysisResults::new(analyses.entries.values())
+    let resolution = engine::AnalysisResults::new(analyses.entries()?.values())
       .resolution_at(snapshot, offset)?;
     check_cancelled(cancelled)?;
     let mut locations = BTreeMap::new();

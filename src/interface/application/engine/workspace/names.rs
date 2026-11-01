@@ -401,7 +401,7 @@ impl SyntaxNames {
         });
       let outer = context.parent.map(|id| contexts[id.index]);
       let separate = super::parser::subshell(&context.kind)
-        || node.is_some_and(super::parser::asynchronous);
+        || node.is_some_and(|node| document.asynchronous(node));
       let environment =
         if context.parent.is_none() || context.kind == "function_body" {
           NameEnvironment::Caller(context.id)

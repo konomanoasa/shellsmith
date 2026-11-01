@@ -126,8 +126,8 @@ impl Default for AnalysisLimits {
   fn default() -> Self {
     Self {
       value_bytes: 1024 * 1024,
-      work: 2_000_000,
-      storage_bytes: 64 * 1024 * 1024,
+      work: 8_000_000,
+      storage_bytes: 256 * 1024 * 1024,
     }
   }
 }

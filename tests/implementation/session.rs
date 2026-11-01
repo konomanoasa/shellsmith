@@ -725,10 +725,10 @@ async fn rename_reanalyzes_unchanged_entries_when_their_source_dependency_is_edi
 }
 
 #[tokio::test]
-async fn requested_documents_outside_the_inputs_remain_entries_with_newer_shared_results()
+async fn requested_documents_only_extend_their_own_entry_sets_and_share_matching_results()
  {
   let fixture = Fixture::new();
-  fixture.write("workspace/main.sh", ":\n");
+  let main = fixture.write("workspace/main.sh", ":\n");
   let first = fixture.write("first.sh", "f() { :; }; f\n");
   let second = fixture.write("second.sh", "g() { :; }; g\n");
   let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
@@ -739,18 +739,76 @@ async fn requested_documents_outside_the_inputs_remain_entries_with_newer_shared
       move |app, cancelled| {
         let id = app.document_id(&path).unwrap();
         let definitions = app.definitions(id, 12, cancelled)?;
-        Ok(
+        Ok((
           definitions
             .into_iter()
             .map(|location| (location.bytes.start, location.bytes.end))
             .collect::<Vec<_>>(),
-        )
+          app.analyses.clone().unwrap(),
+        ))
       },
     )
   };
-  for path in [first.clone(), second, first] {
-    assert_eq!(definitions(path).await.result.unwrap(), [(0, 1)]);
+  let mut collections = BTreeMap::new();
+  for path in [first.clone(), second.clone(), first, second] {
+    let relative = path.strip_prefix(&fixture.root).unwrap().to_path_buf();
+    let names = session.request(RequestScope::Names(relative), |app, _| {
+      Ok(app.analyses.clone().unwrap())
+    });
+    let (navigation, names) = tokio::join!(definitions(path.clone()), names);
+    let (locations, analyses) = navigation.result.unwrap();
+    assert!(Arc::ptr_eq(&analyses, &names.result.unwrap()));
+    assert_eq!(locations, [(0, 1)]);
+    let expected = BTreeSet::from([main.clone(), path.clone()]);
+    assert_eq!(
+      analyses
+        .entries()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>(),
+      expected
+    );
+    if let Some(previous) = collections.insert(path, analyses.clone()) {
+      assert!(Arc::ptr_eq(&previous, &analyses));
+    }
   }
+  let path = main.clone();
+  let entries = session
+    .request(RequestScope::Analysis(main.clone()), move |app, flag| {
+      app.classify(app.loaded_document(&path)?, flag)?;
+      Ok(
+        app
+          .analyses
+          .as_ref()
+          .unwrap()
+          .entries()?
+          .keys()
+          .cloned()
+          .collect::<Vec<_>>(),
+      )
+    })
+    .await
+    .result
+    .unwrap();
+  assert_eq!(entries, std::slice::from_ref(&main));
+  let entries = session
+    .request(RequestScope::WorkspaceAnalysis, |app, _| {
+      Ok(
+        app
+          .analyses
+          .as_ref()
+          .unwrap()
+          .entries()?
+          .keys()
+          .cloned()
+          .collect::<Vec<_>>(),
+      )
+    })
+    .await
+    .result
+    .unwrap();
+  assert_eq!(entries, [main]);
 }
 
 #[tokio::test]
@@ -790,8 +848,16 @@ async fn workspace_analysis_reloads_inputs_selected_after_its_workspace_was_load
     .await
     .result
     .unwrap();
-  let analyses = lock(&session.state).unwrap().application.analyses.clone();
-  let entries: Vec<_> = analyses.unwrap().entries.keys().cloned().collect();
+  let analyses = lock(&session.state)
+    .unwrap()
+    .analyses_for(&RequestScope::WorkspaceAnalysis);
+  let entries: Vec<_> = analyses
+    .unwrap()
+    .entries()
+    .unwrap()
+    .keys()
+    .cloned()
+    .collect();
   assert_eq!(entries, [main, created]);
 }
 
@@ -883,4 +949,151 @@ async fn failed_requests_do_not_commit_mutations_or_poison_the_session() {
       .unwrap();
     assert_eq!(actual, 1024);
   }
+}
+
+#[tokio::test]
+async fn limit_outcomes_are_shared_across_scopes_and_rechecked_after_source_changes()
+ {
+  for selected in [false, true] {
+    let fixture = Fixture::new();
+    let main = fixture.write("main.sh", ". ./lib.sh\nf\n");
+    let other = fixture.write("other.sh", "x=1; : $x\n");
+    fixture.write("lib.sh", &format!("f() {{ :; }}\n{}", ":\n".repeat(200)));
+    let mut settings = Settings::new(fixture.root.clone());
+    settings.initial = engine::InitialEnvironment::empty();
+    settings.limits.work = 1500;
+    let session = Session::new(settings).unwrap();
+    session.add_input(&other).unwrap();
+    if selected {
+      session.add_input(&main).unwrap();
+    }
+    let limited = session
+      .request::<()>(RequestScope::Names(main.clone()), |_, _| {
+        panic!("an incomplete analysis must not reach the operation")
+      })
+      .await;
+    assert!(matches!(
+      limited.result,
+      Err(Error::Engine(engine::Error::AnalysisLimit))
+    ));
+    let retained = || {
+      lock(&session.state)
+        .unwrap()
+        .analyses_for(&RequestScope::Results(main.clone()))
+        .unwrap()
+    };
+    let cached = retained();
+    assert!(cached.entries().is_err());
+    assert!(cached.limited().is_some());
+    for scope in [
+      RequestScope::Results(main.clone()),
+      RequestScope::Names(main.clone()),
+    ] {
+      let outcome = session
+        .request::<()>(scope, |_, _| {
+          panic!("a retained limit must not reach the operation")
+        })
+        .await;
+      assert!(matches!(
+        outcome.result,
+        Err(Error::Engine(engine::Error::AnalysisLimit))
+      ));
+      assert!(Arc::ptr_eq(&cached, &retained()));
+    }
+    let workspace = session
+      .request(RequestScope::WorkspaceAnalysis, move |app, _| {
+        assert_eq!(
+          app
+            .analyses
+            .as_ref()
+            .unwrap()
+            .entries()?
+            .keys()
+            .collect::<Vec<_>>(),
+          [&other]
+        );
+        Ok(())
+      })
+      .await;
+    if selected {
+      assert!(matches!(
+        workspace.result,
+        Err(Error::Engine(engine::Error::AnalysisLimit))
+      ));
+    } else {
+      workspace.result.unwrap();
+    }
+    let path = main.clone();
+    let (syntax, analyses) = session
+      .request(RequestScope::Analysis(main.clone()), move |app, flag| {
+        let syntax = app.classify(app.loaded_document(&path)?, flag)?;
+        Ok((syntax, app.analyses.clone().unwrap()))
+      })
+      .await
+      .result
+      .unwrap();
+    assert_ne!(syntax, []);
+    assert!(Arc::ptr_eq(&cached, &analyses));
+
+    fixture.write("lib.sh", "f() { :; }\n");
+    session
+      .request(RequestScope::WorkspaceAnalysis, |_, _| Ok(()))
+      .await
+      .result
+      .unwrap();
+    let path = main.clone();
+    let definitions = session
+      .request(RequestScope::Results(main.clone()), move |app, flag| {
+        app.definitions(app.loaded_document(&path)?, 11, flag)
+      })
+      .await
+      .result
+      .unwrap();
+    assert_eq!(definitions.len(), 1);
+    let current = retained();
+    assert!(!Arc::ptr_eq(&cached, &current));
+    assert!(current.entries().is_ok());
+  }
+}
+
+#[test]
+fn limit_outcomes_are_invalidated_by_analysis_conditions_and_input_selection() {
+  let fixture = Fixture::new();
+  let main =
+    fixture.write("main.sh", &format!("x=1\n{}", ": $x\n".repeat(100)));
+  let mut settings = Settings::new(fixture.root.clone());
+  settings.initial = engine::InitialEnvironment::empty();
+  settings.limits.work = 1500;
+  let mut app = Application::new(settings).unwrap();
+  app.add_input(&fixture.root);
+  let flag = AtomicBool::new(false);
+  app.refresh_for(None, &flag).unwrap();
+  let limited = app.prepare_workspace_analysis(&flag).unwrap();
+  assert!(limited.limited().is_some());
+  assert!(Arc::ptr_eq(
+    &limited,
+    &app.prepare_workspace_analysis(&flag).unwrap()
+  ));
+
+  app
+    .settings
+    .initial
+    .values
+    .insert(b"other".to_vec(), b"value".to_vec());
+  let changed = app.prepare_workspace_analysis(&flag).unwrap();
+  assert!(changed.limited().is_some());
+  assert!(!Arc::ptr_eq(&limited, &changed));
+  fixture.write("new.sh", ":\n");
+  let selected = app.prepare_workspace_analysis(&flag).unwrap();
+  assert!(selected.limited().is_some());
+  assert!(!Arc::ptr_eq(&changed, &selected));
+
+  app.settings.limits.work = engine::AnalysisLimits::default().work;
+  let completed = app.prepare_workspace_analysis(&flag).unwrap();
+  assert!(completed.entries().unwrap().contains_key(&main));
+  assert!(!Arc::ptr_eq(&selected, &completed));
+  app.settings.limits.work = 1500;
+  let limited_again = app.prepare_workspace_analysis(&flag).unwrap();
+  assert!(limited_again.limited().is_some());
+  assert!(!Arc::ptr_eq(&completed, &limited_again));
 }

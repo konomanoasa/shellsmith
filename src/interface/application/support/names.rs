@@ -35,7 +35,7 @@ impl Application {
     {
       return Ok(names.clone());
     }
-    let roots = analyses.entries.keys().cloned().collect();
+    let roots = analyses.entries()?.keys().cloned().collect();
     let names = Arc::new(self.collect_names(
       roots,
       analyses.selection.clone(),

@@ -110,7 +110,11 @@ impl Resolver<'_> {
       if parser::subshell(node.kind()) {
         continue;
       }
-      if parser::asynchronous(node) {
+      if self
+        .workspace
+        .document(snapshot.document)?
+        .asynchronous(node)
+      {
         targets.insert(EffectTarget::SpecialParameters);
         continue;
       }

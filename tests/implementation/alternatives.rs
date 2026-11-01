@@ -29,6 +29,33 @@ fn identical_decisions_share_nodes_and_equal_branches_collapse() {
 }
 
 #[test]
+fn summary_reuses_a_selected_binding_without_recomputing_its_value() {
+  use super::super::super::request::Budget;
+  use crate::interface::application::engine::AnalysisLimits;
+
+  let flag = AtomicBool::new(false);
+  let mut decisions = Decisions::default();
+  let kept = StateValue::Binding(Binding {
+    resolution: alternative(Alternative::External),
+    value: Arc::new(Value::Literal(vec![b'a'; 4096])),
+  });
+  let kept_id = decisions.intern(Decision::Value(kept.clone()));
+  let discarded = decisions.intern(Decision::Value(StateValue::Binding(
+    Binding::new(alternative(Alternative::Unset)),
+  )));
+  let active = decisions.expressions.conditions.variable(0);
+  let root = decisions.branch(active, discarded, kept_id);
+  decisions
+    .expressions
+    .set_budget(Budget::new(AnalysisLimits {
+      work: 100,
+      storage_bytes: 4096,
+      ..AnalysisLimits::default()
+    }));
+  assert_eq!(decisions.summary(root, active, &flag).unwrap(), kept);
+}
+
+#[test]
 fn partitions_preserve_unread_correlations_and_merge_equal_inputs() {
   let assign = |env: &mut Environment, name: &[u8], value: &[u8]| {
     env.assign(

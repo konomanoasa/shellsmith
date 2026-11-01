@@ -4483,6 +4483,54 @@ mod rename {
   }
 
   #[test]
+  fn rename_does_not_inherit_entry_contexts_from_previous_requests() {
+    let fixture = Fixture::new();
+    let first = fixture.write("a.sh", "x=first; target=./empty; . ./lib\n");
+    let second = fixture.write("b.sh", "x=second; target=./empty; . ./lib\n");
+    let library = fixture.write("lib", ": $x; . \"$target\"\n");
+    fixture.write("empty", ":\n");
+    let cancel = AtomicBool::new(false);
+    for prior in ["none", "definitions", "references"] {
+      let mut app = application(&fixture);
+      app.add_input(&fixture.root);
+      for _ in 0..2 {
+        match prior {
+          "definitions" => {
+            app.definitions(&library, 3, &cancel).unwrap();
+          }
+          "references" => {
+            app.references(&library, 3, true, &cancel).unwrap();
+          }
+          _ => {}
+        }
+        let edits = app.rename(&first, 0, "value", &cancel).unwrap();
+        let locations: Vec<_> = edits
+          .iter()
+          .map(|edit| {
+            (
+              app
+                .snapshot()
+                .path(edit.location.snapshot.document)
+                .unwrap(),
+              edit.location.bytes.clone(),
+              edit.new_text.as_str(),
+            )
+          })
+          .collect();
+        assert_eq!(
+          locations,
+          [
+            (first.as_path(), 0..1, "value"),
+            (second.as_path(), 0..1, "value"),
+            (library.as_path(), 3..4, "value"),
+          ],
+          "prior request: {prior:?}"
+        );
+      }
+    }
+  }
+
+  #[test]
   fn rename_collects_shared_sources_across_entries_without_merging_unrelated_names()
    {
     let fixture = Fixture::new();

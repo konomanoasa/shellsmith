@@ -1,11 +1,12 @@
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use super::analysis::AnalysisCollection;
 use super::{Application, Error, Failure, Settings};
 use crate::interface::application::engine::{self, check_cancelled};
 
@@ -36,6 +37,7 @@ impl<T> RequestOutcome<T> {
 
 struct State {
   application: Application,
+  analyses: BTreeMap<BTreeSet<PathBuf>, Arc<AnalysisCollection>>,
   generation: Arc<()>,
   jobs: Vec<Weak<AtomicBool>>,
   preparations: BTreeMap<RequestScope, Arc<Preparation>>,
@@ -59,23 +61,60 @@ impl State {
     result
   }
 
-  /// Keeps the most recently collected analyses; reused results may be older.
+  /// Keeps the newest analyses for each entry set; reused results may be older.
   /// A state that found unnotified changes outdates the retained ones.
   fn publish(&mut self, application: &Application) {
     if application.outdated {
       self.invalidate();
     }
     if let Some(analyses) = &application.analyses
-      && analyses.supersedes(self.application.analyses.as_deref())
+      && analyses.supersedes(
+        self
+          .analyses
+          .get(&analyses.selection.explicit)
+          .map(Arc::as_ref),
+      )
     {
-      self.application.set_analyses(Some(analyses.clone()));
+      self
+        .analyses
+        .insert(analyses.selection.explicit.clone(), analyses.clone());
       self.updates.send_replace(());
     }
   }
 
+  fn analyses_for(
+    &self,
+    scope: &RequestScope,
+  ) -> Option<Arc<AnalysisCollection>> {
+    let requested = match scope {
+      RequestScope::Analysis(path)
+      | RequestScope::Names(path)
+      | RequestScope::Results(path) => {
+        self.analyses.get(&BTreeSet::from([path.clone()]))
+      }
+      RequestScope::WorkspaceAnalysis => None,
+      RequestScope::Document(_) | RequestScope::Workspace => return None,
+    };
+    requested
+      .or_else(|| self.analyses.get(&BTreeSet::new()))
+      .or_else(|| {
+        self
+          .preparations
+          .get(&RequestScope::WorkspaceAnalysis)?
+          .result
+          .peek()?
+          .result
+          .as_ref()
+          .ok()?
+          .analyses
+          .as_ref()
+      })
+      .cloned()
+  }
+
   fn invalidate(&mut self) {
     self.generation = Arc::default();
-    self.application.set_analyses(None);
+    self.analyses.clear();
     if let Some(task) = self.background.take() {
       task.abort();
     }
@@ -168,6 +207,7 @@ impl Session {
     Ok(Self {
       state: Arc::new(Mutex::new(State {
         application: Application::new(settings)?,
+        analyses: BTreeMap::new(),
         generation: Arc::default(),
         jobs: Vec::new(),
         preparations: BTreeMap::new(),
@@ -275,13 +315,13 @@ impl Session {
   /// shared preparation stops only when its last subscriber leaves.
   pub fn request<T: Send + 'static>(
     &self,
-    scope: RequestScope,
+    mut scope: RequestScope,
     operation: impl FnOnce(&mut Application, &AtomicBool) -> Result<T, Error>
     + Send
     + 'static,
   ) -> impl Future<Output = RequestOutcome<T>> + Send + 'static {
     let workers = self.workers_for(&scope);
-    let prepared = self.subscribe(scope.clone());
+    let prepared = self.subscribe(&mut scope);
     let state = self.state.clone();
     async move {
       let mut failures = Vec::new();
@@ -292,7 +332,7 @@ impl Session {
         let (application, published) = {
           let mut state = lock(&state)?;
           let application = state.accept(&request, outcome.result)?;
-          (application, state.application.analyses.clone())
+          (application, state.analyses_for(&scope))
         };
         let failed_inputs = !application.failures().is_empty();
         let mut outdated = false;
@@ -313,13 +353,30 @@ impl Session {
               application.check_inputs(flag)?;
               Ok(output)
             })();
+            if matches!(
+              output,
+              Err(Error::Engine(engine::Error::AnalysisLimit))
+            ) {
+              application.check_inputs(flag)?;
+            }
             Ok((output, application))
           })
           .await
           .and_then(|(output, application)| {
             failures = application.failures().to_vec();
             outdated = application.outdated;
-            output.map(|output| (output, application))
+            match output {
+              Ok(output) => Ok((Ok(output), application)),
+              Err(Error::Engine(engine::Error::AnalysisLimit))
+                if application
+                  .analyses
+                  .as_ref()
+                  .is_some_and(|collection| collection.limited().is_some()) =>
+              {
+                Ok((Err(engine::Error::AnalysisLimit.into()), application))
+              }
+              Err(error) => Err(error),
+            }
           });
         let mut state = lock(&state)?;
         let result = state.accept(&request, result);
@@ -336,7 +393,7 @@ impl Session {
         }
         let (output, application) = result?;
         state.publish(&application);
-        Ok(output)
+        output
       }
       .await;
       if matches!(
@@ -360,9 +417,9 @@ impl Session {
     .clone()
   }
 
-  fn subscribe(&self, mut scope: RequestScope) -> Result<Request, Error> {
+  fn subscribe(&self, scope: &mut RequestScope) -> Result<Request, Error> {
     let mut state = lock(&self.state)?;
-    match &mut scope {
+    match scope {
       RequestScope::Analysis(path)
       | RequestScope::Results(path)
       | RequestScope::Document(path)
@@ -371,7 +428,7 @@ impl Session {
       }
       RequestScope::Workspace | RequestScope::WorkspaceAnalysis => {}
     }
-    Ok(self.subscribe_current(&mut state, scope))
+    Ok(self.subscribe_current(&mut state, scope.clone()))
   }
 
   fn subscribe_current(
@@ -410,13 +467,18 @@ impl Session {
       RequestScope::WorkspaceAnalysis => {
         Some(self.prepare(state, RequestScope::Workspace))
       }
-      RequestScope::Names(_) | RequestScope::Results(_) => {
+      RequestScope::Names(path) => {
+        Some(self.prepare(state, RequestScope::Results(path.clone())))
+      }
+      RequestScope::Results(_) => {
         Some(self.prepare(state, RequestScope::WorkspaceAnalysis))
       }
       _ => None,
     };
+    let mut application = state.application.clone();
+    application.set_analyses(state.analyses_for(&scope));
     let job = Arc::new(Preparation::new(
-      state.application.clone(),
+      application,
       scope.clone(),
       self.workers_for(&scope),
       prerequisite,
@@ -458,7 +520,15 @@ impl Preparation {
         let outcome = prerequisite.job.result.clone().await;
         prerequisite.release();
         match outcome.result {
-          Ok(prepared) => application = prepared.as_ref().clone(),
+          Ok(prepared) => {
+            let published = application.analyses.clone();
+            application = prepared.as_ref().clone();
+            if let Some(published) = published
+              && published.supersedes(application.analyses.as_deref())
+            {
+              application.set_analyses(Some(published));
+            }
+          }
           Err(_) => return outcome,
         }
       }
@@ -466,7 +536,15 @@ impl Preparation {
         let result = (|| {
           match &scope {
             RequestScope::Analysis(path) => {
-              application.refresh_for(Some(path), flag)?;
+              if let Some(collection) = application.analyses.clone()
+                && collection.cache_has_document(path)
+                && application.analysis_inputs_current(&collection, flag)?
+              {
+                application.share_analyses(collection);
+                application.restore_analysis_documents(flag)?;
+              } else {
+                application.refresh_for(Some(path), flag)?;
+              }
               application
                 .prepare_semantics(application.loaded_document(path)?, flag)?;
             }
@@ -488,6 +566,17 @@ impl Preparation {
           }
           Ok(())
         })();
+        let result = match result {
+          Err(Error::Engine(engine::Error::AnalysisLimit))
+            if application
+              .analyses
+              .as_ref()
+              .is_some_and(|collection| collection.limited().is_some()) =>
+          {
+            application.check_inputs(flag)
+          }
+          result => result,
+        };
         let failures = application.failures().to_vec();
         Ok(RequestOutcome {
           result: result.map(|()| Arc::new(application)),
@@ -569,7 +658,7 @@ impl Application {
         }
       }
       RequestScope::WorkspaceAnalysis => {
-        self.prepare_workspace_analysis(flag)?;
+        self.prepare_workspace_analysis(flag)?.entries()?;
       }
     }
     Ok(())

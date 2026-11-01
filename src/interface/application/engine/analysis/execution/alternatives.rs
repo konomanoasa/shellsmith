@@ -355,6 +355,8 @@ impl Decisions {
         _ => unreachable!(),
       });
     }
+    let mut count = 0;
+    let mut selected = root;
     let mut resolution = Resolution::default();
     let mut positional: Option<Positionals> = None;
     for (&id, &condition) in self.leaves(root, cancelled)?.iter().rev() {
@@ -364,6 +366,8 @@ impl Decisions {
       if guard == NEVER {
         continue;
       }
+      count += 1;
+      selected = id;
       match &self.nodes[id] {
         Decision::Value(StateValue::Binding(binding)) => {
           resolution.join(&binding.resolution);
@@ -400,6 +404,12 @@ impl Decisions {
     }
     if let Some(value) = positional {
       return Ok(StateValue::Positionals(value));
+    }
+    if count == 1
+      && let Decision::Value(value) = &self.nodes[selected]
+    {
+      self.expressions.budget().check(cancelled)?;
+      return Ok(value.clone());
     }
     let scalar = self.scalar(root, None, cancelled)?;
     let scalar = self.expressions.mask(scalar, active);

@@ -788,9 +788,13 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     let [entries] = regions(node, ["and_or"]);
+    let document = self
+      .workspace
+      .document(frame.snapshot.document)
+      .expect("analyzed document");
     let entries: Vec<_> = entries
       .into_iter()
-      .map(|child| (child, parser::asynchronous(child)))
+      .map(|child| (child, document.asynchronous(child)))
       .collect();
     self.list_next(entries.into_iter(), Flow::next(env), frame)
   }

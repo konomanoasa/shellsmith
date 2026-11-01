@@ -19,7 +19,7 @@ impl Application {
       .document(id)
       .ok_or(engine::Error::UnknownDocument(id))?
       .snapshot();
-    let links = engine::AnalysisResults::new(analyses.entries.values())
+    let links = engine::AnalysisResults::new(analyses.entries()?.values())
       .sources(snapshot)?;
     let links = links
       .into_iter()

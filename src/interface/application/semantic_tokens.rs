@@ -33,7 +33,8 @@ impl Application {
     let entries: Vec<_> = self
       .analyses
       .iter()
-      .flat_map(|analyses| analyses.entries.values())
+      .filter_map(|analyses| analyses.entries().ok())
+      .flat_map(|entries| entries.values())
       .collect();
     let spans = self.workspace.semantic_spans_with(id, &entries)?;
     self.check_inputs(cancelled)?;

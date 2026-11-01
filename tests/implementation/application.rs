@@ -18,7 +18,7 @@ fn dependencies(
     app
       .analyses
       .iter()
-      .flat_map(|collection| collection.entries.values()),
+      .flat_map(|collection| collection.entries().unwrap().values()),
   )
   .dependencies();
   app

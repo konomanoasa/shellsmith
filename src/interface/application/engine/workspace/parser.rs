@@ -17,7 +17,7 @@ use crate::interface::application::engine::{
   SymbolId, SymbolKind, Value, ValueIssue,
 };
 use crate::interface::application::engine::{ReferenceId, SourceReference};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub struct Document {
@@ -112,6 +112,13 @@ impl Document {
     &self,
   ) -> bool {
     self.occurrences().iter().any(body_candidate)
+  }
+
+  pub(in crate::interface::application::engine) fn asynchronous(
+    &self,
+    node: Node<'_>,
+  ) -> bool {
+    self.facts.asynchronous.contains(&node.id())
   }
 
   pub(in crate::interface::application::engine) fn command_at(
@@ -230,6 +237,7 @@ impl Document {
 #[derive(Debug, Default)]
 struct Facts {
   syntax_errors: bool,
+  asynchronous: BTreeSet<usize>,
   contexts: Vec<Context>,
   occurrences: Vec<Occurrence>,
   symbols: Vec<Symbol>,
@@ -255,6 +263,9 @@ fn extract(
   let mut pending = vec![(tree.root_node(), None, State::default())];
   while let Some((node, field, mut state)) = pending.pop() {
     check_cancelled(cancelled)?;
+    if asynchronous(node) {
+      facts.asynchronous.insert(node.id());
+    }
     let damaged = damaged(node);
     facts.syntax_errors |= damaged;
     state.excluded |=
@@ -373,9 +384,7 @@ fn damaged_outside_units(node: Node<'_>) -> bool {
   false
 }
 
-pub(in crate::interface::application::engine) fn asynchronous(
-  node: Node<'_>,
-) -> bool {
+fn asynchronous(node: Node<'_>) -> bool {
   if node.kind() != "and_or" {
     return false;
   }

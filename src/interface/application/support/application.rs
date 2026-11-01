@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 
 use engine::{AnalysisLimits, DocumentId, InitialEnvironment, Workspace};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Settings {
   pub cwd: PathBuf,
   pub initial: InitialEnvironment,
@@ -387,19 +387,17 @@ impl Application {
 
   pub(super) fn select_inputs(
     &self,
-    explicit: BTreeSet<PathBuf>,
+    mut explicit: BTreeSet<PathBuf>,
     cancelled: &AtomicBool,
   ) -> Result<InputSelection, Error> {
     let (collected, failures) =
       self
         .discovery
         .collect(&self.discovery_inputs(), false, cancelled)?;
-    let paths = explicit
-      .iter()
-      .chain(self.opened.keys())
-      .cloned()
-      .chain(collected)
-      .collect();
+    let mut paths: BTreeSet<_> =
+      self.opened.keys().cloned().chain(collected).collect();
+    explicit.retain(|path| !paths.contains(path));
+    paths.extend(explicit.iter().cloned());
     Ok(InputSelection {
       explicit,
       paths,

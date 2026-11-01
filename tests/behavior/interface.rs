@@ -61,6 +61,7 @@ mod lsp {
       "textDocument/references",
       "textDocument/prepareRename",
       "textDocument/rename",
+      "textDocument/documentLink",
     ] {
       let response = server.request(method, params.clone()).await;
       assert_eq!(response["error"]["code"], -32803, "{method}: {response}");

@@ -131,12 +131,8 @@ impl<'a> Resolver<'a> {
             let mut values = expansion.env.alternatives.expressions();
             let next =
               values.literal(Arc::new(Value::Literal(fragment.bytes.clone())));
-            match values.concat(previous, next, self.cancelled) {
-              Ok(value) => {
-                expansion.expression = value.filter(|id| {
-                  values.maximum(*id).is_some_and(|size| size <= limit)
-                });
-              }
+            match values.concat(previous, next, limit, self.cancelled) {
+              Ok(value) => expansion.expression = value,
               Err(error) => {
                 self.error = Some(error);
                 return Task::Done(Flow::default());
@@ -162,34 +158,34 @@ impl<'a> Resolver<'a> {
           } = expansion;
           return self.expand_part(node, quoted, env, frame).then_word(
             move |resolver, next| {
-              let expression =
-                if expression.is_some() || next.expression.is_some() {
-                  let mut values = next.env.alternatives.expressions();
-                  let left = expression.or_else(|| {
-                    matches!(word.scalar(), Value::Literal(_))
-                      .then(|| values.literal(Arc::new(word.scalar())))
-                  });
-                  let right = next.expression.or_else(|| {
-                    matches!(next.word.scalar(), Value::Literal(_))
-                      .then(|| values.literal(Arc::new(next.word.scalar())))
-                  });
-                  match (left, right) {
-                    (Some(left), Some(right)) => {
-                      match values.concat(left, right, resolver.cancelled) {
-                        Ok(value) => value.filter(|id| {
-                          values.maximum(*id).is_some_and(|size| size <= limit)
-                        }),
-                        Err(error) => {
-                          resolver.error = Some(error);
-                          return Task::Done(Flow::default());
-                        }
+              let expression = if expression.is_some()
+                || next.expression.is_some()
+              {
+                let mut values = next.env.alternatives.expressions();
+                let mut literal = |word: &Word| match word.scalar() {
+                  value @ Value::Literal(_) => {
+                    Some(values.literal(Arc::new(value)))
+                  }
+                  _ => None,
+                };
+                let left = expression.or_else(|| literal(&word));
+                let right = next.expression.or_else(|| literal(&next.word));
+                match (left, right) {
+                  (Some(left), Some(right)) => {
+                    match values.concat(left, right, limit, resolver.cancelled)
+                    {
+                      Ok(value) => value,
+                      Err(error) => {
+                        resolver.error = Some(error);
+                        return Task::Done(Flow::default());
                       }
                     }
-                    _ => None,
                   }
-                } else {
-                  None
-                };
+                  _ => None,
+                }
+              } else {
+                None
+              };
               word.extend(next.word, limit);
               resolver.expand_parts(
                 parts,
@@ -244,16 +240,21 @@ impl<'a> Resolver<'a> {
       let source = self.workspace.source(frame.snapshot.document);
       let value = if let Some(user) = node.child_by_field_name("user") {
         let user = word::lexical(user, source);
-        match self.input(&InputQuery::Home(user)) {
+        match self.input(&InputQuery::Home(user.clone())) {
           InputResult::Path(home) => Value::Literal(home),
           InputResult::Unknown(issue) => Value::Unknown(issue),
-          _ => Value::Unknown(ValueIssue::Unspecified),
+          _ => {
+            let mut literal = vec![b'~'];
+            literal.extend(user);
+            Value::Literal(literal)
+          }
         }
       } else {
         let (mut home, absent) = env.parameter(b"HOME");
-        // XCU 2.6.1 leaves the result unspecified on paths where HOME is unset.
-        if absent != Some(false) {
-          home.join(&Value::Unknown(ValueIssue::Unspecified));
+        if absent == Some(true) {
+          home = Value::Literal(vec![b'~']);
+        } else if absent.is_none() {
+          home.join(&Value::Literal(vec![b'~']));
         }
         home
       };
@@ -298,7 +299,7 @@ impl<'a> Resolver<'a> {
     }
     let mut expanded = Vec::new();
     for field in fields {
-      match self.pathname_fields(word, &field, env, utf8) {
+      match self.pathname_fields(&field, env, utf8) {
         Ok(fields) => expanded.extend(fields),
         Err(issue) => expanded.push(word::Field::unknown(
           Value::Unknown(
@@ -319,7 +320,6 @@ impl<'a> Resolver<'a> {
 
   fn pathname_fields(
     &mut self,
-    word: &Word,
     field: &word::Field,
     env: &Environment,
     utf8: bool,
@@ -335,8 +335,7 @@ impl<'a> Resolver<'a> {
     {
       return Ok(vec![field.clone()]);
     }
-    let pattern =
-      word::Pattern::field(word, field, utf8, env.portable_collation())?;
+    let pattern = word::Pattern::field(field, utf8, env.portable_collation())?;
     if pattern.is_literal() {
       return Ok(vec![field.clone()]);
     }
@@ -551,7 +550,7 @@ impl<'a> Resolver<'a> {
 
 struct Conditional<'a> {
   parameter: Option<Node<'a>>,
-  value: Value,
+  value: Word,
   quoted: bool,
   operation: Option<u8>,
   condition: Result<bool, ValueIssue>,
@@ -575,15 +574,26 @@ impl<'a> Resolver<'a> {
       .map(|p| word::lexical(p, source))
       .unwrap_or_default();
     let Some(operator) = node.child_by_field_name("operator") else {
-      return self.plain_parameter(node, quoted, env, frame);
+      return self.plain_parameter(&name, quoted, env);
     };
-    let (value, _) = env.parameter(&name);
-    let op = word::lexical(operator, source);
-    let condition = if matches!(name.as_slice(), b"@" | b"*") {
-      Err(ValueIssue::Unspecified)
+    let parameter_word = if !matches!(name.as_slice(), b"@" | b"*") {
+      Word::value(env.parameter(&name).0, quoted)
+    } else if env.positional.fields.is_empty() {
+      // dash expands operator forms without positional parameters to an
+      // empty word instead of no fields.
+      Word::value(Value::Literal(Vec::new()), quoted)
     } else {
-      Self::parameter_condition(&name, &value, &env, op.starts_with(b":"))
+      env.positional_word(
+        &name,
+        quoted,
+        self.result.request.limits.value_bytes,
+        self.utf8(&env),
+      )
     };
+    let value = parameter_word.scalar();
+    let op = word::lexical(operator, source);
+    let condition =
+      Self::parameter_condition(&name, &value, &env, op.starts_with(b":"));
     let operation = op.last().copied();
     if matches!(
       operator.kind(),
@@ -592,9 +602,7 @@ impl<'a> Resolver<'a> {
       env.require_parameter(&name);
     }
     if operator.kind() == "parameter_length_operator" {
-      let result = if matches!(name.as_slice(), b"@" | b"*") {
-        Value::Unknown(ValueIssue::Unspecified)
-      } else if let Value::Literal(bytes) = value {
+      let result = if let Value::Literal(bytes) = value {
         word::characters(&bytes, self.utf8(&env))
           .map_or_else(Value::Unknown, |chars| {
             Value::Literal(chars.len().to_string().into_bytes())
@@ -609,55 +617,14 @@ impl<'a> Resolver<'a> {
       });
     }
     if operator.kind() == "parameter_pattern_operator" {
-      let undefined = matches!(name.as_slice(), b"@" | b"*" | b"#");
-      let pattern = node.child_by_field_name("pattern");
-      let task = pattern.map_or_else(
-        || {
-          Task::expanded(Expansion {
-            expression: None,
-            word: Word::default(),
-            env: env.clone(),
-          })
-        },
-        |pattern| Task::expand(pattern, false, env.clone(), frame),
-      );
-      return task.then_word(move |resolver, mut result| {
-        let utf8 = resolver.utf8(&result.env);
-        let output = if undefined {
-          Value::Unknown(ValueIssue::Unspecified)
-        } else {
-          word::Pattern::word(
-            &result.word,
-            utf8,
-            result.env.portable_collation(),
-          )
-          .map_or_else(
-            |issue| {
-              Value::Unknown(
-                value.issue().map_or(issue, |value| value.combine(issue)),
-              )
-            },
-            |pattern| {
-              pattern.remove(
-                &value,
-                op.starts_with(b"%"),
-                op.len() == 2,
-                utf8,
-                resolver.cancelled,
-              )
-            },
-          )
-        };
-        result.word = Word::value(output, quoted);
-        Task::expanded(result)
-      });
+      return self
+        .remove_parameter_pattern(node, name, value, quoted, env, frame);
     }
-
     Self::conditional_parameter(
       node,
       Conditional {
         parameter,
-        value,
+        value: parameter_word,
         quoted,
         operation,
         condition,
@@ -667,46 +634,111 @@ impl<'a> Resolver<'a> {
     )
   }
 
-  fn plain_parameter(
+  fn remove_parameter_pattern(
     &mut self,
     node: Node<'a>,
+    name: Vec<u8>,
+    value: Value,
     quoted: bool,
-    mut env: Environment,
+    env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let source = self.workspace.source(frame.snapshot.document);
-    let name = node
-      .child_by_field_name("parameter")
-      .map(|p| word::lexical(p, source))
-      .unwrap_or_default();
-    env.require_parameter(&name);
+    let op = word::lexical(
+      node
+        .child_by_field_name("operator")
+        .expect("pattern operator"),
+      self.workspace.source(frame.snapshot.document),
+    );
+    let pattern = node.child_by_field_name("pattern");
+    let task = pattern.map_or_else(
+      || {
+        Task::expanded(Expansion {
+          expression: None,
+          word: Word::default(),
+          env: env.clone(),
+        })
+      },
+      |pattern| Task::expand(pattern, false, env.clone(), frame),
+    );
+    task.then_word(move |resolver, mut result| {
+      let utf8 = resolver.utf8(&result.env);
+      let pattern = word::Pattern::word(
+        &result.word,
+        utf8,
+        result.env.portable_collation(),
+      );
+      let remove = |value: &Value| {
+        pattern.as_ref().map_or_else(
+          |issue| {
+            Value::Unknown(
+              value.issue().map_or(*issue, |value| value.combine(*issue)),
+            )
+          },
+          |pattern| {
+            pattern.remove(
+              value,
+              op.starts_with(b"%"),
+              op.len() == 2,
+              utf8,
+              resolver.cancelled,
+            )
+          },
+        )
+      };
+      let output = remove(&value);
+      result.word = if (name == b"@" || (name == b"*" && !quoted))
+        && !env.positional.fields.is_empty()
+      {
+        let mut parameters = env;
+        let fields = &mut parameters.positional.fields;
+        if let Some(issue) = fields
+          .iter()
+          .filter_map(|(_, count)| count.boundary().err())
+          .reduce(ValueIssue::combine)
+        {
+          Word::unknown(issue).with_scalar(output)
+        } else {
+          let edge = if op.starts_with(b"%") {
+            fields.last_mut()
+          } else {
+            fields.first_mut()
+          }
+          .expect("nonempty parameters");
+          edge.0 = remove(&edge.0);
+          parameters
+            .positional_word(
+              &name,
+              quoted,
+              resolver.result.request.limits.value_bytes,
+              utf8,
+            )
+            .with_scalar(output)
+        }
+      } else {
+        Word::value(output, quoted)
+      };
+      Task::expanded(result)
+    })
+  }
+
+  fn plain_parameter(
+    &mut self,
+    name: &[u8],
+    quoted: bool,
+    mut env: Environment,
+  ) -> Task<'a> {
+    env.require_parameter(name);
     let utf8 = self.utf8(&env);
-    let mut word = if matches!(name.as_slice(), b"@" | b"*") {
+    let word = if matches!(name, b"@" | b"*") {
       env.positional_word(
-        &name,
+        name,
         quoted,
         self.result.request.limits.value_bytes,
         utf8,
       )
     } else {
-      Word::value(env.parameter(&name).0, quoted)
+      Word::value(env.parameter(name).0, quoted)
     };
-    if name == b"@"
-      && quoted
-      && env.positional.fields.is_empty()
-      && let Some(parent) =
-        node.parent().filter(|p| p.kind() == "double_quoted")
-    {
-      word.ambiguous_empty =
-        parent.named_children(&mut parent.walk()).any(|child| {
-          child.id() != node.id()
-            && child.kind() != "line_continuation"
-            && !(child.kind() == "parameter_expansion"
-              && child
-                .child_by_field_name("parameter")
-                .is_some_and(|p| word::lexical(p, source) == b"@"))
-        });
-    }
     Task::expanded(Expansion {
       expression: None,
       word,
@@ -735,14 +767,14 @@ impl<'a> Resolver<'a> {
       }
     });
     let skipped = if operation == Some(b'+') {
-      Value::Literal(Vec::new())
+      Word::value(Value::Literal(Vec::new()), quoted)
     } else {
       value
     };
     if choose == Ok(false) {
       return Task::expanded(Expansion {
         expression: None,
-        word: Word::value(skipped, quoted),
+        word: skipped,
         env,
       });
     }
@@ -786,6 +818,7 @@ impl<'a> Resolver<'a> {
       if let Err(cause) = choose {
         result.env.join(&before);
         let mut joined = result.word.scalar();
+        let skipped = skipped.scalar();
         if !matches!(joined, Value::Literal(_)) || joined != skipped {
           joined.join_choice(&skipped, Some(cause));
         }
@@ -829,6 +862,8 @@ impl<'a> Resolver<'a> {
 impl Environment {
   pub fn set_positionals(&mut self, args: &[Argument<'_>]) {
     self.positional = positional_arguments(args);
+    self.option_cursor = None;
+    self.options_reset = true;
     let fields = args
       .iter()
       .map(|arg| {
@@ -852,12 +887,11 @@ impl Environment {
     utf8: bool,
   ) -> Word {
     let args = &self.positional.fields;
-    let separator = if name == b"*"
-      && args.len() <= 1
+    let separator = if args.len() <= 1
       && args.iter().all(|(_, count)| count.boundary().is_ok())
     {
       Some(Value::Literal(Vec::new()))
-    } else if name == b"*" {
+    } else {
       let ifs = self.ifs();
       Some(match ifs {
         Value::Literal(bytes) => {
@@ -871,8 +905,6 @@ impl Environment {
         }
         value => Value::Unknown(value.issue().expect("unknown IFS")),
       })
-    } else {
-      None
     };
     let word = Word::parameters(args, quoted, separator.as_ref(), limit);
     if name == b"*" && quoted {

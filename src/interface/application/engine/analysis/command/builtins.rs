@@ -112,11 +112,7 @@ impl<'a> Resolver<'a> {
       let (output, trace, expression) =
         self.utility_output(node, name, &args, &env, frame);
       self.emit(&mut env, output, trace, expression);
-      if env.io.stderr_captured
-        && let Some(output) = &mut env.io.output
-      {
-        output.fail(ValueIssue::Dynamic);
-      }
+      env.io.may_write_stderr();
     }
     let previous_status = env.status();
     env.set_status(Value::Unknown(ValueIssue::Dynamic));
@@ -145,24 +141,22 @@ impl<'a> Resolver<'a> {
       }
       b"read" => Task::Done(self.read_arguments(node, &args, env, frame)),
       b"getopts" => Task::Done(self.getopts(node, &args, env, frame)),
+      b"printf" if args.is_empty() => {
+        env.set_status(Value::Literal(b"2".to_vec()));
+        Task::Done(Flow::next(env))
+      }
       b"echo" | b"printf" | b"pwd" | b"test" | b"[" | b"umask" | b"wait"
       | b"jobs" | b"fg" | b"bg" | b"hash" | b"type" | b"ulimit" | b"times"
       | b"kill" | b"exec" => Task::Done(Flow::next(env)),
       b"exit" | b"return" => {
-        let status = exit_status(&args, previous_status);
+        let status = exit_status(&args, previous_status, name == b"exit");
         env.set_status(status);
         Task::Done(if name == b"exit" {
           Flow::next(env)
         } else if frame.returnable {
           Flow::single(Transfer::Return, env)
         } else {
-          self.opaque(
-            node,
-            env,
-            frame,
-            ResolutionIssue::UnsupportedControl,
-            None,
-          )
+          Flow::next(env)
         })
       }
       b"break" | b"continue" => {
@@ -214,16 +208,17 @@ impl<'a> Resolver<'a> {
         return Flow::next(env);
       }
       env.special.remove(b"-".as_slice());
+      let enabled = Some(option[0] == b'-');
       let mut letters = option[1..].iter();
       if letters.as_slice().is_empty() {
         return self.unknown_options(node, env, frame, ValueIssue::Dynamic);
       }
       while let Some(letter) = letters.next() {
         match letter {
-          b'e' => env.errexit = Some(option[0] == b'-'),
-          b'u' => env.nounset = Some(option[0] == b'-'),
-          b'f' => env.noglob = Some(option[0] == b'-'),
-          b'a' | b'b' | b'C' | b'h' | b'm' | b'n' | b'v' | b'x' => {}
+          b'u' => env.nounset = enabled,
+          b'f' => env.noglob = enabled,
+          b'a' => env.allexport = enabled,
+          b'b' | b'C' | b'e' | b'h' | b'm' | b'n' | b'v' | b'x' => {}
           b'o' => {
             let name = if letters.as_slice().is_empty() {
               let Some(name) = arguments.next() else {
@@ -233,40 +228,32 @@ impl<'a> Resolver<'a> {
             } else {
               Value::Literal(letters.as_slice().to_vec())
             };
-            if let Value::Literal(name) = &name
-              && matches!(
-                name.as_slice(),
-                b"errexit"
-                  | b"nounset"
-                  | b"noglob"
-                  | b"allexport"
-                  | b"notify"
-                  | b"noclobber"
-                  | b"monitor"
-                  | b"noexec"
-                  | b"nolog"
-                  | b"pipefail"
-                  | b"verbose"
-                  | b"xtrace"
-                  | b"ignoreeof"
-                  | b"vi"
-              )
-            {
-              if name == b"errexit" {
-                env.errexit = Some(option[0] == b'-');
-              } else if name == b"nounset" {
-                env.nounset = Some(option[0] == b'-');
-              } else if name == b"noglob" {
-                env.noglob = Some(option[0] == b'-');
+            let Value::Literal(name) = name else {
+              return self.unknown_options(
+                node,
+                env,
+                frame,
+                name.issue().expect("unknown option name"),
+              );
+            };
+            match name.as_slice() {
+              b"nounset" => env.nounset = enabled,
+              b"noglob" => env.noglob = enabled,
+              b"allexport" => env.allexport = enabled,
+              b"pipefail" => env.pipefail = enabled,
+              b"errexit" | b"notify" | b"noclobber" | b"monitor"
+              | b"noexec" | b"nolog" | b"verbose" | b"xtrace"
+              | b"ignoreeof" | b"vi" => {}
+              _ => {
+                return self.unknown_options(
+                  node,
+                  env,
+                  frame,
+                  ValueIssue::Dynamic,
+                );
               }
-              break;
             }
-            return self.unknown_options(
-              node,
-              env,
-              frame,
-              name.issue().unwrap_or(ValueIssue::Dynamic),
-            );
+            break;
           }
           _ => {
             return self.unknown_options(node, env, frame, ValueIssue::Dynamic);
@@ -287,15 +274,18 @@ impl<'a> Resolver<'a> {
   ) -> Flow {
     let source = self.workspace.source(frame.snapshot.document);
     let Some(start) = declaration_operands(args) else {
-      let attributes =
-        (utility == b"readonly").then_some(EffectTarget::Attributes);
+      let attributes = if utility == b"readonly" {
+        EffectTarget::Attributes
+      } else {
+        EffectTarget::Exports
+      };
       self.invalidate(
         node,
         &mut env,
         frame,
         ResolutionIssue::UnknownEffect,
         argument_issue(args).unwrap_or(ValueIssue::Dynamic),
-        std::iter::once(EffectTarget::Variables).chain(attributes),
+        [EffectTarget::Variables, attributes],
       );
       return Flow::next(env);
     };
@@ -338,50 +328,74 @@ impl<'a> Resolver<'a> {
         None
       };
       if let Some(Value::Literal(name)) = name {
-        if matches!(
-          argument.kind,
-          Some(ArgumentKind::Variable {
-            access: Access::NameReference,
-            ..
-          })
-        ) {
-          self.record_argument_use(
-            argument,
-            env.variables.get(&name).resolution.clone(),
-            &env,
-            frame,
-          );
-        }
-        if utility == b"readonly" {
-          env.readonly.insert(name.clone(), true);
-        }
+        self.declare_attributes(
+          utility,
+          argument,
+          &name,
+          definition.is_some(),
+          &mut env,
+          frame,
+        );
       } else {
         let target = argument_target(argument, NameTarget::Declaration);
-        let attribute = attribute_target(&target);
+        let attribute = attribute_target(&target, utility == b"export");
         self.invalidate(
           node,
           &mut env,
           frame,
           ResolutionIssue::DynamicName,
           argument.value.issue().unwrap_or(ValueIssue::Dynamic),
-          [target],
+          [target, attribute],
         );
-        if utility == b"readonly" {
-          self.invalidate(
-            node,
-            &mut env,
-            frame,
-            ResolutionIssue::UnknownEffect,
-            argument.value.issue().unwrap_or(ValueIssue::Dynamic),
-            [attribute],
-          );
-        }
       }
       if let Some(id) = definition {
+        if let Some(symbol) = self.index.defined_symbol(id) {
+          self.record_argument_definition(argument, symbol, frame);
+        }
         self.record_attribute(id, frame.context, &env);
       }
     }
     Flow::next(env)
+  }
+
+  fn declare_attributes(
+    &mut self,
+    utility: &[u8],
+    argument: &Argument<'_>,
+    name: &[u8],
+    assigned: bool,
+    env: &mut Environment,
+    frame: Frame,
+  ) {
+    if utility == b"export" {
+      let readonly = assigned.then(|| env.readonly(name)).flatten();
+      if readonly != Some(true) {
+        env.exports.mark(name, true, readonly.is_none());
+      }
+    }
+    if matches!(
+      argument.kind,
+      Some(ArgumentKind::Variable {
+        access: Access::NameReference,
+        ..
+      })
+    ) {
+      self.record_argument_use(
+        argument,
+        env.variables.get(name).resolution.clone(),
+        env,
+        frame,
+      );
+    }
+    if utility == b"readonly" {
+      env.readonly.insert(name.to_vec(), true);
+    }
+    self.record_site_attributes(
+      UseSite::argument(&frame.location(argument.node)),
+      frame.context,
+      name,
+      env,
+    );
   }
 
   fn unset(
@@ -439,38 +453,31 @@ impl<'a> Resolver<'a> {
         continue;
       }
       let conditional_readonly = !functions && env.readonly(name).is_some();
-      if functions {
-        env.alternatives.forget_function(name);
-      } else {
-        env.alternatives.forget(name);
-        env.variable_changed(name, None);
-      }
-      let bindings = if functions {
-        &mut env.functions
-      } else {
-        &mut env.variables
-      };
-      let before = bindings.get(name).clone();
       let mut after = Binding::new(
         alternative(Alternative::Unset)
           .in_context(self.result.binding_context(frame.context)),
       );
       if conditional_readonly {
-        after.join(&before);
+        after.join(env.variables.get(name));
         after
           .resolution
           .issues
           .insert(ResolutionIssue::UnknownEffect);
       }
-      bindings.values.insert(name.to_vec(), after);
+      if functions {
+        env.replace_function(name, after);
+      } else {
+        env.variable_changed(name, None);
+        env.replace_variable(name, after);
+        env.exports.mark(name, false, !conditional_readonly);
+      }
       if function_unset {
-        env.alternatives.forget_function(name);
         let mut function = env.functions.get(name).clone();
         function.join(&Binding::new(
           alternative(Alternative::Unset)
             .in_context(self.result.binding_context(frame.context)),
         ));
-        env.functions.values.insert(name.to_vec(), function);
+        env.replace_function(name, function);
       }
     }
     Flow::next(env)
@@ -491,7 +498,6 @@ impl<'a> Resolver<'a> {
     };
     if let Some(depth) = depth
       && frame.loops > 0
-      && !(depth > frame.loops && frame.dynamic_loops)
     {
       let depth = depth.min(frame.loops);
       let transfer = if name == b"break" {
@@ -500,6 +506,8 @@ impl<'a> Resolver<'a> {
         Transfer::Continue(depth)
       };
       Flow::single(transfer, env)
+    } else if depth.is_some() {
+      Flow::next(env)
     } else {
       self.opaque(node, env, frame, ResolutionIssue::UnsupportedControl, None)
     }
@@ -592,7 +600,6 @@ impl Resolver<'_> {
     }
     paths.push(operand);
     for path in paths {
-      let absolute = path.starts_with(b"/");
       match self.input(&InputQuery::Directory {
         cwd: cwd.clone(),
         path,
@@ -601,20 +608,13 @@ impl Resolver<'_> {
         InputResult::Path(curpath) => {
           let previous = env.parameter(b"PWD").0;
           let directory = simplified(&curpath);
-          // Step 8c simplifications and an inexact PWD prefix are optional.
-          let pwd = if directory == curpath
-            && (absolute || physical || matches!(previous, Value::Literal(_)))
-          {
-            Value::Literal(curpath)
-          } else {
-            Value::Unknown(ValueIssue::Unspecified)
-          };
+          let pwd = Value::Literal(directory.clone());
           env.cwd = Value::Literal(directory);
           for (name, value) in [(b"OLDPWD".as_slice(), previous), (b"PWD", pwd)]
           {
-            env.alternatives.forget(name);
-            env.variables.values.insert(
-              name.to_vec(),
+            env.export_assignment(name);
+            env.replace_variable(
+              name,
               Binding {
                 resolution: alternative(Alternative::External)
                   .in_context(self.result.binding_context(frame.context)),
@@ -848,7 +848,7 @@ impl Resolver<'_> {
       if let Some(name) = name
         && valid_name(name)
       {
-        if let Some(id) = self.write_argument(
+        self.write_argument(
           node,
           Some(arg),
           name,
@@ -863,9 +863,7 @@ impl Resolver<'_> {
           ),
           &mut env,
           frame,
-        ) {
-          self.record_attribute(id, frame.context, &env);
-        }
+        );
       } else if name.is_some() {
         self.gap(node, frame, ResolutionIssue::DynamicName);
       } else {
@@ -896,98 +894,123 @@ impl Resolver<'_> {
     let args = &args[operands.unwrap_or(0)..];
     let computed = operands
       .ok_or_else(|| argument_issue(args).unwrap_or(ValueIssue::Dynamic))
-      .and_then(|_| option_values(args, &env, frame.functions));
+      .and_then(|_| option_values(args, &env));
     let known_prefix = operands.is_some()
       && args.iter().take(2).all(|arg| arg.count.boundary().is_ok());
-    if known_prefix
-      && (args.len() < 2
-        || matches!(&args[1].value, Value::Literal(name) if !valid_name(name)))
-    {
+    if known_prefix && args.len() < 2 {
       self.gap(node, frame, ResolutionIssue::DynamicName);
       return Flow::next(env);
     }
-    for name in [b"OPTIND".as_slice(), b"OPTARG"] {
-      let _ = self.write_argument(
-        node,
-        None,
-        name,
-        computed.as_ref().map_or_else(
-          |issue| Value::Unknown(*issue),
-          |result| match &result.argument {
-            Some(_) if name == b"OPTIND" => {
-              Value::Literal(result.cursor.index.to_string().into_bytes())
-            }
-            // POSIX fixes OPTIND only after an option-argument; the option
-            // cursor keeps the position for the next getopts.
-            None if name == b"OPTIND" => {
-              Value::Unknown(ValueIssue::Unspecified)
-            }
-            argument => argument.clone().unwrap_or(Value::Literal(Vec::new())),
-          },
-        ),
-        &mut env,
-        frame,
-      );
-    }
-    if env.readonly(b"OPTARG") != Some(true) {
-      env.alternatives.forget(b"OPTARG");
-      let mut binding = env.variables.get(b"OPTARG").clone();
-      if env.readonly(b"OPTARG").is_none()
-        && computed
-          .as_ref()
-          .is_ok_and(|result| result.argument.is_none())
-      {
-        binding = Binding::new(
-          alternative(Alternative::Unset)
-            .in_context(self.result.binding_context(frame.context)),
-        );
-      } else if computed.is_err() {
-        binding.resolution.alternatives.insert(Alternative::Unset);
-        binding.resolution.origins.insert(BindingOrigin::Context(
-          self.result.binding_context(frame.context),
-        ));
-      }
-      env.variables.values.insert(b"OPTARG".to_vec(), binding);
-    }
-    if let Some(arg) = args.get(1)
-      && known_prefix
-      && let Value::Literal(name) = &arg.value
+    let target = args.get(1).filter(|_| known_prefix);
+    let mut flow = Flow::default();
+    for (index, (name, arg)) in [
+      (Some(b"OPTARG".as_slice()), None),
+      (Some(b"OPTIND".as_slice()), None),
+      (target.and_then(Argument::literal), target),
+    ]
+    .into_iter()
+    .enumerate()
     {
-      if let Some(id) = self.write_argument(
-        node,
-        Some(arg),
-        name,
-        computed.as_ref().map_or_else(
-          |issue| Value::Unknown(*issue),
-          |result| Value::Literal(vec![result.option]),
-        ),
-        &mut env,
-        frame,
-      ) {
-        self.record_attribute(id, frame.context, &env);
+      let failure = name.map_or(Some(false), |name| {
+        if valid_name(name) {
+          env.readonly(name)
+        } else {
+          Some(true)
+        }
+      });
+      if failure.is_some() {
+        let mut failed = env.clone();
+        failed.options_reset = true;
+        failed.option_cursor = None;
+        failed.set_status(Value::Literal(b"2".to_vec()));
+        flow.add(Transfer::Next, failed);
       }
-    } else {
-      self.invalidate(
-        node,
-        &mut env,
-        frame,
-        ResolutionIssue::DynamicName,
-        argument_issue(args).unwrap_or(ValueIssue::Dynamic),
-        [args
-          .get(1)
-          .filter(|_| known_prefix)
-          .map_or(EffectTarget::Variables, |arg| {
+      if let Some(name) = name.filter(|name| valid_name(name)) {
+        let previous = env.variables.get(name).clone();
+        self.write_argument(
+          node,
+          arg,
+          name,
+          computed.as_ref().map_or_else(
+            |issue| Value::Unknown(*issue),
+            |result| match index {
+              0 => result
+                .argument
+                .clone()
+                .unwrap_or(Value::Literal(Vec::new())),
+              1 => Value::Literal(
+                (result.cursor.index + usize::from(result.cursor.offset > 1))
+                  .to_string()
+                  .into_bytes(),
+              ),
+              _ => Value::Literal(vec![result.option]),
+            },
+          ),
+          &mut env,
+          frame,
+        );
+        if index == 0 {
+          self.unset_optarg(&mut env, &previous, &computed, frame);
+        }
+      } else if name.is_none() {
+        self.invalidate(
+          node,
+          &mut env,
+          frame,
+          ResolutionIssue::DynamicName,
+          argument_issue(args).unwrap_or(ValueIssue::Dynamic),
+          [target.map_or(EffectTarget::Variables, |arg| {
             argument_target(arg, NameTarget::Variable)
           })],
-      );
+        );
+      }
+      if failure == Some(true) {
+        return flow;
+      }
     }
     env.options_reset = false;
     env.option_cursor =
       computed.as_ref().ok().map(|result| result.cursor.clone());
-    env.set_status(
-      computed.map_or_else(Value::Unknown, |_| Value::Literal(b"0".to_vec())),
-    );
-    Flow::next(env)
+    env.set_status(computed.map_or_else(Value::Unknown, |result| {
+      Value::Literal(result.status.to_string().into_bytes())
+    }));
+    flow.add(Transfer::Next, env);
+    flow
+  }
+
+  fn unset_optarg(
+    &self,
+    env: &mut Environment,
+    previous: &Binding,
+    computed: &Result<OptionValues, ValueIssue>,
+    frame: Frame,
+  ) {
+    if env.readonly(b"OPTARG") == Some(true) {
+      return;
+    }
+    let mut binding = env.variables.get(b"OPTARG").clone();
+    if computed
+      .as_ref()
+      .is_ok_and(|result| result.argument.is_none())
+    {
+      binding = Binding::new(
+        alternative(Alternative::Unset)
+          .in_context(self.result.binding_context(frame.context)),
+      );
+      if env.readonly(b"OPTARG").is_some() {
+        binding.join(previous);
+      }
+      env
+        .exports
+        .mark(b"OPTARG", false, env.readonly(b"OPTARG").is_none());
+    } else if computed.is_err() {
+      binding.resolution.alternatives.insert(Alternative::Unset);
+      binding.resolution.origins.insert(BindingOrigin::Context(
+        self.result.binding_context(frame.context),
+      ));
+      env.exports.mark(b"OPTARG", false, false);
+    }
+    env.replace_variable(b"OPTARG", binding);
   }
 
   fn argument_definition(
@@ -1067,12 +1090,7 @@ impl Resolver<'_> {
     };
     self.result.writes.insert((symbol, frame.context));
     if let Some(arg) = arg {
-      self
-        .result
-        .argument_definitions
-        .entry((UseSite::argument(&frame.location(arg.node)), frame.context))
-        .or_default()
-        .insert(symbol);
+      self.record_argument_definition(arg, symbol, frame);
     }
     if env.readonly(name).is_some() {
       let resolution = env.variables.get(name).resolution.clone();
@@ -1089,24 +1107,81 @@ impl Resolver<'_> {
       }
     }
     env.assign(name, super::super::execution::definition(symbol), value);
+    if !arg.is_some_and(|arg| {
+      matches!(
+        arg.kind,
+        Some(ArgumentKind::Variable {
+          declaration: true,
+          ..
+        })
+      )
+    }) {
+      self.record_attribute(definition, frame.context, env);
+      if let Some(arg) = arg {
+        self.record_site_attributes(
+          UseSite::argument(&frame.location(arg.node)),
+          frame.context,
+          name,
+          env,
+        );
+      }
+    }
     Some(definition)
+  }
+
+  fn record_argument_definition(
+    &mut self,
+    arg: &Argument<'_>,
+    symbol: SymbolId,
+    frame: Frame,
+  ) {
+    self
+      .result
+      .argument_definitions
+      .entry((UseSite::argument(&frame.location(arg.node)), frame.context))
+      .or_default()
+      .insert(symbol);
   }
 }
 
-fn exit_status(args: &[Argument<'_>], previous: Value) -> Value {
-  if args.is_empty() {
-    previous
-  } else {
-    let issue = if args.len() == 1
-      || args.iter().any(|arg| arg.count.boundary().is_err())
-    {
-      argument_issue(args).unwrap_or(ValueIssue::Unspecified)
-    } else {
-      ValueIssue::Unspecified
-    };
-    decimal_value::<u8>(args).map_or(Value::Unknown(issue), |status| {
+fn exit_status(args: &[Argument<'_>], previous: Value, process: bool) -> Value {
+  let value = match args.first() {
+    None => previous,
+    Some(arg) => {
+      let bytes = match arg.count.boundary().and_then(|()| arg.value.literal())
+      {
+        Ok(bytes) => bytes,
+        Err(issue) => return Value::Unknown(issue),
+      };
+      let status = std::str::from_utf8(bytes)
+        .ok()
+        .map(|number| {
+          number.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{b}')
+        })
+        .and_then(|number| number.parse::<i32>().ok())
+        .filter(|status| *status >= 0)
+        .unwrap_or(2);
       Value::Literal(status.to_string().into_bytes())
-    })
+    }
+  };
+  if process {
+    process_status(value)
+  } else {
+    value
+  }
+}
+
+pub(in crate::interface::application::engine::analysis) fn process_status(
+  value: Value,
+) -> Value {
+  match &value {
+    Value::Literal(bytes) => std::str::from_utf8(bytes)
+      .ok()
+      .and_then(|number| number.parse::<i64>().ok())
+      .map_or(value.clone(), |status| {
+        Value::Literal(status.rem_euclid(256).to_string().into_bytes())
+      }),
+    _ => value,
   }
 }
 
@@ -1201,12 +1276,9 @@ impl Resolver<'_> {
     });
     let result = (|| {
       let mut values = env.alternatives.expressions();
-      let Some(id) = values.concat(before, next, self.cancelled)? else {
+      let Some(id) = values.concat(before, next, limit, self.cancelled)? else {
         return Ok(None);
       };
-      if values.maximum(id).is_none_or(|size| size > limit) {
-        return Ok(None);
-      }
       Ok::<_, Error>(Some((
         id,
         values.projected(id, self.cancelled)?.as_ref().clone(),
@@ -1215,11 +1287,12 @@ impl Resolver<'_> {
     env.emit(value, trace, limit);
     match result {
       Ok(Some((id, value))) => {
-        let output = env.io.output.as_mut().expect("captured output");
-        let trace = output.trace();
-        *output = super::super::execution::Output::default();
-        output.append(value, trace, limit);
-        output.expression = Some(id);
+        env
+          .io
+          .output
+          .as_mut()
+          .expect("captured output")
+          .set_expression(id, value, limit);
       }
       Ok(None) => {}
       Err(error) => self.error = Some(error),
@@ -1294,22 +1367,20 @@ fn shared_echo(
       issue = values.equals(*arg, b"-n", cancelled)?;
     } else {
       result = values
-        .concat(result, space, cancelled)?
+        .concat(result, space, limit, cancelled)?
         .expect("finite echo");
     }
     let escaped = values.contains(*arg, b'\\', cancelled)?;
     issue = values.conditions.or(issue, escaped);
     result = values
-      .concat(result, *arg, cancelled)?
+      .concat(result, *arg, limit, cancelled)?
       .expect("finite echo");
   }
   let newline = values.literal(Arc::new(Value::Literal(b"\n".to_vec())));
   result = values
-    .concat(result, newline, cancelled)?
+    .concat(result, newline, limit, cancelled)?
     .expect("finite echo");
-  let unknown =
-    values.literal(Arc::new(Value::Unknown(ValueIssue::Unspecified)));
-  Ok(Some(values.select(issue, unknown, result)))
+  Ok((issue == NEVER).then_some(result))
 }
 
 fn output(
@@ -1354,42 +1425,10 @@ fn output(
       Value::Literal(Vec::new())
     }
     b"echo" => {
-      if args
-        .first()
-        .is_some_and(|arg| arg.value == Value::Literal(b"-n".to_vec()))
-        || args
-          .iter()
-          .any(|arg| arg.value.literal().is_ok_and(|a| a.contains(&b'\\')))
-      {
-        return Value::Unknown(
-          argument_issue(args).map_or(ValueIssue::Unspecified, |issue| {
-            issue.combine(ValueIssue::Unspecified)
-          }),
-        );
-      }
       let Some(args) = known else {
         return unknown();
       };
-      let size = args
-        .iter()
-        .map(|a| a.len())
-        .sum::<usize>()
-        .saturating_add(args.len().max(1));
-      if size > limit {
-        return Value::Unknown(ValueIssue::SizeLimit);
-      }
-      let mut bytes = Vec::with_capacity(size);
-      for (index, argument) in args.iter().enumerate() {
-        if index != 0 {
-          emit(None, 0..0, b" ");
-          bytes.push(b' ');
-        }
-        emit(Some(index), 0..argument.len(), argument);
-        bytes.extend_from_slice(argument);
-      }
-      emit(None, 0..0, b"\n");
-      bytes.push(b'\n');
-      Value::Literal(bytes)
+      echo_output(&args, limit, emit)
     }
     b"printf" => formatted_output(args, limit, emit),
     b"pwd"
@@ -1418,13 +1457,90 @@ fn output(
   }
 }
 
+fn echo_output(
+  args: &[&[u8]],
+  limit: usize,
+  emit: &mut impl FnMut(Option<usize>, Range<usize>, &[u8]),
+) -> Value {
+  let first = usize::from(args.first() == Some(&b"-n".as_slice()));
+  let mut output = Value::Literal(Vec::new());
+  for (index, argument) in args.iter().enumerate().skip(first) {
+    if index > first {
+      output.concat(&Value::Literal(b" ".to_vec()), limit);
+      emit(None, 0..0, b" ");
+    }
+    let mut offset = 0;
+    while offset < argument.len() {
+      let start = offset;
+      if argument[offset] != b'\\' {
+        offset += argument[offset..]
+          .iter()
+          .position(|byte| *byte == b'\\')
+          .unwrap_or(argument.len() - offset);
+        let bytes = &argument[start..offset];
+        output.concat(&Value::Literal(bytes.to_vec()), limit);
+        emit(Some(index), start..offset, bytes);
+        continue;
+      }
+      let mut byte = argument[offset];
+      offset += 1;
+      if byte == b'\\'
+        && let Some(&escaped) = argument.get(offset)
+      {
+        offset += 1;
+        byte = match escaped {
+          b'a' => 7,
+          b'b' => 8,
+          b'e' => 27,
+          b'f' => 12,
+          b'n' => b'\n',
+          b'r' => b'\r',
+          b't' => b'\t',
+          b'v' => 11,
+          b'\\' => b'\\',
+          b'c' => return output,
+          b'0'..=b'7' | b'x' => {
+            let radix: u8 = if escaped == b'x' { 16 } else { 8 };
+            let maximum = if escaped == b'0' { 3 } else { 2 };
+            let digits = offset;
+            let mut number = if escaped == b'x' { 0 } else { escaped - b'0' };
+            while offset < argument.len() && offset - digits < maximum {
+              let Some(digit) =
+                char::from(argument[offset]).to_digit(u32::from(radix))
+              else {
+                break;
+              };
+              number = number
+                .wrapping_mul(radix)
+                .wrapping_add(u8::try_from(digit).expect("byte digit"));
+              offset += 1;
+            }
+            number
+          }
+          _ => {
+            offset -= 1;
+            b'\\'
+          }
+        };
+      }
+      output.concat(&Value::Literal(vec![byte]), limit);
+      emit(Some(index), start..offset, &[byte]);
+    }
+  }
+  if first == 0 {
+    output.concat(&Value::Literal(b"\n".to_vec()), limit);
+    emit(None, 0..0, b"\n");
+  }
+  output
+}
+
 fn formatted_output(
   args: &[Argument<'_>],
   limit: usize,
   emit: &mut impl FnMut(Option<usize>, Range<usize>, &[u8]),
 ) -> Value {
   let Some((format, operands)) = args.split_first() else {
-    return Value::Unknown(ValueIssue::Unspecified);
+    return Value::Literal(Vec::new());
   };
   if format.count.boundary().is_err() {
     return Value::Unknown(argument_issue(args).unwrap_or(ValueIssue::Dynamic));
@@ -1525,19 +1641,11 @@ impl Resolver<'_> {
     }
     let ifs = env.ifs();
     let utf8 = self.utf8(env);
-    if env.io.input_order_unknown {
-      env.io.consume_input(None);
-      return Ok(vec![
-        Value::Unknown(ValueIssue::Unspecified);
-        operands.len()
-      ]);
-    }
     let (input, mut offset) = env.io.input.clone()?;
     let word = input_line(
       &input,
       &mut offset,
       options.raw,
-      ifs.empty() == Some(true),
       self.result.request.limits.value_bytes,
     );
     env.io.consume_input(Some(offset));
@@ -1558,7 +1666,6 @@ fn input_line(
   input: &[u8],
   offset: &mut usize,
   raw: bool,
-  empty_ifs: bool,
   limit: usize,
 ) -> Result<word::Word, ValueIssue> {
   let mut word = word::Word::default();
@@ -1594,11 +1701,7 @@ fn input_line(
       );
       word.append(
         word::Fragment {
-          bytes: if empty_ifs {
-            vec![b'\\', next]
-          } else {
-            vec![next]
-          },
+          bytes: vec![next],
           source: None,
           quoted: true,
           split: false,
@@ -1616,39 +1719,20 @@ struct OptionValues {
   option: u8,
   argument: Option<Value>,
   cursor: OptionCursor,
+  status: u8,
 }
 
 fn option_values(
   args: &[Argument<'_>],
   env: &Environment,
-  functions: u32,
 ) -> Result<OptionValues, ValueIssue> {
   if args.len() < 2 || args[..2].iter().any(|arg| arg.count.boundary().is_err())
   {
     return Err(argument_issue(args).unwrap_or(ValueIssue::Dynamic));
   }
   let options = args[0].value.literal()?;
+  let silent = options.starts_with(b":");
   let options = options.strip_prefix(b":").unwrap_or(options);
-  let mut seen = BTreeSet::new();
-  let mut colon_allowed = false;
-  for byte in options {
-    if *byte == b':' && colon_allowed {
-      colon_allowed = false;
-    } else if byte.is_ascii_alphanumeric() && seen.insert(byte) {
-      colon_allowed = true;
-    } else {
-      return Err(ValueIssue::Dynamic);
-    }
-  }
-  let target = args[1].value.literal()?;
-  if !valid_name(target)
-    || matches!(target, b"OPTIND" | b"OPTARG")
-    || [target, b"OPTIND", b"OPTARG"]
-      .iter()
-      .any(|name| env.readonly(name).is_some())
-  {
-    return Err(ValueIssue::Dynamic);
-  }
   let arguments = if args.len() == 2 {
     env.positional.clone()
   } else {
@@ -1657,14 +1741,6 @@ fn option_values(
   let (mut index, mut offset) = if env.options_reset {
     (1, 1)
   } else if let Some(cursor) = &env.option_cursor {
-    // POSIX leaves the results unspecified when a caller and its functions
-    // both parse with getopts.
-    if cursor.functions != functions {
-      return Err(ValueIssue::Unspecified);
-    }
-    if cursor.arguments != arguments {
-      return Err(ValueIssue::Dynamic);
-    }
     (cursor.index, cursor.offset.max(1))
   } else {
     return Err(
@@ -1675,46 +1751,64 @@ fn option_values(
         .unwrap_or(ValueIssue::Dynamic),
     );
   };
-  let current =
-    arguments.present(index.checked_sub(1).ok_or(ValueIssue::Dynamic)?)?;
+  let (current, absent) =
+    arguments.parameter(index.checked_sub(1).ok_or(ValueIssue::Dynamic)?);
   let current = current.literal()?;
-  if !current.starts_with(b"-") || current == b"--" {
+  if absent.is_none() {
     return Err(ValueIssue::Dynamic);
+  }
+  if absent == Some(true)
+    || !current.starts_with(b"-")
+    || matches!(current, b"-" | b"--")
+  {
+    if current == b"--" {
+      index += 1;
+    }
+    return Ok(OptionValues {
+      option: b'?',
+      argument: None,
+      cursor: OptionCursor { index, offset: 1 },
+      status: 1,
+    });
   }
   let option = *current.get(offset).ok_or(ValueIssue::Dynamic)?;
-  if !option.is_ascii_alphanumeric() {
-    return Err(ValueIssue::Dynamic);
-  }
   let position = options
     .iter()
-    .position(|byte| *byte == option)
-    .ok_or(ValueIssue::Dynamic)?;
+    .position(|byte| *byte == option && option != b':');
   offset += 1;
-  let argument = if options.get(position + 1) == Some(&b':') {
-    let argument = if offset < current.len() {
-      Value::Literal(current[offset..].to_vec())
-    } else {
-      index += 1;
-      arguments.present(index - 1)?
-    };
+  let mut result = option;
+  let mut argument = None;
+  if let Some(position) = position {
+    if options.get(position + 1) == Some(&b':') {
+      if offset < current.len() {
+        argument = Some(Value::Literal(current[offset..].to_vec()));
+      } else {
+        index += 1;
+        let (value, absent) = arguments.parameter(index - 1);
+        match absent {
+          Some(false) => argument = Some(value),
+          Some(true) => {
+            result = if silent { b':' } else { b'?' };
+            argument = silent.then(|| Value::Literal(vec![option]));
+            index -= 1;
+          }
+          None => return Err(value.issue().unwrap_or(ValueIssue::Dynamic)),
+        }
+      }
+      offset = current.len();
+    }
+  } else {
+    result = b'?';
+    argument = silent.then(|| Value::Literal(vec![option]));
+  }
+  if offset >= current.len() {
     index += 1;
     offset = 1;
-    Some(argument)
-  } else {
-    if offset >= current.len() {
-      index += 1;
-      offset = 1;
-    }
-    None
-  };
+  }
   Ok(OptionValues {
-    option,
+    option: result,
     argument,
-    cursor: OptionCursor {
-      arguments,
-      index,
-      offset,
-      functions,
-    },
+    cursor: OptionCursor { index, offset },
+    status: 0,
   })
 }

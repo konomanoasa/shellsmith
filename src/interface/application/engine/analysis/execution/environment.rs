@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::interface::application::engine::{
   Alternative, AttributeState, BindingOrigin, EffectTarget, ExecutionContextId,
   InitialBinding, InitialEnvironment, Resolution, ResolutionIssue, SymbolId,
-  SymbolKind, Value, ValueIssue,
+  SymbolKind, Value, ValueIssue, VariableAttributes,
 };
 
 pub(super) fn merge_value(into: &mut Arc<Value>, other: &Arc<Value>) {
@@ -298,15 +298,6 @@ impl Positionals {
     }
   }
 
-  pub fn present(&self, index: usize) -> Result<Value, ValueIssue> {
-    let (value, absent) = self.parameter(index);
-    if absent == Some(false) {
-      Ok(value)
-    } else {
-      Err(value.issue().unwrap_or(ValueIssue::Dynamic))
-    }
-  }
-
   pub fn count(&self) -> Value {
     self
       .fields
@@ -466,6 +457,93 @@ impl Positionals {
   }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::interface::application::engine::analysis) struct ExportAttributes
+{
+  pub values: OrdMap<Vec<u8>, AttributeState>,
+  pub unknown: BTreeSet<Value>,
+}
+
+impl ExportAttributes {
+  fn new(input: &InitialEnvironment) -> Self {
+    let mut state = Self::default();
+    if input.other_variables != InitialBinding::Absent {
+      state.unknown.insert(Value::Unknown(ValueIssue::Dynamic));
+    }
+    for name in input.values.keys() {
+      state.values.insert(name.clone(), AttributeState::Unknown);
+    }
+    for name in input.environment.keys() {
+      state
+        .values
+        .insert(name.clone(), AttributeState::Known(true));
+    }
+    for (name, binding) in &input.variables {
+      state.values.insert(
+        name.clone(),
+        if *binding == InitialBinding::Absent {
+          AttributeState::Known(false)
+        } else {
+          AttributeState::Unknown
+        },
+      );
+    }
+    state
+  }
+
+  pub fn get(&self, name: &[u8]) -> AttributeState {
+    self.values.get(name).copied().unwrap_or_else(|| {
+      if self.unknown.iter().any(|pattern| pattern.can_equal(name)) {
+        AttributeState::Unknown
+      } else {
+        AttributeState::Known(false)
+      }
+    })
+  }
+
+  /// Sets the attribute, or joins it with the previous state when the change
+  /// may not happen.
+  pub fn mark(&mut self, name: &[u8], exported: bool, certain: bool) {
+    let before = self.get(name);
+    let state = if certain {
+      AttributeState::Known(exported)
+    } else {
+      before.join(AttributeState::Known(exported))
+    };
+    if state != before {
+      self.values.insert(name.to_vec(), state);
+    }
+  }
+
+  pub fn invalidate(&mut self, pattern: Value) {
+    let names: Vec<_> = self
+      .values
+      .keys()
+      .filter(|name| pattern.can_equal(name))
+      .cloned()
+      .collect();
+    for name in names {
+      self.values.insert(name, AttributeState::Unknown);
+    }
+    self.unknown.insert(pattern);
+  }
+
+  fn join(&mut self, other: &Self) {
+    let names: BTreeSet<_> = self
+      .values
+      .keys()
+      .chain(other.values.keys())
+      .cloned()
+      .collect();
+    for name in names {
+      self
+        .values
+        .insert(name.clone(), self.get(&name).join(other.get(&name)));
+    }
+    self.unknown.extend(other.unknown.iter().cloned());
+  }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::interface::application::engine::analysis) struct Environment {
   pub alternatives: Alternatives,
@@ -475,9 +553,11 @@ pub(in crate::interface::application::engine::analysis) struct Environment {
   pub readonly: OrdMap<Vec<u8>, bool>,
   /// Names matching these values may have become readonly untracked.
   pub unknown_attributes: BTreeSet<Value>,
-  pub errexit: Option<bool>,
+  pub exports: ExportAttributes,
   pub nounset: Option<bool>,
   pub noglob: Option<bool>,
+  pub allexport: Option<bool>,
+  pub pipefail: Option<bool>,
   pub cwd: Value,
   pub positional: Positionals,
   pub special: BTreeMap<Vec<u8>, Value>,
@@ -493,11 +573,8 @@ pub(in crate::interface::application::engine::analysis) struct Environment {
 /// The getopts position after the last parsed option.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::interface::application::engine::analysis) struct OptionCursor {
-  pub arguments: Positionals,
   pub index: usize,
   pub offset: usize,
-  /// Call depth: callers and functions cannot share a getopts parse.
-  pub functions: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -515,14 +592,6 @@ impl CommandFailure {
       Self::Possible(previous) => Self::Possible(previous.combine(issue)),
       Self::Definite => Self::Definite,
     };
-  }
-
-  pub fn then(&mut self, other: Self) {
-    match other {
-      Self::Definite => *self = Self::Definite,
-      Self::Possible(issue) => self.uncertain(issue),
-      Self::None => {}
-    }
   }
 
   fn join(&mut self, other: Self) {
@@ -546,6 +615,18 @@ impl Environment {
     issue: ResolutionIssue,
     value_issue: ValueIssue,
   ) {
+    match &target {
+      EffectTarget::Variable(name) => {
+        self.exports.invalidate(Value::Literal(name.clone()));
+      }
+      EffectTarget::VariablePattern(pattern) => {
+        self.exports.invalidate(pattern.clone());
+      }
+      EffectTarget::Variables => {
+        self.exports.invalidate(Value::Unknown(value_issue));
+      }
+      _ => {}
+    }
     match target {
       EffectTarget::Variable(name) => {
         if self.taint_variable(&name, context, issue, value_issue) {
@@ -565,10 +646,9 @@ impl Environment {
         self.invalidate_names(false, None, context, issue, value_issue);
       }
       EffectTarget::Function(name) => {
-        self.alternatives.forget_function(&name);
         let mut binding = self.functions.get(&name).clone();
         binding.taint(BindingOrigin::Context(context), issue, value_issue);
-        self.functions.values.insert(name, binding);
+        self.replace_function(&name, binding);
       }
       EffectTarget::FunctionPattern(pattern) => {
         self.invalidate_names(true, Some(pattern), context, issue, value_issue);
@@ -587,10 +667,23 @@ impl Environment {
       EffectTarget::Attributes => {
         self.unknown_attributes.insert(Value::Unknown(value_issue));
       }
+      EffectTarget::Export(name) => {
+        self.exports.values.insert(name, AttributeState::Unknown);
+      }
+      EffectTarget::ExportPattern(pattern) => self.exports.invalidate(pattern),
+      EffectTarget::Exports => {
+        self.exports.invalidate(Value::Unknown(value_issue));
+      }
       EffectTarget::Sources => {}
       EffectTarget::Directory => {
         self.cwd = Value::Unknown(value_issue);
         for name in [b"PWD".as_slice(), b"OLDPWD"] {
+          let before = self.exports.get(name);
+          self.export_assignment(name);
+          self
+            .exports
+            .values
+            .insert(name.to_vec(), before.join(self.exports.get(name)));
           self.taint_variable(name, context, issue, value_issue);
         }
       }
@@ -599,9 +692,10 @@ impl Environment {
         self.alternatives.forget_positionals();
       }
       EffectTarget::Options => {
-        self.errexit = None;
         self.nounset = None;
         self.noglob = None;
+        self.allexport = None;
+        self.pipefail = None;
         self
           .special
           .insert(b"-".to_vec(), Value::Unknown(value_issue));
@@ -665,10 +759,9 @@ impl Environment {
     if self.readonly(name) == Some(true) {
       return false;
     }
-    self.alternatives.forget(name);
     let mut binding = self.variables.get(name).clone();
     binding.taint(BindingOrigin::Context(context), issue, value_issue);
-    self.variables.values.insert(name.to_vec(), binding);
+    self.replace_variable(name, binding);
     true
   }
 
@@ -684,7 +777,6 @@ impl Environment {
       return;
     }
     self.variable_changed(name, readonly.is_none().then_some(&value));
-    self.alternatives.forget(name);
     let mut binding = Binding {
       resolution: definition,
       value: Arc::new(value),
@@ -692,14 +784,107 @@ impl Environment {
     if readonly.is_some() {
       binding.join(self.variables.get(name));
     }
+    self.export_assignment(name);
+    self.replace_variable(name, binding);
+  }
+
+  pub fn export_assignment(&mut self, name: &[u8]) {
+    if self.readonly(name) == Some(true) || self.allexport == Some(false) {
+      return;
+    }
+    let certain = self.allexport == Some(true) && self.readonly(name).is_none();
+    self.exports.mark(name, true, certain);
+  }
+
+  /// A new binding drops the symbolic value of the old one.
+  pub(in crate::interface::application::engine::analysis) fn replace_variable(
+    &mut self,
+    name: &[u8],
+    binding: Binding,
+  ) {
+    self.alternatives.forget(name);
     self.variables.values.insert(name.to_vec(), binding);
+  }
+
+  pub(in crate::interface::application::engine::analysis) fn replace_function(
+    &mut self,
+    name: &[u8],
+    binding: Binding,
+  ) {
+    self.alternatives.forget_function(name);
+    self.functions.values.insert(name.to_vec(), binding);
+  }
+
+  /// Either binding may be the one in effect.
+  pub(in crate::interface::application::engine::analysis) fn join_uncertain(
+    &mut self,
+    name: &[u8],
+    other: &Binding,
+  ) {
+    let mut binding = self.variables.get(name).clone();
+    if binding == *other {
+      return;
+    }
+    self.variable_changed(name, None);
+    binding.join(other);
+    binding
+      .resolution
+      .issues
+      .insert(ResolutionIssue::UnknownEffect);
+    self.replace_variable(name, binding);
+  }
+
+  /// Ends a temporary assignment with its attribute; one that may persist
+  /// keeps either state.
+  pub(in crate::interface::application::engine::analysis) fn restore_temporary(
+    &mut self,
+    name: &[u8],
+    before: &Self,
+    persist: bool,
+  ) {
+    if persist {
+      self.join_uncertain(name, before.variables.get(name));
+      self.join_readonly(name, before);
+      self.exports.values.insert(
+        name.to_vec(),
+        self.exports.get(name).join(before.exports.get(name)),
+      );
+      return;
+    }
+    self.variable_changed(name, None);
+    self
+      .variables
+      .values
+      .insert(name.to_vec(), before.variables.get(name).clone());
+    self.alternatives.restore(name, &before.alternatives);
+    self
+      .exports
+      .values
+      .insert(name.to_vec(), before.exports.get(name));
+    match before.readonly.get(name) {
+      Some(definite) => self.readonly.insert(name.to_vec(), *definite),
+      None => self.readonly.remove(name),
+    };
+  }
+
+  fn join_readonly(&mut self, name: &[u8], other: &Self) {
+    if self.readonly.contains_key(name) || other.readonly.contains_key(name) {
+      let definite = self.readonly.get(name) == Some(&true)
+        && other.readonly.get(name) == Some(&true);
+      self.readonly.insert(name.to_vec(), definite);
+    }
   }
 
   pub fn variable_changed(&mut self, name: &[u8], value: Option<&Value>) {
     match name {
       b"OPTIND" => {
-        self.option_cursor = None;
-        self.options_reset = value == Some(&Value::Literal(b"1".to_vec()));
+        if value == Some(&Value::Literal(b"1".to_vec())) {
+          self.option_cursor = None;
+          self.options_reset = true;
+        } else if value.is_none_or(|value| value.issue().is_some()) {
+          self.option_cursor = None;
+          self.options_reset = false;
+        }
       }
       b"PWD" | b"OLDPWD" => self.directory_variables_modified = true,
       _ => {}
@@ -736,44 +921,47 @@ impl Environment {
   }
 
   pub fn new(input: &InitialEnvironment) -> Self {
+    let variables = Names {
+      patterns: BTreeSet::new(),
+      uncertain: None,
+      values: input
+        .environment
+        .iter()
+        .map(|(name, value)| {
+          (
+            name.clone(),
+            Binding {
+              resolution: alternative(Alternative::Environment)
+                .in_context(ExecutionContextId(0)),
+              value: Arc::new(if value.contains(&0) {
+                Value::Unknown(ValueIssue::Nul)
+              } else {
+                Value::Literal(value.clone())
+              }),
+            },
+          )
+        })
+        .chain(input.values.iter().map(|(name, bytes)| {
+          (
+            name.clone(),
+            Binding {
+              resolution: alternative(Alternative::External)
+                .in_context(ExecutionContextId(0)),
+              value: Arc::new(Value::Literal(bytes.clone())),
+            },
+          )
+        }))
+        .chain(input.variables.iter().map(|(name, binding)| {
+          (name.clone(), Binding::new(initial(*binding)))
+        }))
+        .collect(),
+      fallback: Binding::new(initial(input.other_variables)),
+    };
+    let options_reset =
+      *variables.get(b"OPTIND").value == Value::Literal(b"1".to_vec());
     Self {
       alternatives: Alternatives::default(),
-      variables: Names {
-        patterns: BTreeSet::new(),
-        uncertain: None,
-        values: input
-          .environment
-          .iter()
-          .map(|(name, value)| {
-            (
-              name.clone(),
-              Binding {
-                resolution: alternative(Alternative::Environment)
-                  .in_context(ExecutionContextId(0)),
-                value: Arc::new(if value.contains(&0) {
-                  Value::Unknown(ValueIssue::Nul)
-                } else {
-                  Value::Literal(value.clone())
-                }),
-              },
-            )
-          })
-          .chain(input.values.iter().map(|(name, bytes)| {
-            (
-              name.clone(),
-              Binding {
-                resolution: alternative(Alternative::External)
-                  .in_context(ExecutionContextId(0)),
-                value: Arc::new(Value::Literal(bytes.clone())),
-              },
-            )
-          }))
-          .chain(input.variables.iter().map(|(name, binding)| {
-            (name.clone(), Binding::new(initial(*binding)))
-          }))
-          .collect(),
-        fallback: Binding::new(initial(input.other_variables)),
-      },
+      variables,
       functions: Names {
         patterns: BTreeSet::new(),
         uncertain: None,
@@ -805,18 +993,16 @@ impl Environment {
       substitution_status: None,
       failure: CommandFailure::None,
       option_cursor: None,
-      options_reset: input
-        .values
-        .get(b"OPTIND".as_slice())
-        .or_else(|| input.environment.get(b"OPTIND".as_slice()))
-        .is_some_and(|value| value == b"1"),
+      options_reset,
       io: Io::default(),
       order: BTreeSet::new(),
       readonly: OrdMap::new(),
       unknown_attributes: BTreeSet::new(),
-      errexit: input.errexit,
+      exports: ExportAttributes::new(input),
       nounset: input.nounset,
       noglob: input.noglob,
+      allexport: input.allexport,
+      pipefail: input.pipefail,
       cwd: input
         .cwd
         .clone()
@@ -849,11 +1035,7 @@ impl Environment {
     if self.io.stdout_redirected != other.io.stdout_redirected
       || self.io.stderr_captured != other.io.stderr_captured
     {
-      if let Some(output) = &mut self.io.output {
-        output.fail(ValueIssue::Dynamic);
-      }
-      self.io.stdout_redirected = false;
-      self.io.stderr_captured = true;
+      self.io.unknown_descriptors();
     }
     match (&mut self.io.output, &other.io.output) {
       (Some(left), Some(right)) => left.join(right),
@@ -872,15 +1054,19 @@ impl Environment {
       }
       _ => {}
     }
-    if self.errexit != other.errexit {
-      self.errexit = None;
-    }
     if self.nounset != other.nounset {
       self.nounset = None;
     }
     if self.noglob != other.noglob {
       self.noglob = None;
     }
+    if self.allexport != other.allexport {
+      self.allexport = None;
+    }
+    if self.pipefail != other.pipefail {
+      self.pipefail = None;
+    }
+    self.exports.join(&other.exports);
     self.positional.join(&other.positional);
     for (name, value) in &mut self.special {
       value.join(
@@ -905,9 +1091,7 @@ impl Environment {
       .cloned()
       .collect();
     for name in names {
-      let definite = self.readonly.get(&name) == Some(&true)
-        && other.readonly.get(&name) == Some(&true);
-      self.readonly.insert(name, definite);
+      self.join_readonly(&name, other);
     }
   }
 
@@ -937,7 +1121,7 @@ impl Environment {
   }
 
   pub fn require_parameter(&mut self, name: &[u8]) {
-    if self.nounset == Some(false) || matches!(name, b"@" | b"*") {
+    if self.nounset == Some(false) {
       return;
     }
     let (value, absent) = self.parameter(name);
@@ -977,6 +1161,13 @@ impl Environment {
     }
   }
 
+  pub fn attributes(&self, name: &[u8]) -> VariableAttributes {
+    VariableAttributes {
+      readonly: self.readonly_attribute(name),
+      exported: self.exports.get(name),
+    }
+  }
+
   pub fn uncertain_variable(&self, name: &[u8]) -> bool {
     self
       .order
@@ -991,6 +1182,11 @@ impl Environment {
     if name == b"#" {
       return (self.positional.count(), Some(false));
     }
+    let name = if !name.is_empty() && name.iter().all(|byte| *byte == b'0') {
+      b"0".as_slice()
+    } else {
+      name
+    };
     if name != b"0" && name.iter().all(u8::is_ascii_digit) && !name.is_empty() {
       let index = std::str::from_utf8(name)
         .ok()
@@ -1009,7 +1205,8 @@ impl Environment {
       );
     }
     if matches!(name, b"@" | b"*") {
-      return (Value::Unknown(ValueIssue::Unspecified), None);
+      // dash treats both as set even without positional parameters.
+      return (Value::Unknown(ValueIssue::Dynamic), Some(false));
     }
     if self.uncertain_variable(name) {
       return (Value::Unknown(ValueIssue::Dynamic), None);
@@ -1121,6 +1318,20 @@ impl Output {
     self.constraint.clone().unwrap_or_else(|| {
       Value::Literal(self.chunks.iter().flatten().copied().collect())
     })
+  }
+
+  /// Replaces the output by `value`, computed from `expression`, keeping the
+  /// trace that still matches it.
+  pub fn set_expression(
+    &mut self,
+    expression: super::values::ValueId,
+    value: Value,
+    limit: usize,
+  ) {
+    let trace = self.trace();
+    *self = Self::default();
+    self.append(value, trace, limit);
+    self.expression = Some(expression);
   }
 
   fn join(&mut self, other: &Self) {
@@ -1235,8 +1446,7 @@ impl IntoIterator for Flow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::interface::application::engine::analysis) struct Io {
   pub input: Input,
-  pub input_order_unknown: bool,
-  saved_inputs: imbl::Vector<(Input, bool)>,
+  saved_inputs: imbl::Vector<Input>,
   pub output: Option<Output>,
   pub stdout_redirected: bool,
   pub stderr_captured: bool,
@@ -1248,7 +1458,6 @@ impl Default for Io {
   fn default() -> Self {
     Self {
       input: Err(ValueIssue::Dynamic),
-      input_order_unknown: false,
       saved_inputs: imbl::Vector::new(),
       output: None,
       stdout_redirected: false,
@@ -1269,16 +1478,33 @@ fn input_issue(left: &Input, right: &Input) -> ValueIssue {
 }
 
 impl Io {
+  /// Diagnostics reach the output when standard error is captured.
+  pub fn may_write_stderr(&mut self) {
+    if self.stderr_captured
+      && let Some(output) = &mut self.output
+    {
+      output.fail(ValueIssue::Dynamic);
+    }
+  }
+
+  /// Later output may or may not be captured.
+  pub fn unknown_descriptors(&mut self) {
+    if let Some(output) = &mut self.output {
+      output.fail(ValueIssue::Dynamic);
+    }
+    self.stdout_redirected = false;
+    self.stderr_captured = true;
+  }
+
   fn join_input(&mut self, other: &Self) {
     let same_stream = match (&self.input, &other.input) {
       (Ok((left, _)), Ok((right, _))) => Arc::ptr_eq(left, right),
       (Err(_), Err(_)) => true,
       _ => false,
     };
-    for (index, (input, unordered)) in self.saved_inputs.iter_mut().enumerate()
-    {
+    for (index, input) in self.saved_inputs.iter_mut().enumerate() {
       let next = other.saved_inputs.get(index);
-      if next.map(|(input, _)| input) != Some(input)
+      if next != Some(input)
         || (!same_stream
           && input.as_ref().is_ok_and(|(saved, _)| {
             [self.input.as_ref(), other.input.as_ref()]
@@ -1287,36 +1513,31 @@ impl Io {
               .any(|(active, _)| Arc::ptr_eq(active, saved))
           }))
       {
-        *input =
-          Err(next.map_or(ValueIssue::Dynamic, |(other, _)| {
-            input_issue(input, other)
-          }));
+        *input = Err(
+          next.map_or(ValueIssue::Dynamic, |other| input_issue(input, other)),
+        );
       }
-      *unordered |= next.is_some_and(|(_, unordered)| *unordered);
     }
     if self.input != other.input {
       self.input = Err(input_issue(&self.input, &other.input));
     }
-    self.input_order_unknown |= other.input_order_unknown;
   }
 
   pub fn forget_inputs(&mut self, issue: ValueIssue) {
     self.input = Err(issue);
-    for (input, _) in &mut self.saved_inputs {
+    for input in &mut self.saved_inputs {
       *input = Err(issue);
     }
   }
 
   pub fn save_input(&mut self) -> usize {
     let slot = self.saved_inputs.len();
-    self
-      .saved_inputs
-      .push_back((self.input.clone(), self.input_order_unknown));
+    self.saved_inputs.push_back(self.input.clone());
     slot
   }
 
   pub fn restore_input(&mut self, slot: usize) {
-    (self.input, self.input_order_unknown) = self.saved_inputs[slot].clone();
+    self.input = self.saved_inputs[slot].clone();
     self.saved_inputs.truncate(slot);
   }
 
@@ -1326,17 +1547,13 @@ impl Io {
   }
 
   pub fn consume_input(&mut self, offset: Option<usize>) {
-    if self.input_order_unknown {
-      self.forget_inputs(ValueIssue::Unspecified);
-      return;
-    }
     let Ok((stream, _)) = &self.input else {
       return;
     };
     let next = offset
       .map(|offset| (Arc::clone(stream), offset))
       .ok_or(ValueIssue::Dynamic);
-    for (saved, _) in &mut self.saved_inputs {
+    for saved in &mut self.saved_inputs {
       if saved
         .as_ref()
         .is_ok_and(|(old, _)| Arc::ptr_eq(old, stream))
@@ -1349,7 +1566,6 @@ impl Io {
 
   pub fn connect_input(&mut self, input: Input) {
     self.input = input;
-    self.input_order_unknown = false;
   }
 }
 

@@ -22,6 +22,7 @@ pub(in crate::interface::application::engine::analysis) struct Conditions {
   nodes: Vec<Decision>,
   unique: HashMap<Decision, Guard>,
   cache: HashMap<(bool, Guard, Guard), Guard>,
+  negations: HashMap<Guard, Guard>,
   budget: Budget,
 }
 
@@ -38,6 +39,7 @@ impl Default for Conditions {
       ],
       unique: HashMap::new(),
       cache: HashMap::new(),
+      negations: HashMap::from([(NEVER, ALWAYS), (ALWAYS, NEVER)]),
       budget: Budget::default(),
     }
   }
@@ -64,13 +66,12 @@ impl Conditions {
   }
 
   pub(super) fn not(&mut self, root: Guard) -> Guard {
-    let mut done = HashMap::from([(NEVER, ALWAYS), (ALWAYS, NEVER)]);
     let mut pending = vec![(root, false)];
     while let Some((id, visited)) = pending.pop() {
       if self.budget.exhausted() {
         return NEVER;
       }
-      if done.contains_key(&id) {
+      if self.negations.contains_key(&id) {
         continue;
       }
       let node = self.nodes[id];
@@ -79,11 +80,15 @@ impl Conditions {
         continue;
       }
       self.budget.work(1);
-      let result =
-        self.decision(node.choice, done[&node.low], done[&node.high]);
-      done.insert(id, result);
+      let result = self.decision(
+        node.choice,
+        self.negations[&node.low],
+        self.negations[&node.high],
+      );
+      self.budget.retain(64);
+      self.negations.insert(id, result);
     }
-    done[&root]
+    self.negations[&root]
   }
 
   pub(in crate::interface::application::engine::analysis) fn and(
@@ -228,6 +233,7 @@ pub(in crate::interface::application::engine::analysis) struct Values {
   index: BTreeMap<Expression, ValueId>,
   pub conditions: Conditions,
   queries: BTreeMap<Query, Memo<QueryState>>,
+  candidates: Memo<ValueId>,
   reversed: BTreeMap<ValueId, ValueId>,
   budget: Budget,
 }
@@ -240,6 +246,7 @@ impl Default for Values {
       index: BTreeMap::new(),
       conditions: Conditions::default(),
       queries: BTreeMap::new(),
+      candidates: Memo::new(),
       reversed: BTreeMap::new(),
       budget: budget.clone(),
     };
@@ -368,17 +375,25 @@ impl Values {
     }
   }
 
+  /// `None` when the result may exceed `limit` bytes.
   pub fn concat(
     &mut self,
     a: ValueId,
     b: ValueId,
+    limit: usize,
     cancelled: &AtomicBool,
   ) -> Result<Option<ValueId>, Error> {
     self.budget.check(cancelled)?;
     if self.maximum(a).is_none() || self.maximum(b).is_none() {
       return Ok(None);
     }
-    Ok(Some(self.concatenate(a, b)))
+    let result = self.concatenate(a, b);
+    Ok(
+      self
+        .maximum(result)
+        .is_some_and(|size| size <= limit)
+        .then_some(result),
+    )
   }
 
   fn merge<S: Ord>(
@@ -684,6 +699,7 @@ impl Values {
     root: ValueId,
     cancelled: &AtomicBool,
   ) -> Result<BTreeMap<ValueId, Guard>, Error> {
+    let mut memo = std::mem::take(&mut self.candidates);
     let results = self.transfer(
       root,
       0,
@@ -692,11 +708,12 @@ impl Values {
         combined.concat(value, usize::MAX);
         (values.literal(Arc::new(combined)), 0, false)
       },
-      &mut Memo::new(),
+      &mut memo,
       cancelled,
-    )?;
+    );
+    self.candidates = memo;
     Ok(
-      results
+      results?
         .into_iter()
         .map(|(id, output)| (id, output.guard))
         .collect(),
@@ -779,10 +796,9 @@ impl Values {
     cancelled: &AtomicBool,
   ) -> Result<ValueId, Error> {
     if self.maximum(root).is_none() {
-      return self.apply(
+      return self.map(
         root,
-        root,
-        |value, _| {
+        |value| {
           let mut value = value.clone();
           value.trim_newlines();
           value
@@ -842,10 +858,9 @@ impl Values {
     cancelled: &AtomicBool,
   ) -> Result<ValueId, Error> {
     if !self.entries[root].ascii || self.maximum(root).is_none() {
-      return self.apply(
+      return self.map(
         root,
-        root,
-        |input, _| pattern.remove(input, suffix, longest, utf8, cancelled),
+        |input| pattern.remove(input, suffix, longest, utf8, cancelled),
         cancelled,
       );
     }
@@ -896,6 +911,26 @@ impl Values {
     } else {
       Ok(result)
     }
+  }
+
+  pub fn map(
+    &mut self,
+    root: ValueId,
+    operation: impl Fn(&Value) -> Value,
+    cancelled: &AtomicBool,
+  ) -> Result<ValueId, Error> {
+    let mut result = 1;
+    for (input, guard) in self.candidates(root, cancelled)? {
+      self.budget.work(1);
+      self.budget.check(cancelled)?;
+      if guard == NEVER {
+        continue;
+      }
+      let input = self.constant(input).unwrap();
+      let value = self.literal(Arc::new(operation(&input)));
+      result = self.select(guard, value, result);
+    }
+    Ok(result)
   }
 
   pub fn apply(

@@ -2,7 +2,9 @@ use crate::interface::application::engine::{
   self, DocumentId, Modifier, SemanticKind, SemanticSpan, SymbolDetails,
   SymbolKind,
 };
-use crate::interface::application::{Application, Error, RenameEdit};
+use crate::interface::application::{
+  Application, Error, RenameEdit, RenameTarget,
+};
 use async_lsp::lsp_types as lsp;
 use async_lsp::{ErrorCode, ResponseError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,7 +53,7 @@ pub(super) fn file_path(uri: &Url) -> Result<PathBuf, ResponseError> {
     .map_err(|()| invalid("Unsupported file URI"))
 }
 
-pub(super) fn uri(
+fn uri(
   application: &Application,
   opened: &BTreeMap<PathBuf, OpenDocument>,
   path: &Path,
@@ -71,7 +73,7 @@ pub(super) fn uri(
     .map_err(|()| Error::Message("Cannot encode file URI".into()))
 }
 
-pub(super) fn document_source(
+fn document_source(
   application: &Application,
   id: DocumentId,
 ) -> Result<&str, Error> {
@@ -141,6 +143,35 @@ pub(super) fn workspace_edit(
     );
   }
   Ok(output)
+}
+
+pub(super) fn rename_range(
+  application: &Application,
+  target: RenameTarget,
+) -> Result<lsp::PrepareRenameResponse, Error> {
+  Ok(lsp::PrepareRenameResponse::RangeWithPlaceholder {
+    range: Positions::new(application).result_range(&target.location)?,
+    placeholder: target.placeholder,
+  })
+}
+
+pub(super) fn document_links(
+  application: &Application,
+  opened: &BTreeMap<PathBuf, OpenDocument>,
+  links: Vec<(engine::Location, PathBuf)>,
+) -> Result<Vec<lsp::DocumentLink>, Error> {
+  let mut positions = Positions::new(application);
+  links
+    .into_iter()
+    .map(|(location, path)| {
+      Ok(lsp::DocumentLink {
+        range: positions.result_range(&location)?,
+        target: Some(uri(application, opened, &path)?),
+        tooltip: None,
+        data: None,
+      })
+    })
+    .collect()
 }
 
 pub(super) fn locations(
@@ -253,7 +284,7 @@ pub(super) fn document_symbols(
   Ok(lsp::DocumentSymbolResponse::Nested(roots))
 }
 
-pub(super) const TYPES: &[&str] = &[
+const TYPES: &[&str] = &[
   "comment",
   "keyword",
   "operator",
@@ -264,7 +295,7 @@ pub(super) const TYPES: &[&str] = &[
   "function",
   "command",
 ];
-pub(super) const MODIFIERS: &[&str] = &[
+const MODIFIERS: &[&str] = &[
   "declaration",
   "definition",
   "modification",
@@ -273,14 +304,14 @@ pub(super) const MODIFIERS: &[&str] = &[
   "environment",
 ];
 
-pub(super) struct Positions<'a> {
+struct Positions<'a> {
   application: &'a Application,
   lines: BTreeMap<DocumentId, Lines<'a>>,
   paths: BTreeMap<DocumentId, &'a Path>,
 }
 
 impl<'a> Positions<'a> {
-  pub(super) const fn new(application: &'a Application) -> Self {
+  const fn new(application: &'a Application) -> Self {
     Self {
       application,
       lines: BTreeMap::new(),
@@ -289,7 +320,7 @@ impl<'a> Positions<'a> {
   }
 
   /// Invalid byte ranges return `None`.
-  pub(super) fn range(
+  fn range(
     &mut self,
     location: &engine::Location,
   ) -> Result<Option<lsp::Range>, Error> {
@@ -303,7 +334,7 @@ impl<'a> Positions<'a> {
     Ok(lines.range(&location.bytes))
   }
 
-  pub(super) fn result_range(
+  fn result_range(
     &mut self,
     location: &engine::Location,
   ) -> Result<lsp::Range, Error> {
@@ -312,7 +343,7 @@ impl<'a> Positions<'a> {
       .ok_or_else(|| Error::Message("Invalid result range".into()))
   }
 
-  pub(super) fn path(&mut self, id: DocumentId) -> Result<&'a Path, Error> {
+  fn path(&mut self, id: DocumentId) -> Result<&'a Path, Error> {
     if let Some(path) = self.paths.get(&id) {
       return Ok(path);
     }
@@ -452,7 +483,47 @@ impl<'a> Lines<'a> {
   }
 }
 
-pub(super) fn encode(
+/// Token types and modifiers the client supports, in legend order.
+pub(super) fn legend(
+  capability: &lsp::SemanticTokensClientCapabilities,
+) -> lsp::SemanticTokensLegend {
+  lsp::SemanticTokensLegend {
+    token_types: TYPES
+      .iter()
+      .filter(|name| {
+        capability
+          .token_types
+          .iter()
+          .any(|kind| kind.as_str() == **name)
+      })
+      .map(|name| lsp::SemanticTokenType::new(name))
+      .collect(),
+    token_modifiers: MODIFIERS
+      .iter()
+      .filter(|name| {
+        capability
+          .token_modifiers
+          .iter()
+          .any(|kind| kind.as_str() == **name)
+      })
+      .map(|name| lsp::SemanticTokenModifier::new(name))
+      .collect(),
+  }
+}
+
+pub(super) fn semantic_tokens(
+  application: &Application,
+  id: DocumentId,
+  spans: &[SemanticSpan],
+  legend: &lsp::SemanticTokensLegend,
+) -> Result<lsp::SemanticTokensResult, Error> {
+  Ok(lsp::SemanticTokensResult::Tokens(lsp::SemanticTokens {
+    result_id: None,
+    data: encode(document_source(application, id)?, spans, legend),
+  }))
+}
+
+fn encode(
   source: &str,
   spans: &[SemanticSpan],
   legend: &lsp::SemanticTokensLegend,

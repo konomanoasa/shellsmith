@@ -23,7 +23,6 @@ pub enum ExecutionKind {
   Subshell,
   Substitution,
   Arithmetic(Snapshot),
-  Redirection,
   Asynchronous,
   Pipeline,
   TemporaryAssignments,
@@ -36,7 +35,6 @@ impl ExecutionKind {
       Self::Deferred(_)
         | Self::Subshell
         | Self::Substitution
-        | Self::Redirection
         | Self::Asynchronous
         | Self::Pipeline
     )
@@ -70,8 +68,6 @@ pub enum ResolutionIssue {
   ExcludedEffect,
   Recovery,
   UndecodedSource,
-  EvaluationOrder,
-  PipelineEnvironment,
   UnresolvedSource,
   Recursion,
   ValueLimit,
@@ -211,6 +207,9 @@ pub enum EffectTarget {
   Variables,
   Functions,
   Attributes,
+  Export(Vec<u8>),
+  ExportPattern(engine::Value),
+  Exports,
   /// May read source text whose names and dependencies are unknown.
   Sources,
   /// Includes the PWD and OLDPWD values set by `cd`.
@@ -224,13 +223,16 @@ impl EffectTarget {
   #[must_use]
   pub fn covers(&self, kind: SymbolKind, name: &[u8]) -> bool {
     match (self, kind) {
-      (Self::Variable(text), SymbolKind::Variable)
+      (Self::Variable(text) | Self::Export(text), SymbolKind::Variable)
       | (Self::Function(text), SymbolKind::Function) => text == name,
-      (Self::VariablePattern(value), SymbolKind::Variable)
+      (
+        Self::VariablePattern(value) | Self::ExportPattern(value),
+        SymbolKind::Variable,
+      )
       | (Self::FunctionPattern(value), SymbolKind::Function) => {
         value.can_equal(name)
       }
-      (Self::Variables, SymbolKind::Variable)
+      (Self::Variables | Self::Exports, SymbolKind::Variable)
       | (Self::Functions, SymbolKind::Function) => true,
       (Self::Directory, SymbolKind::Variable) => {
         matches!(name, b"PWD" | b"OLDPWD")
@@ -269,6 +271,21 @@ impl AttributeState {
       Self::Unknown
     } else {
       Self::Conditional
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VariableAttributes {
+  pub readonly: AttributeState,
+  pub exported: AttributeState,
+}
+
+impl VariableAttributes {
+  pub(super) fn join(self, other: Self) -> Self {
+    Self {
+      readonly: self.readonly.join(other.readonly),
+      exported: self.exported.join(other.exported),
     }
   }
 }
@@ -391,7 +408,7 @@ pub struct Analysis {
     BTreeMap<EffectKey, UnknownEffect>,
   pub(in crate::interface::application::engine) derived: DerivedDocuments,
   pub(in crate::interface::application::engine) attributes:
-    BTreeMap<(OccurrenceId, ExecutionContextId), AttributeState>,
+    BTreeMap<(UseSite, ExecutionContextId), VariableAttributes>,
   pub(in crate::interface::application::engine) generation: Arc<()>,
   pub(in crate::interface::application::engine) request: AnalysisRequest,
   pub(in crate::interface::application::engine) contexts: Vec<ExecutionContext>,
@@ -403,8 +420,6 @@ pub struct Analysis {
     BTreeMap<ReferenceId, DependencyState>,
   pub(in crate::interface::application::engine) readable:
     BTreeSet<OccurrenceId>,
-  pub(in crate::interface::application::engine) references:
-    BTreeMap<SymbolId, BTreeSet<(UseSite, ExecutionContextId)>>,
   pub(in crate::interface::application::engine) non_sources:
     BTreeSet<ReferenceId>,
   pub(in crate::interface::application::engine) source_operands:
@@ -437,7 +452,6 @@ impl Analysis {
       snapshots: Vec::new(),
       source_bindings: BTreeMap::new(),
       readable,
-      references: BTreeMap::new(),
       source_inputs: BTreeMap::new(),
       source_operands: BTreeMap::new(),
       non_sources: BTreeSet::new(),
@@ -446,11 +460,11 @@ impl Analysis {
   }
 
   /// Argument uses without a reference role imply unknown effects.
-  pub(super) fn index_uses(
+  pub(super) fn validate_uses(
     &mut self,
     cancelled: &AtomicBool,
   ) -> Result<(), engine::Error> {
-    for (key, site) in &mut self.uses {
+    for site in self.uses.values_mut() {
       if matches!(site.site, UseSite::Argument { .. })
         && self
           .argument_roles
@@ -463,9 +477,6 @@ impl Analysis {
           .insert(ResolutionIssue::UnknownEffect);
       }
       engine::check_cancelled(cancelled)?;
-      for candidate in &site.resolution.candidates {
-        self.references.entry(*candidate).or_default().insert(*key);
-      }
     }
     engine::check_cancelled(cancelled)
   }
@@ -563,25 +574,17 @@ impl Analysis {
     self.values.get(&(occurrence, context)).map(AsRef::as_ref)
   }
 
-  pub fn values(
+  pub(in crate::interface::application::engine) fn write_contexts(
     &self,
-    occurrence: OccurrenceId,
-  ) -> impl Iterator<Item = (ExecutionContextId, &engine::Value)> {
+    symbol: SymbolId,
+  ) -> impl Iterator<Item = ExecutionContextId> {
     self
-      .values
+      .writes
       .range(
-        (occurrence, ExecutionContextId(0))
-          ..=(occurrence, ExecutionContextId(usize::MAX)),
+        (symbol, ExecutionContextId(0))
+          ..=(symbol, ExecutionContextId(usize::MAX)),
       )
-      .map(|((_, context), value)| (*context, value.as_ref()))
-  }
-
-  #[must_use]
-  pub fn has_recursive_calls(&self) -> bool {
-    self
-      .gaps
-      .iter()
-      .any(|gap| gap.issue == ResolutionIssue::Recursion)
+      .map(|(_, context)| *context)
   }
 
   pub fn readonly_contexts(
@@ -589,8 +592,19 @@ impl Analysis {
     id: OccurrenceId,
   ) -> impl Iterator<Item = (ExecutionContextId, AttributeState)> {
     self
+      .variable_attributes(UseSite::Syntax(id))
+      .map(|(context, state)| (context, state.readonly))
+  }
+
+  pub fn variable_attributes(
+    &self,
+    site: UseSite,
+  ) -> impl Iterator<Item = (ExecutionContextId, VariableAttributes)> {
+    self
       .attributes
-      .range((id, ExecutionContextId(0))..=(id, ExecutionContextId(usize::MAX)))
+      .range(
+        (site, ExecutionContextId(0))..=(site, ExecutionContextId(usize::MAX)),
+      )
       .map(|((_, context), state)| (*context, *state))
   }
 
@@ -634,29 +648,6 @@ impl Analysis {
       resolution.issues.insert(ResolutionIssue::UnknownEffect);
     }
     result
-  }
-
-  pub fn document_resolutions(
-    &self,
-    snapshot: Snapshot,
-  ) -> impl Iterator<Item = UseResolution> {
-    let sites: BTreeSet<_> = self
-      .readable
-      .range(
-        OccurrenceId { snapshot, index: 0 }..=OccurrenceId {
-          snapshot,
-          index: usize::MAX,
-        },
-      )
-      .copied()
-      .map(UseSite::Syntax)
-      .chain(
-        self
-          .document_argument_roles(snapshot)
-          .map(|role| UseSite::argument(&role.location)),
-      )
-      .collect();
-    sites.into_iter().map(|site| self.summarize(site))
   }
 
   pub(in crate::interface::application::engine) fn written_definitions(
@@ -772,17 +763,6 @@ impl Analysis {
     self.uses.get(&(site, context)).map(|site| &site.resolution)
   }
 
-  #[must_use]
-  pub fn status(
-    &self,
-    site: UseSite,
-    context: ExecutionContextId,
-  ) -> ResolutionStatus {
-    self
-      .resolution(site, context)
-      .map_or(ResolutionStatus::NotAttempted, Resolution::status)
-  }
-
   pub fn resolutions(
     &self,
     site: UseSite,
@@ -793,18 +773,6 @@ impl Analysis {
         (site, ExecutionContextId(0))..=(site, ExecutionContextId(usize::MAX)),
       )
       .map(|(_, site)| site)
-  }
-
-  pub fn references(
-    &self,
-    definition: SymbolId,
-  ) -> impl Iterator<Item = &ResolvedUse> {
-    self
-      .references
-      .get(&definition)
-      .into_iter()
-      .flatten()
-      .filter_map(|key| self.uses.get(key))
   }
 }
 
@@ -853,16 +821,10 @@ pub(in crate::interface::application::engine) fn syntax_attempted(
       .next()
       .is_some()
       || resolution.is_some_and(|resolution| {
-        resolution.candidates.iter().any(|symbol| {
-          analysis
-            .writes
-            .range(
-              (*symbol, ExecutionContextId(0))
-                ..=(*symbol, ExecutionContextId(usize::MAX)),
-            )
-            .next()
-            .is_some()
-        })
+        resolution
+          .candidates
+          .iter()
+          .any(|symbol| analysis.write_contexts(*symbol).next().is_some())
       })
   })
 }

@@ -178,9 +178,6 @@ impl Value {
           | ValueIssue::Arithmetic
           | ValueIssue::Nul
           | ValueIssue::SizeLimit
-          | ValueIssue::Unspecified
-          | ValueIssue::UnspecifiedEscape
-          | ValueIssue::LocaleDependentEscape
           | ValueIssue::TransformedSource
       )
     }) {
@@ -524,8 +521,6 @@ pub enum ValueIssue {
   Dynamic,
   Recovery,
   TransformedSource,
-  UnspecifiedEscape,
-  LocaleDependentEscape,
   Nul,
   EmptyOperand,
   MissingOperand,
@@ -535,17 +530,14 @@ pub enum ValueIssue {
   UnsupportedExpansion,
   Arithmetic,
   Locale,
-  Unspecified,
   Multiple(u32),
 }
 
 impl ValueIssue {
-  const CAUSES: [Self; 15] = [
+  const CAUSES: [Self; 12] = [
     Self::Dynamic,
     Self::Recovery,
     Self::TransformedSource,
-    Self::UnspecifiedEscape,
-    Self::LocaleDependentEscape,
     Self::Nul,
     Self::EmptyOperand,
     Self::MissingOperand,
@@ -555,7 +547,6 @@ impl ValueIssue {
     Self::UnsupportedExpansion,
     Self::Arithmetic,
     Self::Locale,
-    Self::Unspecified,
   ];
 
   fn mask(self) -> u32 {

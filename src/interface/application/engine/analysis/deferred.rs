@@ -1,5 +1,5 @@
 use super::execution::{Binding, Environment, Names};
-use super::{Frame, Resolver, Task};
+use super::{Frame, Resolver};
 use crate::interface::application::engine::{
   self, Alternative, DerivedOrigin, Error, ExecutionContextId, ExecutionKind,
   InitialEnvironment, Location, OccurrenceId, Resolution, ResolutionIssue,
@@ -182,7 +182,7 @@ impl Resolver<'_> {
           input.snapshot,
         );
         self.sources.start_root(input.snapshot);
-        self.run(Task::eval(document.tree.root_node(), env, frame))?;
+        self.run_root(document.tree.root_node(), env, frame)?;
       }
     }
   }
@@ -193,8 +193,11 @@ struct CapturedState {
   functions: Names,
   readonly: OrdMap<Vec<u8>, bool>,
   unknown_attributes: BTreeSet<Value>,
+  exports: super::execution::ExportAttributes,
+  allexport: Option<bool>,
   cwd: Value,
   noglob: Option<bool>,
+  pipefail: Option<bool>,
   directory_variables_modified: bool,
 }
 
@@ -205,8 +208,11 @@ impl From<&Environment> for CapturedState {
       functions: env.functions.clone(),
       readonly: env.readonly.clone(),
       unknown_attributes: env.unknown_attributes.clone(),
+      exports: env.exports.clone(),
+      allexport: env.allexport,
       cwd: env.cwd.clone(),
       noglob: env.noglob,
+      pipefail: env.pipefail,
       directory_variables_modified: env.directory_variables_modified,
     }
   }
@@ -312,10 +318,54 @@ struct StateChanges {
   variables: NameChanges,
   functions: NameChanges,
   readonly: BTreeMap<Vec<u8>, usize>,
-  attributes: usize,
+  attribute_patterns: BTreeMap<Value, usize>,
+  exports: BTreeMap<Vec<u8>, usize>,
+  export_patterns: BTreeMap<Value, usize>,
+  allexport: usize,
   cwd: usize,
   noglob: usize,
+  pipefail: usize,
   directory_variables: usize,
+}
+
+impl StateChanges {
+  fn observe_exports(
+    &mut self,
+    before: &mut super::execution::ExportAttributes,
+    after: &super::execution::ExportAttributes,
+    revision: usize,
+  ) {
+    for difference in before.values.diff(&after.values) {
+      let name = match difference {
+        DiffItem::Add(name, _)
+        | DiffItem::Remove(name, _)
+        | DiffItem::Update { new: (name, _), .. } => name,
+      };
+      if before.get(name) != after.get(name) {
+        self.exports.insert(name.clone(), revision);
+      }
+    }
+    observe_patterns(
+      &mut self.export_patterns,
+      &before.unknown,
+      &after.unknown,
+      revision,
+    );
+    before.clone_from(after);
+  }
+}
+
+/// Records added patterns; a kept one is in the captured input or was
+/// recorded after it.
+fn observe_patterns(
+  changes: &mut BTreeMap<Value, usize>,
+  before: &BTreeSet<Value>,
+  after: &BTreeSet<Value>,
+  revision: usize,
+) {
+  for pattern in after.difference(before) {
+    changes.insert(pattern.clone(), revision);
+  }
 }
 
 struct ObservedState {
@@ -401,13 +451,25 @@ impl InvariantInputs {
       observed.changes.readonly.insert(name.clone(), revision);
     }
     observed.state.readonly.clone_from(&env.readonly);
-    if observed.state.unknown_attributes != env.unknown_attributes {
-      observed.changes.attributes = revision;
-      observed
-        .state
-        .unknown_attributes
-        .clone_from(&env.unknown_attributes);
+    observed.changes.observe_exports(
+      &mut observed.state.exports,
+      &env.exports,
+      revision,
+    );
+    if observed.state.allexport != env.allexport {
+      observed.changes.allexport = revision;
+      observed.state.allexport = env.allexport;
     }
+    observe_patterns(
+      &mut observed.changes.attribute_patterns,
+      &observed.state.unknown_attributes,
+      &env.unknown_attributes,
+      revision,
+    );
+    observed
+      .state
+      .unknown_attributes
+      .clone_from(&env.unknown_attributes);
     if observed.state.cwd != env.cwd {
       observed.changes.cwd = revision;
       observed.state.cwd.clone_from(&env.cwd);
@@ -423,6 +485,10 @@ impl InvariantInputs {
       observed.changes.noglob = revision;
       observed.state.noglob = env.noglob;
     }
+    if observed.state.pipefail != env.pipefail {
+      observed.changes.pipefail = revision;
+      observed.state.pipefail = env.pipefail;
+    }
   }
 
   fn input(&self, input: &DeferredInput) -> Environment {
@@ -431,11 +497,13 @@ impl InvariantInputs {
       variables: input.state.variables.clone(),
       functions: input.state.functions.clone(),
       readonly: input.state.readonly.clone(),
-      unknown_attributes: if changes.attributes > input.revision {
-        BTreeSet::from([Value::Unknown(ValueIssue::Dynamic)])
+      exports: input.state.exports.clone(),
+      allexport: if changes.allexport > input.revision {
+        None
       } else {
-        input.state.unknown_attributes.clone()
+        input.state.allexport
       },
+      unknown_attributes: input.state.unknown_attributes.clone(),
       cwd: if changes.cwd > input.revision {
         Value::Unknown(ValueIssue::Dynamic)
       } else {
@@ -445,6 +513,11 @@ impl InvariantInputs {
         None
       } else {
         input.state.noglob
+      },
+      pipefail: if changes.pipefail > input.revision {
+        None
+      } else {
+        input.state.pipefail
       },
       directory_variables_modified: input.state.directory_variables_modified
         || changes.directory_variables > input.revision,
@@ -463,6 +536,24 @@ impl InvariantInputs {
     for (name, revision) in &changes.readonly {
       if *revision > input.revision {
         env.readonly.insert(name.clone(), false);
+      }
+    }
+    for (pattern, revision) in &changes.attribute_patterns {
+      if *revision > input.revision {
+        env.unknown_attributes.insert(pattern.clone());
+      }
+    }
+    for (pattern, revision) in &changes.export_patterns {
+      if *revision > input.revision {
+        env.exports.invalidate(pattern.clone());
+      }
+    }
+    for (name, revision) in &changes.exports {
+      if *revision > input.revision {
+        env
+          .exports
+          .values
+          .insert(name.clone(), super::AttributeState::Unknown);
       }
     }
     env
@@ -603,12 +694,18 @@ impl Resolver<'_> {
         let resolution = self
           .result
           .resolution(engine::UseSite::Syntax(*site), *context)?;
-        if !resolution.alternatives.is_empty()
-          || !resolution.issues.is_empty()
-          || resolution.candidates.is_empty()
+        let unset = resolution.alternatives.contains(&Alternative::Unset);
+        if !resolution.issues.is_empty()
+          || resolution
+            .alternatives
+            .iter()
+            .any(|alternative| *alternative != Alternative::Unset)
+          || unset && !value.is_empty()
+          || resolution.candidates.is_empty() && !unset
         {
           return None;
         }
+        // An unset parameter expands to no material.
         Some(TraceRecipe {
           parts: resolution
             .candidates
@@ -616,43 +713,13 @@ impl Resolver<'_> {
             .map(|symbol| {
               TraceTerm::Input(TraceKey::Definition(*symbol, value.to_vec()))
             })
+            .chain(unset.then(|| TraceTerm::Literal(BodyTrace::default())))
             .collect(),
           operation: TraceOperation::Agree(None),
         })
       }
       TraceKey::Definition(id, expected) => {
-        let symbol = self.workspace.symbol(*id)?;
-        let definition = self.workspace.occurrence(symbol.definition)?;
-        let document = self.workspace.document(id.snapshot.document)?;
-        let name = document.tree.root_node().named_descendant_for_byte_range(
-          definition.location.bytes.start,
-          definition.location.bytes.end,
-        )?;
-        let assignment =
-          std::iter::successors(Some(name), Node::parent).find(|node| {
-            node.child_by_field_name("name").is_some_and(|name| {
-              name.byte_range() == definition.location.bytes
-            })
-          })?;
-        let value = assignment.child_by_field_name("value")?;
-        let location = Location {
-          snapshot: id.snapshot,
-          bytes: value.byte_range(),
-        };
-        Some(TraceRecipe {
-          parts: self
-            .result
-            .writes
-            .range(
-              (*id, ExecutionContextId(0))
-                ..=(*id, ExecutionContextId(usize::MAX)),
-            )
-            .map(|(_, context)| {
-              TraceTerm::Input(TraceKey::word(&location, *context, true))
-            })
-            .collect(),
-          operation: TraceOperation::Agree(Some(expected.clone())),
-        })
+        self.definition_trace_recipe(*id, expected)
       }
     }
   }
@@ -727,6 +794,49 @@ impl Resolver<'_> {
     Some(TraceRecipe {
       parts,
       operation: TraceOperation::Concat,
+    })
+  }
+
+  fn definition_trace_recipe(
+    &self,
+    id: engine::SymbolId,
+    expected: &[u8],
+  ) -> Option<TraceRecipe> {
+    let symbol = self.workspace.symbol(id)?;
+    let definition = self.workspace.occurrence(symbol.definition)?;
+    let document = self.workspace.document(id.snapshot.document)?;
+    let name = document.tree.root_node().named_descendant_for_byte_range(
+      definition.location.bytes.start,
+      definition.location.bytes.end,
+    )?;
+    let assignment =
+      std::iter::successors(Some(name), Node::parent).find(|node| {
+        node
+          .child_by_field_name("name")
+          .is_some_and(|name| name.byte_range() == definition.location.bytes)
+      })?;
+    let Some(value) = assignment.child_by_field_name("value") else {
+      // `name=` assigns the empty string, which has no material.
+      return (matches!(assignment.kind(), "assignment_word" | "word")
+        && expected.is_empty())
+      .then(|| TraceRecipe {
+        parts: Vec::new(),
+        operation: TraceOperation::Concat,
+      });
+    };
+    let location = Location {
+      snapshot: id.snapshot,
+      bytes: value.byte_range(),
+    };
+    Some(TraceRecipe {
+      parts: self
+        .result
+        .write_contexts(id)
+        .map(|context| {
+          TraceTerm::Input(TraceKey::word(&location, context, true))
+        })
+        .collect(),
+      operation: TraceOperation::Agree(Some(expected.to_vec())),
     })
   }
 

@@ -91,15 +91,6 @@ impl Workspace {
     self.document(id.snapshot.document)?.occurrence(id)
   }
 
-  pub fn symbols_named(&self, name: &[u8]) -> impl Iterator<Item = &Symbol> {
-    self
-      .symbols
-      .get(name)
-      .into_iter()
-      .flatten()
-      .filter_map(|id| self.symbol(*id))
-  }
-
   pub fn search_symbols<'a>(
     &'a self,
     query: &'a [u8],
@@ -110,19 +101,6 @@ impl Workspace {
       .filter(move |(name, _)| matches_query(name, query))
       .flat_map(|(_, ids)| ids)
       .filter_map(|id| self.symbol(*id))
-  }
-
-  /// Failed updates leave the committed document unchanged.
-  pub fn update(
-    &mut self,
-    snapshot: Snapshot,
-    source: &[u8],
-    cancelled: &AtomicBool,
-  ) -> Result<Change, Error> {
-    self.check_new(snapshot)?;
-    let document = Document::parse(snapshot, source, cancelled)?;
-    check_cancelled(cancelled)?;
-    self.insert(document)
   }
 
   /// Revisions must exceed all previously committed revisions, including deleted ones.
@@ -208,11 +186,6 @@ impl Workspace {
     Ok(Change { affected })
   }
 
-  #[must_use]
-  pub fn reference_state(&self, id: ReferenceId) -> Option<&DependencyState> {
-    self.dependencies.get(&id)
-  }
-
   pub fn dependencies(
     &self,
     id: DocumentId,
@@ -239,23 +212,6 @@ impl Workspace {
       .flatten()
       .copied()
       .collect()
-  }
-
-  #[must_use]
-  pub fn reachable(&self, root: DocumentId) -> Vec<DocumentId> {
-    let mut seen = BTreeSet::new();
-    let mut pending = vec![root];
-    while let Some(id) = pending.pop() {
-      if self.documents.contains_key(&id) && seen.insert(id) {
-        pending.extend(self.derived_children(id));
-        pending.extend(
-          self
-            .dependencies(id)
-            .filter_map(|(_, state)| state.target()),
-        );
-      }
-    }
-    seen.into_iter().collect()
   }
 
   fn derived_children(
@@ -331,20 +287,7 @@ impl Workspace {
     while let Some(parent) = pending.pop() {
       let children: Vec<_> = self.derived_children(parent).collect();
       pending.extend(children);
-      if let Some(unit) = self.derived.remove(&parent) {
-        self.derived_keys.remove(&unit.key);
-        if !self
-          .derived
-          .values()
-          .any(|other| other.key.body == unit.key.body)
-        {
-          self.programs.remove(&unit.key.body);
-        }
-        for keys in self.derived_entries.values_mut() {
-          keys.remove(&parent);
-        }
-      }
-      self.derived_entries.remove(&parent);
+      self.discard_derived(parent);
       self.indexed.remove(&parent);
       self.discard_document(parent);
       self.invalidate(parent);
@@ -419,3 +362,7 @@ impl Workspace {
 pub(super) fn matches_query(name: &[u8], query: &[u8]) -> bool {
   query.is_empty() || name.windows(query.len()).any(|part| part == query)
 }
+
+#[cfg(test)]
+#[path = "../../../../../tests/implementation/workspace.rs"]
+mod tests;

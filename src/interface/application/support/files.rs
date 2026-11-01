@@ -177,9 +177,6 @@ fn resolve_file(
   let identity = absolute(cwd, candidate);
   let overlay = opened.contains_key(&identity) && parents_exist(candidate);
   ordinary(candidate, overlay).map_err(|error| error.to_string())?;
-  if !overlay {
-    std::fs::File::open(candidate).map_err(|error| error.to_string())?;
-  }
   Ok(identity)
 }
 
@@ -345,15 +342,12 @@ fn glob(
       Ok(p) => p,
       Err(issue) => return Ok(InputResult::Unknown(issue)),
     };
-    if pattern.ambiguous_glob(cancelled) {
-      return Ok(InputResult::Unknown(ValueIssue::Unspecified));
-    }
     let last = offset + part.len() == bytes.len();
     let literal = pattern.literal();
     let mut next = Vec::new();
     for prefix in paths {
       check_cancelled(cancelled)?;
-      let found = if let Some(literal) = &literal {
+      if let Some(literal) = &literal {
         let mut path = prefix.clone();
         path.extend(literal);
         if !last {
@@ -370,26 +364,14 @@ fn glob(
         let found = (candidate.exists()
           || std::fs::symlink_metadata(candidate).is_ok())
         .then_some(path);
-        if literal.as_slice() == part {
-          next.extend(found);
-          continue;
-        }
-        Some(found)
-      } else {
-        None
-      };
+        next.extend(found);
+        continue;
+      }
       let matched =
         match listed(&cwd, &prefix, &pattern, last, utf8, cancelled)? {
           Ok(matched) => matched,
           Err(issue) => return Ok(InputResult::Unknown(issue)),
         };
-      // An escaped component may be looked up by name or matched against
-      // directory entries, so only an agreeing result is determined.
-      if found
-        .is_some_and(|found| found.into_iter().ne(matched.iter().cloned()))
-      {
-        return Ok(InputResult::Unknown(ValueIssue::Unspecified));
-      }
       next.extend(matched);
     }
     paths = next;
@@ -417,7 +399,7 @@ fn listed(
   } else {
     cwd.join(directory)
   };
-  let entries = match std::fs::read_dir(directory) {
+  let entries = match std::fs::read_dir(&directory) {
     Ok(entries) => entries,
     Err(error)
       if matches!(
@@ -432,13 +414,19 @@ fn listed(
     Err(_) => return Ok(Err(ValueIssue::PathnameExpansion)),
   };
   let mut matched = Vec::new();
+  let entries =
+    [b".".to_vec(), b"..".to_vec()]
+      .into_iter()
+      .map(Ok)
+      .chain(entries.map(|entry| {
+        entry.map(|entry| entry.file_name().as_encoded_bytes().to_vec())
+      }));
   for entry in entries {
     check_cancelled(cancelled)?;
-    let Ok(entry) = entry else {
+    let Ok(name) = entry else {
       return Ok(Err(ValueIssue::PathnameExpansion));
     };
-    let name = entry.file_name();
-    let name = name.as_encoded_bytes();
+    let name = name.as_slice();
     match pattern.match_entry(name, utf8, cancelled) {
       Ok(true) => {}
       Ok(false) => continue,
@@ -447,7 +435,10 @@ fn listed(
     let mut path = prefix.to_vec();
     path.extend(name);
     if !last {
-      if !entry.path().is_dir() {
+      if !directory
+        .join(path_bytes(name).map_err(Error::Message)?)
+        .is_dir()
+      {
         continue;
       }
       path.push(b'/');

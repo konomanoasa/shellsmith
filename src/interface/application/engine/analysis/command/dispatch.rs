@@ -9,8 +9,8 @@ use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::word;
 use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
-  Alternative, ArgumentKind, ExecutionKind, Resolution, ResolutionIssue,
-  SymbolId, UseSite, Value, ValueIssue,
+  Alternative, ArgumentKind, ExecutionKind, OccurrenceId, Resolution,
+  ResolutionIssue, SymbolId, UseSite, Value, ValueIssue,
 };
 
 #[derive(Clone, Copy)]
@@ -153,6 +153,12 @@ pub(super) fn command_options(
         break;
       }
       ForwardOption::End => {
+        if args
+          .get(index + 1)
+          .is_some_and(|operand| operand.count.boundary().is_err())
+        {
+          return Err(ResolutionIssue::DynamicName);
+        }
         options.operands = index + 1;
         break;
       }
@@ -170,6 +176,9 @@ pub(super) fn command_options(
   }
   Ok(options)
 }
+
+type Invocation<'a> =
+  Box<dyn FnOnce(&mut Resolver<'a>, Environment) -> Task<'a> + 'a>;
 
 #[derive(Clone)]
 struct CallArguments<'a> {
@@ -194,7 +203,7 @@ impl<'a> Resolver<'a> {
       .map_or_else(Vec::new, children);
     let redirects = redirects(node);
     let Some(command) = parser::command_word(node) else {
-      return Self::without_command(node, prefix, redirects, env, frame);
+      return self.without_command(prefix, redirects, env, frame);
     };
     let arguments = suffix
       .into_iter()
@@ -332,222 +341,144 @@ impl<'a> Resolver<'a> {
     let prefix = node.child_by_field_name("prefix");
     let redirects = redirects(node);
     if words.is_empty() {
-      return Self::without_command(node, prefix, redirects, env, frame);
+      return self.without_command(prefix, redirects, env, frame);
     }
     let name = Argument::take_first(&mut words);
     let args = words;
-    let mut flow = Flow::default();
     let assignments = assignments(prefix);
-    let uncertain_order = !assignments.is_empty()
-      && !redirects.is_empty()
-      && (special_name(&name) || !matches!(name, Value::Literal(_)));
-    let order = (env.order.clone(), env.io.input_order_unknown);
-    let affected = if uncertain_order {
-      self.gap(node, frame, ResolutionIssue::EvaluationOrder);
-      self
-        .expansion_targets(assignments.iter().chain(&redirects).copied(), frame)
-    } else {
-      BTreeSet::new()
-    };
-    env.order.extend(affected.iter().cloned());
     let source = self.workspace.source(frame.snapshot.document);
     let search = Self::name_search(command, source, &name, &env);
     let io = redirection_persistence(&name, &args, &env)
       .save(&redirects, source, &mut env);
-    env.io.input_order_unknown |= uncertain_order;
-    Task::sequence(redirects, env, frame).then(
-      move |resolver, mut redirected| {
-        let before = redirected.take(Transfer::Next);
-        flow.join(redirected);
-        let Some(mut before) = before else {
-          return Task::Done(flow);
-        };
-        let input_order = before.io.input_order_unknown && order.1;
-        before.io.input_order_unknown |= uncertain_order;
-        let frame =
-          resolver.temporary_prefix(node, &name, &before, frame, search);
-        resolver
-          .prefix_assignments(node, assignments, &name, before.clone(), frame)
-          .then(move |resolver, mut prepared| {
-            let env = prepared.take(Transfer::Next);
-            flow.join(prepared);
-            let Some(mut env) = env else {
-              return Task::Done(flow);
-            };
-            env.order = order.0;
-            env.io.input_order_unknown = input_order;
-            if uncertain_order {
-              resolver.invalidate(
-                node,
-                &mut env,
-                frame,
-                ResolutionIssue::EvaluationOrder,
-                ValueIssue::Dynamic,
-                affected,
-              );
-            }
-            let resolution = Self::search_resolution(&name, &env, search);
+    Task::sequence(redirects, env, frame).then(move |resolver, mut flow| {
+      let Some(env) = flow.take(Transfer::Next) else {
+        return Task::Done(flow);
+      };
+      let resolution = Self::search_resolution(&name, &env, search);
+      let scope = prefix_scope(&name);
+      let frame = resolver.temporary_prefix(node, &assignments, scope, frame);
+      resolver
+        .prefix_assignments(
+          assignments.into_iter(),
+          scope,
+          env,
+          frame,
+          Box::new(move |resolver, env| {
             if let Some(id) = resolver.site(command, frame) {
               resolver.record_use(
                 UseSite::Syntax(id),
                 frame.context,
-                resolution.clone(),
+                resolution,
                 None,
                 &env,
               );
             }
-            if let Some(prefix) = prefix
-              && !special_name(&name)
-            {
-              resolver.prefix_order(node, prefix, &mut env, frame);
-            }
-            resolver
-              .invoke(node, &name, &args, env, frame, search)
-              .then(move |resolver, mut called| {
-                if let Some(prefix) = prefix {
-                  resolver.restore_prefix(
-                    prefix,
-                    &before,
-                    &name,
-                    &resolution,
-                    &mut called,
-                    frame,
-                  );
-                }
-                if let Some(io) = io {
-                  io.restore(&mut called);
-                }
-                flow.join(called);
-                Task::Done(flow)
-              })
-          })
-      },
-    )
+            resolver.invoke(node, &name, &args, env, frame, search)
+          }),
+        )
+        .then(move |_, mut called| {
+          if let Some(io) = io {
+            io.restore(&mut called);
+          }
+          flow.join(called);
+          Task::Done(flow)
+        })
+    })
   }
 
   fn prefix_assignments(
     &mut self,
-    node: Node<'a>,
-    assignments: Vec<Node<'a>>,
-    name: &Value,
+    mut assignments: std::vec::IntoIter<Node<'a>>,
+    scope: PrefixScope,
     env: Environment,
     frame: Frame,
+    invoke: Invocation<'a>,
   ) -> Task<'a> {
-    if assignments.len() > 1 && !special_name(name) {
-      let targets = self.expansion_targets(assignments.iter().copied(), frame);
-      self.uncertain_order(node, assignments, targets, env, frame)
-    } else {
-      Task::sequence(assignments, env, frame)
-    }
+    let Some(assignment) = assignments.next() else {
+      return invoke(self, env);
+    };
+    Self::assignment_value(assignment, env, frame).then_word(
+      move |resolver, mut expanded| {
+        let before =
+          (scope != PrefixScope::Persistent).then(|| expanded.env.clone());
+        let name = assignment.child_by_field_name("name").map(|name| {
+          word::lexical(
+            name,
+            resolver.workspace.source(frame.snapshot.document),
+          )
+        });
+        if scope != PrefixScope::Persistent
+          && let Some(name) = &name
+          && expanded.env.readonly(name) != Some(true)
+        {
+          let certain = scope == PrefixScope::Temporary
+            && expanded.env.readonly(name).is_none();
+          expanded.env.exports.mark(name, true, certain);
+        }
+        resolver.assign_value(assignment, expanded, frame).then(
+          move |resolver, mut flow| {
+            let Some(env) = flow.take(Transfer::Next) else {
+              return Task::Done(flow);
+            };
+            resolver
+              .prefix_assignments(assignments, scope, env, frame, invoke)
+              .then(move |_, mut called| {
+                if let (Some(name), Some(before)) = (name, before) {
+                  for env in called.environments_mut() {
+                    env.restore_temporary(
+                      &name,
+                      &before,
+                      scope == PrefixScope::Uncertain,
+                    );
+                  }
+                }
+                flow.join(called);
+                Task::Done(flow)
+              })
+          },
+        )
+      },
+    )
   }
 
   fn without_command(
-    node: Node<'a>,
+    &mut self,
     prefix: Option<Node<'a>>,
     redirects: Vec<Node<'a>>,
     mut env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let assignments = assignments(prefix);
-    let possible_writes = assignments.clone();
-    let uncertain_order = !assignments.is_empty();
-    let previous_input_order = env.io.input_order_unknown;
-    env.io.input_order_unknown |= uncertain_order && !redirects.is_empty();
-    Task::sequence(assignments, env, frame).then(move |resolver, mut flow| {
-      if !redirects.is_empty()
-        && let Some(env) = flow.get_mut(Transfer::Next)
-      {
-        let assigned_status = env.substitution_status.take();
-        let saved_input = env.io.save_input();
-        let inner = resolver.execution(
-          node,
-          frame,
-          ExecutionKind::Redirection,
-          frame.snapshot,
-        );
-        let task = if uncertain_order {
-          let targets = resolver.expansion_targets(
-            possible_writes.into_iter().chain(redirects.iter().copied()),
-            frame,
-          );
-          resolver.uncertain_order(node, redirects, targets, env.clone(), inner)
-        } else {
-          Task::sequence(redirects, env.clone(), inner)
-        };
-        return task.then(move |_, redirects| {
-          if let Some(state) = flow.get_mut(Transfer::Next) {
-            let returned = redirects.merged();
-            let mut status = assigned_status;
-            if let Some(returned) = returned {
-              state.failure.then(returned.failure);
-              if let Some(redirected_status) = returned.substitution_status {
-                if let Some(status) = &mut status {
-                  status.join(&redirected_status);
-                } else {
-                  status = Some(redirected_status);
-                }
-              }
-              state.io.inherit_input(&returned.io, saved_input);
-              state.io.output = returned.io.output;
-            } else {
-              state.io.restore_input(saved_input);
-            }
-            state.set_status(
-              status.unwrap_or(Value::Unknown(ValueIssue::Dynamic)),
-            );
-            state.io.input_order_unknown = previous_input_order;
+    let source = self.workspace.source(frame.snapshot.document);
+    let io = Redirections::new(&redirects, source, &mut env, false);
+    Task::sequence(redirects, env, frame).then(move |_, mut flow| {
+      let Some(env) = flow.take(Transfer::Next) else {
+        return Task::Done(flow);
+      };
+      Task::sequence(assignments(prefix), env, frame).then(
+        move |_, mut assigned| {
+          for env in assigned.environments_mut() {
+            let status = env
+              .substitution_status
+              .take()
+              .unwrap_or(Value::Literal(b"0".to_vec()));
+            env.set_status(status);
           }
+          io.restore(&mut assigned);
+          flow.join(assigned);
           Task::Done(flow)
-        });
-      }
-      if let Some(state) = flow.get_mut(Transfer::Next) {
-        state.io.input_order_unknown = previous_input_order;
-        let status = state
-          .substitution_status
-          .take()
-          .unwrap_or(Value::Literal(b"0".to_vec()));
-        state.set_status(status);
-      }
-      Task::Done(flow)
+        },
+      )
     })
-  }
-
-  fn prefix_order(
-    &mut self,
-    node: Node<'_>,
-    prefix: Node<'a>,
-    env: &mut Environment,
-    frame: Frame,
-  ) {
-    let targets = self.expansion_targets(
-      children(prefix)
-        .into_iter()
-        .filter_map(|child| child.child_by_field_name("value")),
-      frame,
-    );
-    self.invalidate(
-      node,
-      env,
-      frame,
-      ResolutionIssue::EvaluationOrder,
-      ValueIssue::Dynamic,
-      targets,
-    );
   }
 
   fn temporary_prefix(
     &mut self,
     node: Node<'_>,
-    name: &Value,
-    env: &Environment,
+    assignments: &[Node<'_>],
+    scope: PrefixScope,
     frame: Frame,
-    search: Search,
   ) -> Frame {
-    let assignments = assignments(node.child_by_field_name("prefix"));
-    if assignments.is_empty()
-      || special_name(name)
-      || prefix_may_persist(name, &Self::search_resolution(name, env, search))
-    {
+    if assignments.is_empty() || scope != PrefixScope::Temporary {
       return frame;
     }
     let inner = self.execution(
@@ -556,71 +487,33 @@ impl<'a> Resolver<'a> {
       ExecutionKind::TemporaryAssignments,
       frame.snapshot,
     );
-    for assignment in assignments {
-      if let Some(id) = assignment
-        .child_by_field_name("name")
-        .and_then(|name| self.site(name, frame))
-        && let Some(site) = self.workspace.occurrence(id)
-        && let Value::Literal(name) = &site.name
-      {
-        self
-          .result
-          .temporary
-          .entry(inner.context)
-          .or_default()
-          .insert(name.clone(), UseSite::Syntax(id));
-      }
+    for (name, id) in self.assigned_names(assignments, frame) {
+      self
+        .result
+        .temporary
+        .entry(inner.context)
+        .or_default()
+        .insert(name, UseSite::Syntax(id));
     }
     inner
   }
 
-  fn restore_prefix(
+  /// Literal names of prefix assignments, with their name occurrences.
+  fn assigned_names(
     &self,
-    prefix: Node<'_>,
-    before: &Environment,
-    name: &Value,
-    resolution: &Resolution,
-    flow: &mut Flow,
+    assignments: &[Node<'_>],
     frame: Frame,
-  ) {
-    if special_name(name) {
-      return;
-    }
-    let uncertain = prefix_may_persist(name, resolution);
-    for assignment in children(prefix) {
-      let Some(id) = assignment
-        .child_by_field_name("name")
-        .and_then(|node| self.site(node, frame))
-      else {
-        continue;
-      };
-      let Some(site) = self.workspace.occurrence(id) else {
-        continue;
-      };
-      let Value::Literal(name) = &site.name else {
-        continue;
-      };
-      if before.readonly(name) == Some(true) {
-        continue;
-      }
-      for env in flow.environments_mut() {
-        env.variable_changed(name, None);
-        env.alternatives.forget(name);
-        let old = before.variables.get(name);
-        if uncertain {
-          let mut current = env.variables.get(name).clone();
-          current.join(old);
-          current
-            .resolution
-            .issues
-            .insert(ResolutionIssue::EvaluationOrder);
-          env.variables.values.insert(name.clone(), current);
-        } else {
-          env.variables.values.insert(name.clone(), old.clone());
-          env.alternatives.restore(name, &before.alternatives);
+  ) -> Vec<(Vec<u8>, OccurrenceId)> {
+    assignments
+      .iter()
+      .filter_map(|assignment| {
+        let id = self.site(assignment.child_by_field_name("name")?, frame)?;
+        match &self.workspace.occurrence(id)?.name {
+          Value::Literal(name) => Some((name.clone(), id)),
+          _ => None,
         }
-      }
-    }
+      })
+      .collect()
   }
 
   pub(super) fn command_resolution(
@@ -705,8 +598,6 @@ impl<'a> Resolver<'a> {
         || resolution.alternatives != [Alternative::ExternalCommand].into()
     } else {
       optional_reserved_word(&word)
-        || (colon_word(&word)
-          && !word.iter().any(|byte| matches!(byte, b'\\' | b'\'' | b'"')))
     };
     if reserved {
       Search::Reserved
@@ -760,6 +651,8 @@ impl<'a> Resolver<'a> {
       .then(move |resolver, mut flow| {
         for state in flow.environments_mut() {
           state.positional.clone_from(&env.positional);
+          state.option_cursor.clone_from(&env.option_cursor);
+          state.options_reset = env.options_reset;
           state.alternatives.restore_positionals(&env.alternatives);
         }
         let task = if resolution.alternatives.contains(&Alternative::Builtin) {
@@ -831,11 +724,7 @@ impl<'a> Resolver<'a> {
     if !standard.is_some_and(|name| super::builtins::preserves_input(name)) {
       env.io.consume_input(None);
     }
-    if env.io.stderr_captured
-      && let Some(output) = &mut env.io.output
-    {
-      output.fail(ValueIssue::Dynamic);
-    }
+    env.io.may_write_stderr();
     env.set_status(Value::Unknown(ValueIssue::Dynamic));
     env
   }
@@ -1125,16 +1014,24 @@ pub fn optional_reserved_word(word: &[u8]) -> bool {
   OPTIONAL_RESERVED.contains(&word)
 }
 
-/// POSIX reserves colon-suffixed names except the `:` utility.
-fn colon_word(word: &[u8]) -> bool {
-  word.len() > 1 && word.ends_with(b":")
+/// How long prefix assignments last (XCU 2.9.1.2).
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PrefixScope {
+  /// Special built-ins keep the assignments.
+  Persistent,
+  /// An unknown name may select a special builtin.
+  Uncertain,
+  Temporary,
 }
 
-/// Definite special built-ins are handled by the caller.
-fn prefix_may_persist(name: &Value, resolution: &Resolution) -> bool {
-  !resolution.candidates.is_empty()
-    || unknown_utility(resolution)
-    || SPECIAL.iter().any(|special| name.can_equal(special))
+fn prefix_scope(name: &Value) -> PrefixScope {
+  if special_name(name) {
+    PrefixScope::Persistent
+  } else if SPECIAL.iter().any(|special| name.can_equal(special)) {
+    PrefixScope::Uncertain
+  } else {
+    PrefixScope::Temporary
+  }
 }
 
 const SPECIAL: &[&[u8]] = &[
@@ -1264,15 +1161,6 @@ fn query_output(name: &Value, resolution: &Resolution) -> Value {
     output.push(b'\n');
     outputs.push(Value::Literal(output));
   }
-  if name.intersects(&Value::partial(
-    Vec::new(),
-    b":".to_vec(),
-    2,
-    ValueIssue::Dynamic,
-  )) && !matches!(name, Value::Literal(bytes) if !colon_word(bytes))
-  {
-    outputs.push(line);
-  }
   if unknown
     || resolution
       .alternatives
@@ -1305,7 +1193,8 @@ impl Persistence {
 }
 
 /// Redirections persist only for `exec`, reached directly or through the
-/// `command` builtin; a `command` that may be a function makes them unknown.
+/// `command` builtin; a name that may be either, or a `command` that may be a
+/// function, makes them unknown.
 fn redirection_persistence<'a>(
   mut name: &'a Value,
   mut args: &'a [Argument<'_>],
@@ -1335,7 +1224,7 @@ fn redirection_persistence<'a>(
   }
   if !name.can_equal(b"exec") && !name.can_equal(b"command") {
     Persistence::Temporary
-  } else if builtin {
+  } else if builtin && *name == Value::Literal(b"exec".to_vec()) {
     Persistence::Persistent
   } else {
     Persistence::Unknown

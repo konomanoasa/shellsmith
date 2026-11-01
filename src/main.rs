@@ -1,4 +1,4 @@
-use shellsmith::interface::application::Error;
+use std::error::Error;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -16,10 +16,10 @@ fn main() -> ExitCode {
   }
 }
 
-fn run() -> Result<bool, Error> {
+fn run() -> Result<bool, Box<dyn Error>> {
   let args: Vec<OsString> = std::env::args_os().skip(1).collect();
   match args.as_slice() {
-    [arg] if arg == "lsp" => shellsmith::interface::lsp::stdio(),
+    [arg] if arg == "lsp" => Ok(shellsmith::interface::lsp::stdio()?),
     [arg] if arg == "--help" => {
       io::stdout().lock().write_all(HELP.as_bytes())?;
       Ok(true)
@@ -32,6 +32,6 @@ fn run() -> Result<bool, Error> {
       )?;
       Ok(true)
     }
-    _ => Err(Error::Message(format!("Usage:\n{HELP}"))),
+    _ => Err(format!("Usage:\n{HELP}").into()),
   }
 }

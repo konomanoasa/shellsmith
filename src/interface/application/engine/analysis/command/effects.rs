@@ -24,6 +24,7 @@ fn all() -> BTreeSet<EffectTarget> {
     EffectTarget::Variables,
     EffectTarget::Functions,
     EffectTarget::Attributes,
+    EffectTarget::Exports,
     EffectTarget::Sources,
     EffectTarget::Directory,
     EffectTarget::Positionals,
@@ -390,7 +391,7 @@ fn builtin_targets(
         named_targets(
           &args[options.operands..],
           NameTarget::Variable,
-          false,
+          None,
           targets,
         );
       } else {
@@ -405,7 +406,7 @@ fn builtin_targets(
           named_targets(
             args.get(1..2).unwrap_or(&[]),
             NameTarget::Variable,
-            false,
+            None,
             targets,
           );
         }
@@ -427,11 +428,11 @@ fn builtin_targets(
           } else {
             NameTarget::Variable
           },
-          false,
+          None,
           targets,
         );
         if !explicit {
-          named_targets(&args[index..], NameTarget::Function, false, targets);
+          named_targets(&args[index..], NameTarget::Function, None, targets);
         }
       } else {
         targets.extend([EffectTarget::Variables, EffectTarget::Functions]);
@@ -442,14 +443,16 @@ fn builtin_targets(
         named_targets(
           &args[start..],
           NameTarget::Declaration,
-          name == b"readonly",
+          Some(name == b"export"),
           targets,
         );
       } else {
         targets.insert(EffectTarget::Variables);
-        if name == b"readonly" {
-          targets.insert(EffectTarget::Attributes);
-        }
+        targets.insert(if name == b"readonly" {
+          EffectTarget::Attributes
+        } else {
+          EffectTarget::Exports
+        });
       }
     }
     b"cd" => {
@@ -469,7 +472,7 @@ fn builtin_targets(
 fn named_targets(
   args: &[Argument<'_>],
   kind: NameTarget,
-  attributes: bool,
+  attributes: Option<bool>,
   targets: &mut BTreeSet<EffectTarget>,
 ) {
   for arg in args {
@@ -482,14 +485,17 @@ fn named_targets(
         } else {
           EffectTarget::Variable(name.clone())
         });
-        if attributes {
-          targets.insert(EffectTarget::Attribute(name.clone()));
+        if let Some(exported) = attributes {
+          targets.insert(attribute_target(
+            &EffectTarget::Variable(name.clone()),
+            exported,
+          ));
         }
       }
       _ if arg.count.boundary().is_err() || arg.value.issue().is_some() => {
         let target = argument_target(arg, kind);
-        if attributes {
-          targets.insert(attribute_target(&target));
+        if let Some(exported) = attributes {
+          targets.insert(attribute_target(&target, exported));
         }
         targets.insert(target);
       }
@@ -530,12 +536,22 @@ pub(super) fn argument_target(
   }
 }
 
-pub(super) fn attribute_target(target: &EffectTarget) -> EffectTarget {
-  match target {
-    EffectTarget::Variable(name) => EffectTarget::Attribute(name.clone()),
-    EffectTarget::VariablePattern(pattern) => {
+pub(super) fn attribute_target(
+  target: &EffectTarget,
+  exported: bool,
+) -> EffectTarget {
+  match (target, exported) {
+    (EffectTarget::Variable(name), true) => EffectTarget::Export(name.clone()),
+    (EffectTarget::Variable(name), false) => {
+      EffectTarget::Attribute(name.clone())
+    }
+    (EffectTarget::VariablePattern(pattern), true) => {
+      EffectTarget::ExportPattern(pattern.clone())
+    }
+    (EffectTarget::VariablePattern(pattern), false) => {
       EffectTarget::AttributePattern(pattern.clone())
     }
-    _ => EffectTarget::Attributes,
+    (_, true) => EffectTarget::Exports,
+    (_, false) => EffectTarget::Attributes,
   }
 }

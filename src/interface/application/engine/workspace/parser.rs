@@ -331,6 +331,7 @@ pub(in crate::interface::application::engine) fn dynamic_arithmetic(
       | "command_substitution"
       | "backquote_substitution"
       | "arithmetic_dynamic_expression"
+      | "arithmetic_source"
       | "parenthesized_arithmetic_dynamic_source"
       | "arithmetic_expansion" => return true,
       _ => pending.extend(node.named_children(&mut node.walk())),

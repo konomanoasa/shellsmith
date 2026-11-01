@@ -179,16 +179,15 @@ impl<'a> Resolver<'a> {
         }
         _ => return Ok(None),
       };
-      let mut values = env.alternatives.expressions();
-      let Some(combined) = values.concat(result, next, self.cancelled)? else {
+      let Some(combined) = env.alternatives.expressions().concat(
+        result,
+        next,
+        self.result.request.limits.value_bytes,
+        self.cancelled,
+      )?
+      else {
         return Ok(None);
       };
-      if values
-        .maximum(combined)
-        .is_none_or(|size| size > self.result.request.limits.value_bytes)
-      {
-        return Ok(None);
-      }
       result = combined;
     }
     Ok(Some(result))
@@ -273,10 +272,9 @@ impl<'a> Resolver<'a> {
           else {
             return Ok(None);
           };
-          env.alternatives.expressions().apply(
+          env.alternatives.expressions().map(
             input,
-            input,
-            |a, _| value(integer(a)),
+            |a| value(integer(a)),
             self.cancelled,
           )?
         }
@@ -301,10 +299,9 @@ impl<'a> Resolver<'a> {
               return Ok(None);
             };
             let operator = word::lexical(operator, source);
-            env.alternatives.expressions().apply(
+            env.alternatives.expressions().map(
               input,
-              input,
-              |a, _| value(unary(&operator, integer(a))),
+              |a| value(unary(&operator, integer(a))),
               self.cancelled,
             )?
           } else {

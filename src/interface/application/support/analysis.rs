@@ -75,8 +75,7 @@ impl Application {
       return Err(Error::Superseded);
     }
     let collection = Arc::new(collection);
-    self.names = None;
-    self.analyses = Some(collection.clone());
+    self.set_analyses(Some(collection.clone()));
     Ok(collection)
   }
 
@@ -188,17 +187,10 @@ impl Application {
   }
 
   pub(super) fn share_analyses(&mut self, collection: Arc<AnalysisCollection>) {
-    if self
-      .analyses
-      .as_ref()
-      .is_none_or(|previous| !Arc::ptr_eq(previous, &collection))
-    {
-      self.names = None;
-    }
     self.entries.extend(collection.paths.clone());
     self.cache = collection.cache.clone();
     self.failures.clone_from(&collection.failures);
-    self.analyses = Some(collection);
+    self.set_analyses(Some(collection));
   }
 
   pub(super) fn analyze_entry(
@@ -298,9 +290,8 @@ impl Application {
       .document(id)
       .ok_or(engine::Error::UnknownDocument(id))?
       .snapshot();
-    let initial = self.initial_environment(id)?;
     let mut request = AnalysisRequest::new(snapshot);
-    request.initial = initial.clone();
+    request.initial = self.initial_environment(id)?;
     request.limits = self.settings.limits;
     if self.limited.as_ref() == Some(&request) {
       return Err(engine::Error::AnalysisLimit.into());

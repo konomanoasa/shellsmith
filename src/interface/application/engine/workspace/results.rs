@@ -280,16 +280,6 @@ impl Workspace {
       .semantic_spans(snapshot)
   }
 
-  /// Locations are projected to the requested document.
-  #[must_use]
-  pub fn source_links(&self, id: DocumentId) -> Vec<(Location, Snapshot)> {
-    self
-      .source_observations(id)
-      .into_iter()
-      .filter_map(|(location, target)| target.map(|target| (location, target)))
-      .collect()
-  }
-
   pub(super) fn source_observations(
     &self,
     id: DocumentId,

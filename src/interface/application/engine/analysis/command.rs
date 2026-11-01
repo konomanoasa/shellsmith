@@ -1,6 +1,8 @@
 mod arguments;
 mod builtins;
 mod dispatch;
+
+pub(super) use builtins::process_status;
 mod effects;
 mod redirections;
 

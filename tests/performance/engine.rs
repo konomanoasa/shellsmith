@@ -103,13 +103,18 @@ fn measure_documents() {
     let mut workspace = Workspace::default();
     let start = Instant::now();
     workspace
-      .update(snapshot(1, 1), source.as_bytes(), &cancelled)
+      .insert(
+        Document::parse(snapshot(1, 1), source.as_bytes(), &cancelled).unwrap(),
+      )
       .unwrap();
     let initial = start.elapsed();
     let changed = source.replacen("x=1", "y=2", 1);
     let start = Instant::now();
     workspace
-      .update(snapshot(1, 2), changed.as_bytes(), &cancelled)
+      .insert(
+        Document::parse(snapshot(1, 2), changed.as_bytes(), &cancelled)
+          .unwrap(),
+      )
       .unwrap();
     println!(
       "document_lines\t{lines}\t{:.3}\t{:.3}",
@@ -123,10 +128,13 @@ fn measure_documents() {
     let start = Instant::now();
     for id in 1..=count {
       workspace
-        .update(
-          snapshot(id, 1),
-          b"value=1\nf() { echo \"$value\"; }\n. next\n",
-          &cancelled,
+        .insert(
+          Document::parse(
+            snapshot(id, 1),
+            b"value=1\nf() { echo \"$value\"; }\n. next\n",
+            &cancelled,
+          )
+          .unwrap(),
         )
         .unwrap();
     }
@@ -143,7 +151,9 @@ fn measure_documents() {
     let initial = start.elapsed();
     let start = Instant::now();
     let change = workspace
-      .update(snapshot(count, 2), b"value=2\n", &cancelled)
+      .insert(
+        Document::parse(snapshot(count, 2), b"value=2\n", &cancelled).unwrap(),
+      )
       .unwrap();
     assert_eq!(u64::try_from(change.affected.len()).unwrap(), count);
     println!(
@@ -412,7 +422,9 @@ fn measure(case: &str, size: usize) {
   let source = fixture(case, size, &mut workspace, &mut inputs, &cancelled);
   let start = Instant::now();
   workspace
-    .update(snapshot(1, 1), source.as_bytes(), &cancelled)
+    .insert(
+      Document::parse(snapshot(1, 1), source.as_bytes(), &cancelled).unwrap(),
+    )
     .unwrap();
   let parse = start.elapsed().as_secs_f64() * 1000.0;
   let start = Instant::now();

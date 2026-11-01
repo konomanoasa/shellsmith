@@ -3,7 +3,7 @@ mod classification {
 
   use shellsmith::interface::application::engine::{
     AnalysisRequest, ArgumentKind, AttributeState, DocumentId, ExecutionKind,
-    InitialEnvironment, Modifier, SemanticKind, Workspace,
+    InitialEnvironment, Modifier, ResolutionIssue, SemanticKind, Workspace,
   };
   use std::sync::atomic::AtomicBool;
 
@@ -253,7 +253,8 @@ mod classification {
             assert_eq!(
               resolution.candidates,
               workspace
-                .symbols_named(b"a")
+                .symbols()
+                .filter(|symbol| symbol.name == b"a")
                 .map(|symbol| symbol.id)
                 .collect(),
               "{source}"
@@ -276,10 +277,10 @@ mod classification {
           );
           let names =
             workspace.name_relations(&AtomicBool::new(false)).unwrap();
-          let sites = names.at(snapshot, offset);
+          let sites = support::name_sites_at(&names, snapshot, offset);
           if call.is_empty() {
             assert!(
-              sites.iter().all(|(_, site)| site.context.is_none()
+              sites.iter().all(|site| site.context.is_none()
                 && site.resolution.is_none()
                 && site.identity.is_none()),
               "{source}"
@@ -288,7 +289,7 @@ mod classification {
           } else {
             assert!(!sites.is_empty(), "{source}");
             assert!(
-              sites.iter().all(|(_, site)| site.context.is_some()),
+              sites.iter().all(|site| site.context.is_some()),
               "{source}"
             );
           }
@@ -712,14 +713,25 @@ mod classification {
   }
 
   #[test]
-  fn trap_actions_are_shell_bodies_only_when_no_option_may_precede_them() {
-    for (action, body) in [
-      ("\"echo $x\" INT", Some("\"echo $x\"")),
-      ("-- \"-$x\" INT", Some("\"-$x\"")),
-      ("\"-$x\" INT", None),
-      ("\"$x\" INT", None),
+  fn trap_bodies_require_a_known_action_and_possible_conditions() {
+    for (call, body) in [
+      ("trap \"echo $x\" INT", Some("\"echo $x\"")),
+      ("trap -- \"-$x\" INT", Some("\"-$x\"")),
+      ("trap \"-$x\" INT", None),
+      ("trap \"$x\" INT", None),
+      ("trap 'echo $x'", None),
+      ("trap -- 'echo $x'", None),
+      ("trap \"$x\"", None),
+      ("trap -- \"$x\"", None),
+      ("conditions=; trap 'echo $x' $conditions", None),
+      ("set --; trap 'echo $x' \"$@\"", None),
+      ("set --; trap -- 'echo $x' \"$@\"", None),
+      ("set -- 'echo $x'; trap \"$@\"", None),
+      ("trap 'echo $x' $x", Some("'echo $x'")),
+      ("trap 'echo $x' \"$x\"", Some("'echo $x'")),
+      ("trap 'echo $x' ''", Some("'echo $x'")),
     ] {
-      let source = format!("x=$(external); trap {action}");
+      let source = format!("x=$(external); {call}");
       let workspace = workspace(&source);
       let bodies: Vec<_> = workspace
         .analysis()
@@ -878,7 +890,8 @@ mod classification {
         .unwrap()
         .candidates,
       workspace
-        .symbols_named(b"f")
+        .symbols()
+        .filter(|symbol| symbol.name == b"f")
         .map(|symbol| symbol.id)
         .collect()
     );
@@ -999,16 +1012,29 @@ mod classification {
         ..InitialEnvironment::empty()
       },
     );
-    let symbol = workspace.symbols_named(b"action").next().unwrap().id;
-    assert_eq!(analysis.references(symbol).count(), 1);
+    let symbol = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"action")
+      .unwrap()
+      .id;
+    assert_eq!(crate::support::references(&analysis, symbol).count(), 1);
     assert_eq!(analysis.contexts().len(), 3);
     let generated = workspace
       .documents()
       .find(|document| document.source() == "x=changed; : \"$x\"")
       .unwrap();
-    let resolutions: Vec<_> = analysis
-      .document_resolutions(generated.snapshot())
-      .filter(|site| site.site.syntax().is_some())
+    let sites: std::collections::BTreeSet<_> = analysis
+      .uses()
+      .filter_map(|site| site.site.syntax())
+      .filter(|site| site.snapshot == generated.snapshot())
+      .collect();
+    let resolutions: Vec<_> = sites
+      .into_iter()
+      .map(|site| {
+        analysis.summarize(
+          shellsmith::interface::application::engine::UseSite::Syntax(site),
+        )
+      })
       .collect();
     assert_eq!(resolutions.len(), 2);
     assert!(resolutions.iter().all(|site| site.resolution.is_some()));
@@ -1150,15 +1176,34 @@ mod classification {
       .unwrap();
     workspace.publish_analysis(analysis).unwrap();
     assert_eq!(workspace.documents().count(), 2);
-    assert_eq!(workspace.symbols_named(b"old_name").count(), 0);
-    assert_eq!(workspace.symbols_named(b"new_name").count(), 1);
+    assert_eq!(
+      workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"old_name")
+        .count(),
+      0
+    );
+    assert_eq!(
+      workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"new_name")
+        .count(),
+      1
+    );
   }
 
   #[test]
   fn recursive_calls_preserve_independently_resolved_semantic_information() {
     let workspace =
       workspace("# comment\nf() { f; }; f; readonly x=1; echo \"$x\"");
-    assert!(workspace.analysis().unwrap().has_recursive_calls());
+    assert!(
+      workspace
+        .analysis()
+        .unwrap()
+        .gaps()
+        .iter()
+        .any(|gap| gap.issue == ResolutionIssue::Recursion)
+    );
     let spans = workspace.semantic_spans(DocumentId(1)).unwrap();
     assert!(spans.iter().any(|span| span.kind == SemanticKind::Comment));
     assert_eq!(
@@ -1266,8 +1311,9 @@ mod classification {
     let workspace = workspace("name=x; read \"$name\"");
     assert_eq!(
       workspace
-        .projected_symbols(DocumentId(1))
-        .filter(|(symbol, _)| symbol.name == b"x")
+        .document_symbol_details(DocumentId(1))
+        .iter()
+        .filter(|entry| entry.symbol.name == b"x")
         .count(),
       0
     );

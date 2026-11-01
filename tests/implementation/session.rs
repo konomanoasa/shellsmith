@@ -1,4 +1,6 @@
 use super::*;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn preparation_survives_one_cancellation_and_stops_after_the_last_subscriber()
@@ -809,4 +811,76 @@ fn name_input_checks_rescan_inputs_created_without_notification() {
     application.check_name_inputs(&names, &cancelled),
     Err(Error::Superseded)
   ));
+}
+
+#[tokio::test]
+async fn cancelling_one_request_leaves_another_request_running_and_discards_changes()
+ {
+  let fixture = Fixture::new();
+  let mut settings = Settings::new(fixture.root.clone());
+  settings.limits.value_bytes = 1024;
+  let session = Session::new(settings.clone()).unwrap();
+  let (started, start) = oneshot::channel();
+  let (release, resume) = std::sync::mpsc::channel();
+  let (stopped, stop) = oneshot::channel();
+  let cancelled = tokio::spawn(session.request(
+    RequestScope::Workspace,
+    move |application, flag| {
+      settings.limits.value_bytes = 512;
+      application.settings = settings;
+      started.send(()).unwrap();
+      resume.recv_timeout(Duration::from_secs(10)).unwrap();
+      stopped.send(flag.load(Ordering::Relaxed)).unwrap();
+      Ok(())
+    },
+  ));
+  start.await.unwrap();
+  let independent =
+    session.request(RequestScope::Workspace, |application, flag| {
+      assert!(!flag.load(Ordering::Relaxed));
+      Ok(application.settings().limits.value_bytes)
+    });
+  cancelled.abort();
+  assert!(cancelled.await.unwrap_err().is_cancelled());
+  release.send(()).unwrap();
+  assert!(stop.await.unwrap());
+  assert_eq!(independent.await.result.unwrap(), 1024);
+  assert_eq!(
+    session
+      .request(RequestScope::Workspace, |application, _| Ok(
+        application.settings().limits.value_bytes
+      ))
+      .await
+      .result
+      .unwrap(),
+    1024
+  );
+}
+
+#[tokio::test]
+async fn failed_requests_do_not_commit_mutations_or_poison_the_session() {
+  let fixture = Fixture::new();
+  let mut settings = Settings::new(fixture.root.clone());
+  settings.limits.value_bytes = 1024;
+  let session = Session::new(settings.clone()).unwrap();
+  for panics in [false, true] {
+    let mut settings = settings.clone();
+    let result = session
+      .request(RequestScope::Workspace, move |application, _| {
+        settings.limits.value_bytes = 512;
+        application.settings = settings;
+        assert!(!panics, "test worker failure");
+        Err::<(), _>(Error::Message("test operation failure".into()))
+      })
+      .await;
+    assert!(matches!(result.result, Err(Error::Message(_))));
+    let actual = session
+      .request(RequestScope::Workspace, |application, _| {
+        Ok(application.settings().limits.value_bytes)
+      })
+      .await
+      .result
+      .unwrap();
+    assert_eq!(actual, 1024);
+  }
 }

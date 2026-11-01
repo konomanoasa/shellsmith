@@ -19,11 +19,9 @@ impl Application {
     id: DocumentId,
     cancelled: &AtomicBool,
   ) -> Result<Vec<engine::SemanticSpan>, Error> {
-    if !self.inputs_current(cancelled)? {
-      if self.request_prepared {
-        self.discard_results();
-        return Err(Error::Superseded);
-      }
+    if self.request_prepared {
+      self.check_inputs(cancelled)?;
+    } else if !self.inputs_current(cancelled)? {
       let path = self
         .path(id)
         .ok_or(engine::Error::UnknownDocument(id))?
@@ -32,20 +30,12 @@ impl Application {
       self.discard_results();
     }
     self.prepare_semantics(id, cancelled)?;
-    let spans = if let Some(analyses) = &self.analyses {
-      let snapshot = self
-        .workspace
-        .document(id)
-        .ok_or(engine::Error::UnknownDocument(id))?
-        .snapshot();
-      engine::AnalysisResults::new(
-        std::iter::once(&self.workspace).chain(analyses.entries.values()),
-      )
-      .semantic_spans(snapshot)
-      .map_err(Error::from)
-    } else {
-      self.workspace.semantic_spans(id).map_err(Error::from)
-    }?;
+    let entries: Vec<_> = self
+      .analyses
+      .iter()
+      .flat_map(|analyses| analyses.entries.values())
+      .collect();
+    let spans = self.workspace.semantic_spans_with(id, &entries)?;
     self.check_inputs(cancelled)?;
     Ok(spans)
   }

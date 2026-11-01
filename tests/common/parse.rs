@@ -1,8 +1,8 @@
 use shellsmith::interface::application::engine::{
   Analysis, AnalysisInputs, AnalysisRequest, Document, DocumentId, Error,
   ExecutionContextId, ExecutionKind, InitialEnvironment, InputQuery,
-  InputResult, Revision, Snapshot, SourceDocument, SourceInput, Value,
-  ValueIssue, Workspace,
+  InputResult, NameOccurrence, NameRelations, Revision, Snapshot,
+  SourceDocument, SourceInput, Value, ValueIssue, Workspace,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -120,4 +120,58 @@ fn analyze_document(
     .analyze(request, &mut Inputs::default(), &AtomicBool::new(false))
     .unwrap();
   (workspace, analysis)
+}
+
+pub fn name_sites_at(
+  names: &NameRelations,
+  snapshot: Snapshot,
+  offset: usize,
+) -> Vec<&NameOccurrence> {
+  let mut sites = Vec::new();
+  let mut width = usize::MAX;
+  for site in &names.occurrences {
+    let Some(location) = site.spelling.editable().filter(|location| {
+      location.snapshot == snapshot && location.bytes.contains(&offset)
+    }) else {
+      continue;
+    };
+    if location.bytes.len() < width {
+      sites.clear();
+      width = location.bytes.len();
+    }
+    if location.bytes.len() == width {
+      sites.push(site);
+    }
+  }
+  sites
+}
+
+pub fn sources(
+  workspace: &Workspace,
+  id: DocumentId,
+) -> Vec<shellsmith::interface::application::engine::SourceResolution> {
+  shellsmith::interface::application::engine::AnalysisResults::new([workspace])
+    .sources(workspace.document(id).unwrap().snapshot())
+    .unwrap()
+}
+
+pub fn values(
+  analysis: &Analysis,
+  occurrence: shellsmith::interface::application::engine::OccurrenceId,
+) -> impl Iterator<Item = (ExecutionContextId, &Value)> {
+  analysis.contexts().iter().filter_map(move |context| {
+    analysis
+      .value(occurrence, context.id)
+      .map(|value| (context.id, value))
+  })
+}
+
+pub fn references(
+  analysis: &Analysis,
+  definition: shellsmith::interface::application::engine::SymbolId,
+) -> impl Iterator<Item = &shellsmith::interface::application::engine::ResolvedUse>
+{
+  analysis
+    .uses()
+    .filter(move |site| site.resolution.candidates.contains(&definition))
 }

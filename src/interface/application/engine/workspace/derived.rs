@@ -599,6 +599,24 @@ impl Workspace {
     Ok(())
   }
 
+  /// Reverses `add_derived`; a program stays while another unit shares its body.
+  pub(super) fn discard_derived(&mut self, id: DocumentId) {
+    if let Some(unit) = self.derived.remove(&id) {
+      self.derived_keys.remove(&unit.key);
+      if !self
+        .derived
+        .values()
+        .any(|other| other.key.body == unit.key.body)
+      {
+        self.programs.remove(&unit.key.body);
+      }
+      for keys in self.derived_entries.values_mut() {
+        keys.remove(&id);
+      }
+    }
+    self.derived_entries.remove(&id);
+  }
+
   pub(super) fn prune_derived(
     &mut self,
     entry: DocumentId,

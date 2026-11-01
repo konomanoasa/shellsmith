@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::Node;
 
-use super::super::command::Redirections;
+use super::super::command::{Redirections, process_status};
 use super::super::expansion::{Expansion, Sharing};
 use super::super::{Frame, Resolver};
 use super::alternatives::{Alternatives, StateKey};
@@ -37,8 +37,7 @@ impl<'a> Resolver<'a> {
     if !env.alternatives.is_empty() {
       let target = match node.kind() {
         "simple_command" => parser::command_word(node),
-        "assignment_word" => Some(node),
-        "word" if node.child_by_field_name("name").is_some() => Some(node),
+        _ if assignment_form(node) => Some(node),
         "for_clause" => node.child_by_field_name("words"),
         "io_redirect" if !self.expansion_targets([node], frame).is_empty() => {
           Some(node)
@@ -54,9 +53,7 @@ impl<'a> Resolver<'a> {
         names.insert(StateKey::Positionals);
       }
       if env.alternatives.depends(&names) {
-        if node.kind() == "assignment_word"
-          || node.kind() == "word" && node.child_by_field_name("name").is_some()
-        {
+        if assignment_form(node) {
           match self.conditional_assignment(node, &env, frame) {
             Ok(Some(output)) => return Task::Done(Flow::next(output)),
             Ok(None) => {}
@@ -200,10 +197,7 @@ impl<'a> Resolver<'a> {
       "list" | "term" => self.list(node, env, frame),
       "and_or" => Self::short_circuit(node, env, frame),
       "pipe_sequence" => self.pipeline(node, env, frame),
-      "assignment_word" => Self::assignment(node, env, frame),
-      "word" if node.child_by_field_name("name").is_some() => {
-        Self::assignment(node, env, frame)
-      }
+      _ if assignment_form(node) => Self::assignment(node, env, frame),
       "parameter_expansion"
       | "word"
       | "cmd_name"
@@ -370,7 +364,7 @@ impl<'a> Resolver<'a> {
         state.complete_command();
       }
       let status = Value::join_all(
-        flow.environments().map(Environment::status),
+        flow.environments().map(|env| process_status(env.status())),
         ValueIssue::Dynamic,
       );
       let mut env = env;
@@ -408,11 +402,7 @@ impl<'a> Resolver<'a> {
     input.io.output = Some(Output::default());
     input.io.stdout_redirected = false;
     input.io.stderr_captured = false;
-    if env.io.stderr_captured
-      && let Some(output) = &mut env.io.output
-    {
-      output.fail(ValueIssue::Dynamic);
-    }
+    env.io.may_write_stderr();
     let task = self.recovered_sequence(node, children(node), input, inner);
     task.then(move |resolver, flow| {
       let result = flow.merged();
@@ -421,10 +411,9 @@ impl<'a> Resolver<'a> {
       let value = if let Some(result) = result {
         env.substitution_status = Some(match body {
           SubstitutionBody::Empty => Value::Literal(b"0".to_vec()),
-          SubstitutionBody::Redirections => {
-            Value::Unknown(ValueIssue::Unspecified)
+          SubstitutionBody::Redirections | SubstitutionBody::Commands => {
+            process_status(result.status())
           }
-          SubstitutionBody::Commands => result.status(),
         });
         env.io.inherit_input(&result.io, saved_input);
         trace = result.io.output.as_ref().and_then(Output::trace);
@@ -451,11 +440,7 @@ impl<'a> Resolver<'a> {
             |output| output.value(),
           );
         value.trim_newlines();
-        if matches!(body, SubstitutionBody::Redirections) {
-          Value::Unknown(ValueIssue::Unspecified)
-        } else {
-          value
-        }
+        value
       } else {
         env.io.restore_input(saved_input);
         Value::Unknown(ValueIssue::UnsupportedExpansion)
@@ -503,29 +488,6 @@ impl<'a> Resolver<'a> {
     }
   }
 
-  /// Any node may observe the others' writes to `targets`.
-  pub(in crate::interface::application::engine::analysis) fn uncertain_order(
-    &mut self,
-    node: Node<'a>,
-    nodes: Vec<Node<'a>>,
-    targets: BTreeSet<EffectTarget>,
-    mut env: Environment,
-    frame: Frame,
-  ) -> Task<'a> {
-    self.gap(node, frame, ResolutionIssue::EvaluationOrder);
-    let previous = env.order.clone();
-    let previous_input_order = env.io.input_order_unknown;
-    env.io.input_order_unknown = true;
-    env.order.extend(targets);
-    Task::sequence(nodes, env, frame).then(move |_, mut flow| {
-      for state in flow.environments_mut() {
-        state.order.clone_from(&previous);
-        state.io.input_order_unknown = previous_input_order;
-      }
-      Task::Done(flow)
-    })
-  }
-
   pub(in crate::interface::application::engine::analysis) fn read(
     &mut self,
     id: OccurrenceId,
@@ -568,7 +530,9 @@ impl<'a> Resolver<'a> {
         .and_modify(|old| merge_value(old, &value))
         .or_insert(value);
     }
-    self.record_attribute(id, frame.context, env);
+    if special {
+      self.record_attribute(id, frame.context, env);
+    }
     let variable = match &site.name {
       Value::Literal(name) if !special => Some(name.as_slice()),
       _ => None,
@@ -584,15 +548,6 @@ impl<'a> Resolver<'a> {
     function: bool,
     value: Value,
   ) -> bool {
-    if !function
-      && let Some(id) = self.site(node, frame)
-      && self
-        .workspace
-        .occurrence(id)
-        .is_some_and(|site| site.kind != OccurrenceKind::DeclarationAssignment)
-    {
-      self.record_attribute(id, frame.context, env);
-    }
     let symbol = self
       .site(node, frame)
       .and_then(|id| self.index.defined_symbol(id))
@@ -600,9 +555,8 @@ impl<'a> Resolver<'a> {
     if let Some(symbol) = symbol {
       self.result.writes.insert((symbol.id, frame.context));
       if function {
-        env.alternatives.forget_function(&symbol.name);
-        env.functions.values.insert(
-          symbol.name.clone(),
+        env.replace_function(
+          &symbol.name,
           Binding {
             resolution: definition(symbol.id),
             value: Arc::new(value),
@@ -619,6 +573,13 @@ impl<'a> Resolver<'a> {
         None => {}
       }
       env.assign(&symbol.name, definition(symbol.id), value);
+      if let Some(id) = self.site(node, frame)
+        && self.workspace.occurrence(id).is_some_and(|site| {
+          site.kind != OccurrenceKind::DeclarationAssignment
+        })
+      {
+        self.record_attribute(id, frame.context, env);
+      }
       if let Some(previous) = previous {
         self.record_use(
           UseSite::Syntax(symbol.definition),
@@ -648,68 +609,84 @@ impl<'a> Resolver<'a> {
   }
 
   fn assignment(node: Node<'a>, env: Environment, frame: Frame) -> Task<'a> {
-    let task = if let Some(value) = node.child_by_field_name("value") {
-      Task::expand(value, false, env, frame)
-    } else {
-      Task::expanded(Expansion {
+    Self::assignment_value(node, env, frame).then_word(
+      move |resolver, result| resolver.assign_value(node, result, frame),
+    )
+  }
+
+  pub(in crate::interface::application::engine::analysis) fn assignment_value(
+    node: Node<'a>,
+    env: Environment,
+    frame: Frame,
+  ) -> Task<'a> {
+    match node.child_by_field_name("value") {
+      Some(value) => Task::expand(value, false, env, frame),
+      None => Task::expanded(Expansion {
         expression: None,
         word: Word::default(),
         env,
-      })
-    };
-    task.then_word(move |resolver, mut result| {
-      let value = match resolver.fields(
-        node,
-        &result.word,
-        &result.env,
-        frame,
-        WordContext::Assignment,
-      ) {
-        Ok(fields) => {
-          fields.into_iter().next().expect("assignment field").value()
-        }
-        Err(issue) => Value::Unknown(issue),
-      };
-      if let Some(name) = node.child_by_field_name("name") {
-        let expression = result
-          .expression
-          .filter(|_| !matches!(value, Value::Unknown(_)));
-        let value = if let Some(id) = expression {
-          match result
-            .env
-            .alternatives
-            .expressions()
-            .projected(id, resolver.cancelled)
-          {
-            Ok(value) => value.as_ref().clone(),
-            Err(error) => {
-              resolver.error = Some(error);
-              return Task::Done(Flow::default());
-            }
-          }
-        } else {
-          value
-        };
-        if resolver.write(name, &mut result.env, frame, false, value)
-          && let Some(id) = expression
-        {
-          let name = crate::interface::application::engine::word::lexical(
-            name,
-            resolver.workspace.source(frame.snapshot.document),
-          );
-          let resolution = result.env.variables.get(&name).resolution.clone();
-          result.env.alternatives.store(&name, id, resolution);
-        }
+      }),
+    }
+  }
+
+  pub(in crate::interface::application::engine::analysis) fn assign_value(
+    &mut self,
+    node: Node<'a>,
+    mut result: Expansion,
+    frame: Frame,
+  ) -> Task<'a> {
+    let value = match self.fields(
+      node,
+      &result.word,
+      &result.env,
+      frame,
+      WordContext::Assignment,
+    ) {
+      Ok(fields) => {
+        fields.into_iter().next().expect("assignment field").value()
       }
-      Task::Done(Flow::next(result.env))
-    })
+      Err(issue) => Value::Unknown(issue),
+    };
+    if let Some(name) = node.child_by_field_name("name") {
+      let expression = result
+        .expression
+        .filter(|_| !matches!(value, Value::Unknown(_)));
+      let value = if let Some(id) = expression {
+        match result
+          .env
+          .alternatives
+          .expressions()
+          .projected(id, self.cancelled)
+        {
+          Ok(value) => value.as_ref().clone(),
+          Err(error) => {
+            self.error = Some(error);
+            return Task::Done(Flow::default());
+          }
+        }
+      } else {
+        value
+      };
+      if self.write(name, &mut result.env, frame, false, value)
+        && let Some(id) = expression
+      {
+        let name = crate::interface::application::engine::word::lexical(
+          name,
+          self.workspace.source(frame.snapshot.document),
+        );
+        let resolution = result.env.variables.get(&name).resolution.clone();
+        result.env.alternatives.store(&name, id, resolution);
+      }
+    }
+    Task::Done(Flow::next(result.env))
   }
 }
 
 struct PipelineState {
   input: Environment,
   output: Environment,
-  transfers: Flow,
+  /// The status of the rightmost failed stage so far, or zero.
+  failed: Value,
 }
 
 struct LoopState<'a> {
@@ -723,8 +700,22 @@ struct LoopState<'a> {
   value: Value,
 }
 
+impl PipelineState {
+  fn fail(&mut self, status: &Value) {
+    match status {
+      Value::Literal(bytes) if bytes == b"0" => {}
+      Value::Literal(_) => self.failed.clone_from(status),
+      Value::Unknown(_) | Value::Partial(_) => self.failed.join(status),
+    }
+  }
+}
+
+type CaseContinuation<'a> =
+  Box<dyn FnOnce(&mut Resolver<'a>, CaseState) -> Task<'a> + 'a>;
+
 struct CaseState {
-  unmatched: Environment,
+  subject: Value,
+  unmatched: Option<Environment>,
   fallthrough: Option<Environment>,
   output: Flow,
 }
@@ -861,46 +852,28 @@ impl<'a> Resolver<'a> {
     if commands.len() <= 1 {
       return Task::sequence(commands, env, frame);
     }
-    self.pipeline_sequence(node, commands, env, frame)
+    self.pipeline_sequence(commands, env, frame)
   }
 
   fn pipeline_sequence(
     &mut self,
-    node: Node<'a>,
     commands: Vec<Node<'a>>,
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    self.gap(node, frame, ResolutionIssue::PipelineEnvironment);
     let mut env = env;
     if let Some(output) = &mut env.io.output {
       output.fail(ValueIssue::UnsupportedExpansion);
     }
-    self
-      .pipeline_next(
-        commands.clone().into_iter(),
-        PipelineState {
-          input: env.clone(),
-          output: env.clone(),
-          transfers: Flow::default(),
-        },
-        frame,
-      )
-      .then(move |resolver, mut flow| {
-        let Some(next) = flow
-          .get(Transfer::Next)
-          .filter(|next| **next != env)
-          .cloned()
-        else {
-          return Task::Done(flow);
-        };
-        resolver
-          .pipeline_sequence(node, commands, next, frame)
-          .then(move |_, repeated| {
-            flow.join(repeated);
-            Task::Done(flow)
-          })
-      })
+    self.pipeline_next(
+      commands.into_iter(),
+      PipelineState {
+        input: env.clone(),
+        output: env,
+        failed: Value::Literal(b"0".to_vec()),
+      },
+      frame,
+    )
   }
 
   fn pipeline_next(
@@ -910,18 +883,29 @@ impl<'a> Resolver<'a> {
     frame: Frame,
   ) -> Task<'a> {
     let Some(command) = commands.next() else {
-      state.transfers.add(Transfer::Next, state.output);
-      return Task::Done(state.transfers);
+      return Task::Done(Flow::next(state.output));
     };
+    if parser::damaged(command) {
+      state.output = self.recover(&[command], state.output, frame);
+      state.input = self.recover(&[command], state.input, frame);
+      state.fail(&state.output.status());
+      return self.pipeline_next(commands, state, frame);
+    }
     let inner =
       self.execution(command, frame, ExecutionKind::Pipeline, frame.snapshot);
     let task = Task::eval(command, state.input.clone(), inner);
     state.input.io.connect_input(Err(ValueIssue::Dynamic));
     task.then(move |resolver, flow| {
-      for (transfer, env) in flow {
-        state.output.widen(&env);
-        if transfer != Transfer::Next {
-          state.transfers.add(transfer, env);
+      if let Some(env) = flow.merged() {
+        let mut status = process_status(env.status());
+        state.fail(&status);
+        if commands.len() == 0 {
+          match state.output.pipefail {
+            Some(false) => {}
+            Some(true) => status.clone_from(&state.failed),
+            None => status.join(&state.failed),
+          }
+          state.output.set_status(status);
         }
       }
       resolver.pipeline_next(commands, state, frame)
@@ -1053,29 +1037,38 @@ impl<'a> Resolver<'a> {
   }
 
   fn case_clause(node: Node<'a>, env: Environment, frame: Frame) -> Task<'a> {
+    let Some(subject) = node.child_by_field_name("word") else {
+      return Task::sequence(children(node), env, frame);
+    };
     let [word, items] = regions(node, ["word", "items"]);
-    Task::sequence(word, env, frame).then(move |resolver, mut output| {
-      let Some(unmatched) = output.take(Transfer::Next) else {
-        return Task::Done(output);
+    let damage = word.into_iter().filter(|child| *child != subject).collect();
+    Task::sequence(damage, env, frame).then(move |_, mut flow| {
+      let Some(env) = flow.take(Transfer::Next) else {
+        return Task::Done(flow);
       };
-      let mut pending: Vec<_> = items.into_iter().rev().collect();
-      let mut items = Vec::new();
-      while let Some(item) = pending.pop() {
-        if matches!(item.kind(), "case_list" | "case_list_ns") {
-          let [terminated, item] = regions(item, ["terminated", "item"]);
-          pending.extend(terminated.into_iter().chain(item).rev());
-        } else {
-          items.push(item);
-        }
-      }
-      resolver.case_next(
-        items.into_iter(),
-        CaseState {
-          unmatched,
-          fallthrough: None,
-          output,
+      Task::expand(subject, false, env, frame).then_word(
+        move |resolver, expanded| {
+          let mut pending: Vec<_> = items.into_iter().rev().collect();
+          let mut items = Vec::new();
+          while let Some(item) = pending.pop() {
+            if matches!(item.kind(), "case_list" | "case_list_ns") {
+              let [terminated, item] = regions(item, ["terminated", "item"]);
+              pending.extend(terminated.into_iter().chain(item).rev());
+            } else {
+              items.push(item);
+            }
+          }
+          resolver.case_next(
+            items.into_iter(),
+            CaseState {
+              subject: expanded.word.scalar(),
+              unmatched: Some(expanded.env),
+              fallthrough: None,
+              output: flow,
+            },
+            frame,
+          )
         },
-        frame,
       )
     })
   }
@@ -1104,85 +1097,113 @@ impl<'a> Resolver<'a> {
       if let Some(env) = state.fallthrough {
         state.output.add(Transfer::Next, env);
       }
-      state.unmatched.set_status(Value::Literal(b"0".to_vec()));
-      state.output.add(Transfer::Next, state.unmatched);
+      if let Some(mut env) = state.unmatched {
+        env.set_status(Value::Literal(b"0".to_vec()));
+        state.output.add(Transfer::Next, env);
+      }
       return Task::Done(state.output);
     };
     if !matches!(item.kind(), "case_item" | "case_item_ns") {
-      // Damaged syntax between clauses runs on the paths that reach it.
-      state.unmatched = self.recover(&[item], state.unmatched, frame);
+      state.unmatched =
+        state.unmatched.map(|env| self.recover(&[item], env, frame));
       state.fallthrough = state
         .fallthrough
         .map(|env| self.recover(&[item], env, frame));
       return self.case_next(items, state, frame);
     }
-    let patterns: Vec<_> =
-      item.child_by_field_name("patterns").into_iter().collect();
-    // Clause patterns expand in an unspecified order until one matches.
-    let unordered = patterns.first().is_some_and(|patterns| {
-      patterns
-        .children_by_field_name("word", &mut patterns.walk())
-        .nth(1)
-        .is_some()
-    });
-    let affected = if unordered {
-      self.expansion_targets(patterns.iter().copied(), frame)
-    } else {
-      BTreeSet::new()
-    };
-    let expanded = if unordered
-      && (!affected.is_empty() || state.unmatched.io.input.is_ok())
-    {
-      self.uncertain_order(
-        item,
-        patterns,
-        affected.clone(),
-        state.unmatched.clone(),
-        frame,
-      )
-    } else {
-      Task::sequence(patterns, state.unmatched.clone(), frame)
-    };
-    expanded.then(move |resolver, mut patterns| {
-      let input = patterns.take(Transfer::Next);
-      state.output.join(patterns);
-      let Some(mut input) = input else {
-        return resolver.case_next(items, state, frame);
-      };
-      resolver.invalidate(
-        item,
-        &mut input,
-        frame,
-        ResolutionIssue::EvaluationOrder,
-        ValueIssue::Dynamic,
-        affected,
-      );
-      state.unmatched = input.clone();
-      if let Some(previous) = state.fallthrough.take() {
-        input.join(&previous);
-      }
-      let body = item.child_by_field_name("body");
-      let fallthrough = item
-        .child_by_field_name("terminator")
-        .is_some_and(|end| end.kind() == "semi_and");
-      if body.is_none() && (!fallthrough || items.len() == 0) {
-        input.set_status(Value::Literal(b"0".to_vec()));
-      }
-      let [patterns, body] = regions(item, ["patterns", "body"]);
-      let nodes = patterns
-        .into_iter()
-        .filter(|child| Some(*child) != item.child_by_field_name("patterns"))
-        .chain(body)
-        .collect();
-      Task::sequence(nodes, input, frame).then(move |resolver, mut body| {
-        if fallthrough {
-          state.fallthrough = body.take(Transfer::Next);
+    let patterns = item
+      .child_by_field_name("patterns")
+      .map_or_else(Vec::new, |patterns| regions(patterns, ["word"])[0].clone());
+    self.case_patterns(
+      patterns.into_iter(),
+      state,
+      frame,
+      Box::new(move |resolver, mut state| {
+        let Some(input) = state.fallthrough.take() else {
+          return resolver.case_next(items, state, frame);
+        };
+        let fallthrough = item
+          .child_by_field_name("terminator")
+          .is_some_and(|end| end.kind() == "semi_and");
+        let body = item.child_by_field_name("body");
+        let mut input = input;
+        if body.is_none() && (!fallthrough || items.len() == 0) {
+          input.set_status(Value::Literal(b"0".to_vec()));
         }
-        state.output.join(body);
-        resolver.case_next(items, state, frame)
-      })
-    })
+        let [patterns, body] = regions(item, ["patterns", "body"]);
+        let nodes = patterns
+          .into_iter()
+          .filter(|child| Some(*child) != item.child_by_field_name("patterns"))
+          .chain(body)
+          .collect();
+        Task::sequence(nodes, input, frame).then(move |resolver, mut body| {
+          if fallthrough {
+            state.fallthrough = body.take(Transfer::Next);
+          }
+          state.output.join(body);
+          resolver.case_next(items, state, frame)
+        })
+      }),
+    )
   }
+
+  fn case_patterns(
+    &mut self,
+    mut patterns: std::vec::IntoIter<Node<'a>>,
+    mut state: CaseState,
+    frame: Frame,
+    complete: CaseContinuation<'a>,
+  ) -> Task<'a> {
+    let Some(pattern) = patterns.next() else {
+      return complete(self, state);
+    };
+    let Some(env) = state.unmatched.take() else {
+      return complete(self, state);
+    };
+    if parser::damaged(pattern) {
+      state.unmatched = Some(self.recover(&[pattern], env, frame));
+      return self.case_patterns(patterns, state, frame, complete);
+    }
+    Task::expand(pattern, false, env, frame).then_word(
+      move |resolver, expanded| {
+        let utf8 = resolver.utf8(&expanded.env);
+        let matches = state
+          .subject
+          .literal()
+          .ok()
+          .and_then(|bytes| {
+            crate::interface::application::engine::word::characters(bytes, utf8)
+              .ok()
+          })
+          .and_then(|text| {
+            crate::interface::application::engine::word::Pattern::word(
+              &expanded.word,
+              utf8,
+              expanded.env.portable_collation(),
+            )
+            .ok()
+            .map(|pattern| pattern.matches(&text, resolver.cancelled))
+          });
+        if matches != Some(false) {
+          if let Some(matched) = &mut state.fallthrough {
+            matched.join(&expanded.env);
+          } else {
+            state.fallthrough = Some(expanded.env.clone());
+          }
+        }
+        if matches != Some(true) {
+          state.unmatched = Some(expanded.env);
+        }
+        resolver.case_patterns(patterns, state, frame, complete)
+      },
+    )
+  }
+}
+
+/// Assignment words, including declaration operands in assignment form.
+fn assignment_form(node: Node<'_>) -> bool {
+  node.kind() == "assignment_word"
+    || node.kind() == "word" && node.child_by_field_name("name").is_some()
 }
 
 fn loop_transfers(flow: Flow, next: &mut Environment, output: &mut Flow) {

@@ -1,7 +1,7 @@
 use super::encoding::{
-  MODIFIERS, OpenDocument, Positions, SymbolFormat, TYPES, document_offset,
-  document_source, document_symbols, encode, fault, file_path, invalid,
-  locations, symbols, uri, workspace_edit,
+  OpenDocument, SymbolFormat, document_links, document_offset,
+  document_symbols, fault, file_path, invalid, legend, locations, rename_range,
+  semantic_tokens, symbols, workspace_edit,
 };
 use crate::interface::application::engine::DocumentId;
 use crate::interface::application::{
@@ -105,28 +105,7 @@ impl Server {
           )
         ) && capability.formats.contains(&lsp::TokenFormat::RELATIVE)
       })
-      .map(|capability| lsp::SemanticTokensLegend {
-        token_types: TYPES
-          .iter()
-          .filter(|name| {
-            capability
-              .token_types
-              .iter()
-              .any(|kind| kind.as_str() == **name)
-          })
-          .map(|name| lsp::SemanticTokenType::new(name))
-          .collect(),
-        token_modifiers: MODIFIERS
-          .iter()
-          .filter(|name| {
-            capability
-              .token_modifiers
-              .iter()
-              .any(|kind| kind.as_str() == **name)
-          })
-          .map(|name| lsp::SemanticTokenModifier::new(name))
-          .collect(),
-      });
+      .map(|capability| legend(&capability));
     Ok(lsp::InitializeResult {
       capabilities: self.capabilities(),
       server_info: Some(lsp::ServerInfo {
@@ -469,12 +448,7 @@ impl Server {
       RequestScope::Analysis,
       move |application, id, cancelled| {
         let spans = application.classify(id, cancelled)?;
-        Ok(Some(lsp::SemanticTokensResult::Tokens(
-          lsp::SemanticTokens {
-            result_id: None,
-            data: encode(document_source(application, id)?, &spans, &legend),
-          },
-        )))
+        semantic_tokens(application, id, &spans, &legend).map(Some)
       },
     )
   }
@@ -528,15 +502,10 @@ impl Server {
     params: &lsp::TextDocumentPositionParams,
   ) -> Reply<Option<lsp::PrepareRenameResponse>> {
     self.name_query(params, |application, path, offset, cancelled| {
-      let Some(target) = application.prepare_rename(path, offset, cancelled)?
-      else {
-        return Ok(None);
-      };
-      let range = Positions::new(application).result_range(&target.location)?;
-      Ok(Some(lsp::PrepareRenameResponse::RangeWithPlaceholder {
-        range,
-        placeholder: target.placeholder,
-      }))
+      application
+        .prepare_rename(path, offset, cancelled)?
+        .map(|target| rename_range(application, target))
+        .transpose()
     })
   }
 
@@ -566,19 +535,7 @@ impl Server {
       RequestScope::Results,
       move |application, id, cancelled| {
         let links = application.document_links(id, cancelled)?;
-        let mut positions = Positions::new(application);
-        links
-          .into_iter()
-          .map(|(location, path)| {
-            Ok(lsp::DocumentLink {
-              range: positions.result_range(&location)?,
-              target: Some(uri(application, &opened, &path)?),
-              tooltip: None,
-              data: None,
-            })
-          })
-          .collect::<Result<Vec<_>, Error>>()
-          .map(Some)
+        document_links(application, &opened, links).map(Some)
       },
     )
   }

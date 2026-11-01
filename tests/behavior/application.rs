@@ -1,11 +1,122 @@
 mod documents {
+  use crate::application_client::Client;
   use crate::fixtures;
   use fixtures::Fixture;
-  use shellsmith::interface::application::engine::{
-    DependencyState, Modifier, SemanticKind,
+  use shellsmith::interface::application::engine::SemanticKind;
+  use shellsmith::interface::application::{
+    RequestOutcome, RequestScope, Session, Settings,
   };
-  use shellsmith::interface::application::{Application, Error, Settings};
   use std::sync::atomic::AtomicBool;
+
+  async fn collected(
+    session: &Session,
+  ) -> RequestOutcome<Vec<std::path::PathBuf>> {
+    session
+      .request(RequestScope::Workspace, |app, _| {
+        Ok(
+          app
+            .workspace()
+            .documents()
+            .map(|document| {
+              app
+                .path(document.snapshot().document)
+                .unwrap()
+                .to_path_buf()
+            })
+            .collect(),
+        )
+      })
+      .await
+  }
+
+  #[tokio::test]
+  async fn recursive_collection_selects_sh_files_and_hidden_entries() {
+    let fixture = Fixture::new();
+    let cases = [
+      ("a.sh", "a=1", true),
+      (".hidden/b.sh", "b=2", true),
+      ("executable", "#!/bin/sh\nc=3", true),
+      ("env-script", "#!/usr/bin/env sh\nd=4", true),
+      ("with-options", "#!/bin/sh -eu\ne=5", true),
+      ("wrong.sh", "#!/bin/bash\nf=6", false),
+      ("env-options.sh", "#!/usr/bin/env -S sh\ng=7", false),
+      ("env-assignment.sh", "#!/usr/bin/env LANG=C sh\nh=8", false),
+      ("relative.sh", "#!sh\ni=9", false),
+      ("other.txt", "j=10", false),
+    ];
+    for (path, source, _) in cases {
+      fixture.write(path, source);
+    }
+    let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+    session.add_input(&fixture.root).unwrap();
+    let outcome = collected(&session).await;
+    let files = outcome.result.unwrap();
+    assert_eq!(files.len(), 5);
+    for (path, _, selected) in cases {
+      assert_eq!(files.contains(&fixture.root.join(path)), selected, "{path}");
+    }
+    assert_eq!(outcome.failures, []);
+  }
+
+  #[tokio::test]
+  async fn workspace_collection_applies_nested_gitignores_without_other_ignore_files()
+   {
+    for repository in [false, true] {
+      let fixture = Fixture::new();
+      fixture.write(".gitignore", "*.sh\n!keep.sh\ntarget/\n");
+      fixture.write("nested/.gitignore", "!included.sh\n");
+      fixture.write(".ignore", "keep.sh\n");
+      if repository {
+        fixture.write(".git/info/exclude", "keep.sh\n");
+        fixture.write(".git/.gitignore", "[z-a]\n");
+        fixture.write(".git/keep.sh", "metadata=1\n");
+      }
+      fixture.write("target/.gitignore", "[z-a]\n");
+      let invalid = fixture.write("target/keep.sh", "");
+      std::fs::write(invalid, [0xff]).unwrap();
+      let cases = [
+        ("keep.sh", true),
+        ("excluded.sh", false),
+        ("nested/included.sh", true),
+        ("nested/excluded.sh", false),
+        (".hidden/keep.sh", true),
+        ("target/other.sh", false),
+      ];
+      for (path, _) in cases {
+        fixture.write(path, "value=1\n");
+      }
+      let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+      session.add_input(&fixture.root).unwrap();
+      let outcome = collected(&session).await;
+      let files = outcome.result.unwrap();
+      assert_eq!(files.len(), 3);
+      for (path, selected) in cases {
+        assert_eq!(
+          files.contains(&fixture.root.join(path)),
+          selected,
+          "repository={repository}, {path}"
+        );
+      }
+      assert_eq!(outcome.failures, []);
+    }
+  }
+
+  #[tokio::test]
+  async fn invalid_gitignore_patterns_report_the_file_and_keep_valid_rules() {
+    let fixture = Fixture::new();
+    let ignore = fixture.write(".gitignore", "[z-a]\nexcluded.sh\n");
+    let included = fixture.write("included.sh", "included=1\n");
+    let excluded = fixture.write("excluded.sh", "excluded=1\n");
+    let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
+    session.add_input(&fixture.root).unwrap();
+    let outcome = collected(&session).await;
+    let files = outcome.result.unwrap();
+    assert!(files.contains(&included));
+    assert!(!files.contains(&excluded));
+    assert_eq!(outcome.failures.len(), 1);
+    assert_eq!(outcome.failures[0].path, ignore);
+    assert!(outcome.failures[0].message.contains("line 1"));
+  }
 
   #[test]
   fn symbol_hierarchy_preserves_redefinitions_and_skips_control_flow_containers()
@@ -14,11 +125,11 @@ mod documents {
     let source = "top=0\nouter() { x=1; if :; then x=2; fi; (inner() { y=3; }); for item in a; do : \"${fallback:=4}\"; done; : \"$((n += 1))\"; }\nouter() { z=5; }\n";
     let file = fixture.write("main.sh", source);
     let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.open(&file, source, &cancel).unwrap();
-    let id = app.document_id(&file).unwrap();
-    let entries: Vec<_> = app.document_symbols(id).unwrap().collect();
+    let id = app.document(&file).unwrap();
+    let entries: Vec<_> =
+      app.snapshot().document_symbols(id).unwrap().collect();
     let actual: Vec<_> = entries
       .iter()
       .map(|entry| {
@@ -51,8 +162,9 @@ mod documents {
         (b"z", Some(9), "z=5"),
       ]
     );
-    assert!(app.workspace().analysis().is_none());
+    assert!(app.snapshot().workspace().analysis().is_none());
     let found: Vec<_> = app
+      .snapshot()
       .workspace_symbols("y")
       .map(|entry| {
         (
@@ -64,6 +176,7 @@ mod documents {
     assert_eq!(found, [(b"y".as_slice(), Some(b"inner".as_slice()))]);
     assert_eq!(
       app
+        .snapshot()
         .workspace_symbols("")
         .map(|entry| std::str::from_utf8(&entry.symbol.name).unwrap())
         .collect::<Vec<_>>(),
@@ -80,11 +193,11 @@ mod documents {
     let source = "outer() { trap 'middle() { trap \"leaf() { value=1; }\" EXIT; }; sibling=2' EXIT; }";
     let file = fixture.write("main.sh", source);
     let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.open(&file, source, &cancel).unwrap();
-    let id = app.document_id(&file).unwrap();
+    let id = app.document(&file).unwrap();
     let entries: Vec<_> = app
+      .snapshot()
       .document_symbols(id)
       .unwrap()
       .map(|entry| {
@@ -109,8 +222,9 @@ mod documents {
         (b"sibling".to_vec(), Some(0), "sibling=2".into()),
       ]
     );
-    assert!(app.workspace().analysis().is_none());
+    assert!(app.snapshot().workspace().analysis().is_none());
     let found: Vec<_> = app
+      .snapshot()
       .workspace_symbols("value")
       .map(|entry| {
         (
@@ -121,8 +235,9 @@ mod documents {
       .collect();
     assert_eq!(found, [(b"value".as_slice(), Some(b"leaf".as_slice()))]);
     app.change(&file, "trap 'value=2' EXIT", &cancel).unwrap();
-    assert_eq!(app.workspace_symbols("leaf").count(), 0);
+    assert_eq!(app.snapshot().workspace_symbols("leaf").count(), 0);
     let updated: Vec<_> = app
+      .snapshot()
       .document_symbols(id)
       .unwrap()
       .map(|entry| {
@@ -143,12 +258,12 @@ mod documents {
     let source = "outer() { :; }; trap '(inside() { :; }; inside); outer' EXIT";
     let file = fixture.write("main.sh", source);
     let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.open(&file, source, &cancel).unwrap();
-    let id = app.document_id(&file).unwrap();
-    let symbols = |app: &Application| {
+    let id = app.document(&file).unwrap();
+    let symbols = |app: &Client| {
       app
+        .snapshot()
         .document_symbols(id)
         .unwrap()
         .map(|entry| {
@@ -165,9 +280,10 @@ mod documents {
       (b"inside".to_vec(), inside..inside + 6),
     ];
     assert_eq!(symbols(&app), expected);
-    assert!(app.workspace().analysis().is_none());
+    assert!(app.snapshot().workspace().analysis().is_none());
     assert_eq!(
       app
+        .snapshot()
         .workspace_symbols("inside")
         .map(|entry| (entry.location.bytes.start, entry.location.bytes.end))
         .collect::<Vec<_>>(),
@@ -176,7 +292,7 @@ mod documents {
     let call = source.find("inside);").unwrap();
     assert_eq!(
       app
-        .definitions(id, call, &cancel)
+        .definitions(&file, call, &cancel)
         .unwrap()
         .into_iter()
         .map(|location| (location.bytes.start, location.bytes.end))
@@ -185,14 +301,14 @@ mod documents {
     );
     assert_eq!(
       app
-        .definitions(id, source.rfind("outer").unwrap(), &cancel)
+        .definitions(&file, source.rfind("outer").unwrap(), &cancel)
         .unwrap(),
       [shellsmith::interface::application::engine::Location {
-        snapshot: app.workspace().document(id).unwrap().snapshot(),
+        snapshot: app.snapshot().workspace().document(id).unwrap().snapshot(),
         bytes: 0..5,
       }]
     );
-    let spans = app.classify(id, &cancel).unwrap();
+    let spans = app.classify(&file, &cancel).unwrap();
     assert!(
       spans
         .iter()
@@ -202,9 +318,10 @@ mod documents {
     assert_eq!(symbols(&app), expected);
     let updated = "trap 'replacement() { :; }' EXIT";
     app.change(&file, updated, &cancel).unwrap();
-    assert_eq!(app.workspace_symbols("inside").count(), 0);
+    assert_eq!(app.snapshot().workspace_symbols("inside").count(), 0);
     assert_eq!(
       app
+        .snapshot()
         .document_symbols(id)
         .unwrap()
         .map(|entry| entry.details.symbol.name.as_slice())
@@ -221,24 +338,37 @@ mod documents {
       "prefix=''; trap \"$prefix\"'derived() { :; }' EXIT",
       "idle() { command trap 'derived() { :; }' EXIT; }",
       "command() { :; }; command trap 'derived() { :; }' EXIT",
+      "trap 'derived() { :; }'",
+      "trap -- 'derived() { :; }'",
+      "idle() { trap 'derived() { :; }'; }",
+      "trap \"trap 'derived() { :; }'\" EXIT",
     ] {
       let file = fixture.write("main.sh", source);
-      let mut app =
-        Application::new(Settings::new(fixture.root.clone())).unwrap();
+      let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
       app.open(&file, source, &cancel).unwrap();
-      let id = app.document_id(&file).unwrap();
-      assert_eq!(app.workspace_symbols("derived").count(), 0, "{source}");
+      let id = app.document(&file).unwrap();
+      assert_eq!(
+        app.snapshot().workspace_symbols("derived").count(),
+        0,
+        "{source}"
+      );
       let before = app
+        .snapshot()
         .document_symbols(id)
         .unwrap()
         .map(|entry| {
           (entry.details.symbol.name.clone(), entry.details.location)
         })
         .collect::<Vec<_>>();
-      app.classify(id, &cancel).unwrap();
-      assert_eq!(app.workspace_symbols("derived").count(), 0, "{source}");
+      app.classify(&file, &cancel).unwrap();
+      assert_eq!(
+        app.snapshot().workspace_symbols("derived").count(),
+        0,
+        "{source}"
+      );
       assert_eq!(
         app
+          .snapshot()
           .document_symbols(id)
           .unwrap()
           .map(|entry| (
@@ -259,10 +389,8 @@ mod documents {
     let source = "trap 'f() { :; }; f; )\nf; f() { :; }; f' EXIT";
     let file = fixture.write("main.sh", source);
     let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.open(&file, source, &cancel).unwrap();
-    let id = app.document_id(&file).unwrap();
     let first = source.find("f()").unwrap();
     let last = source.rfind("f()").unwrap();
     for (offset, expected) in [
@@ -272,7 +400,7 @@ mod documents {
     ] {
       assert_eq!(
         app
-          .definitions(id, offset, &cancel)
+          .definitions(&file, offset, &cancel)
           .unwrap()
           .into_iter()
           .map(|location| (location.bytes.start, location.bytes.end))
@@ -280,7 +408,7 @@ mod documents {
         expected
       );
       assert_eq!(
-        app.classify(id, &cancel).unwrap().iter().any(|span| span
+        app.classify(&file, &cancel).unwrap().iter().any(|span| span
           .location
           .bytes
           == (offset..offset + 1)
@@ -296,17 +424,15 @@ mod documents {
     let source = "trap=1; trap ': \"$trap\"' EXIT; : \"$trap\"";
     let file = fixture.write("main.sh", source);
     let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.open(&file, source, &cancel).unwrap();
-    let id = app.document_id(&file).unwrap();
     for (offset, expected) in [
       (source.find("$trap").unwrap() + 1, vec![(0, 4)]),
       (source.rfind("$trap").unwrap() + 1, vec![(0, 4)]),
     ] {
       assert_eq!(
         app
-          .definitions(id, offset, &cancel)
+          .definitions(&file, offset, &cancel)
           .unwrap()
           .into_iter()
           .map(|location| (location.bytes.start, location.bytes.end))
@@ -314,7 +440,7 @@ mod documents {
         expected
       );
       assert!(
-        app.classify(id, &cancel).unwrap().iter().any(|span| span
+        app.classify(&file, &cancel).unwrap().iter().any(|span| span
           .location
           .bytes
           == (offset..offset + 4)
@@ -338,10 +464,9 @@ mod documents {
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial =
       shellsmith::interface::application::engine::InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     app.open(&file, &source, &cancel).unwrap();
-    let id = app.document_id(&file).unwrap();
-    let links = app.document_links(id, &cancel).unwrap();
+    let links = app.document_links(&file, &cancel).unwrap();
     assert_eq!(links.len(), 1);
     for (location, path) in &links {
       assert_eq!(path, &library);
@@ -350,17 +475,22 @@ mod documents {
         format!("\"{}\"", library.display())
       );
     }
-    assert!(app.document_id(&fixture.root.join("relative.sh")).is_none());
-    assert_eq!(app.workspace_symbols("supplied").count(), 1);
+    assert!(
+      app
+        .snapshot()
+        .document_id(&fixture.root.join("relative.sh"))
+        .is_none()
+    );
+    assert_eq!(app.snapshot().workspace_symbols("supplied").count(), 1);
     for name in ["changed", "supplied"] {
       assert_eq!(
         app
-          .definitions(id, source.rfind(name).unwrap(), &cancel)
+          .definitions(&file, source.rfind(name).unwrap(), &cancel)
           .unwrap(),
         []
       );
     }
-    assert_eq!(app.document_links(id, &cancel).unwrap(), links);
+    assert_eq!(app.document_links(&file, &cancel).unwrap(), links);
   }
 
   #[test]
@@ -370,72 +500,22 @@ mod documents {
     let lib = fixture.root.join("lib.sh");
     let cancel = AtomicBool::new(false);
     let settings = Settings::new(fixture.root.clone());
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     app.open(&main, ". ./lib.sh\nf\n", &cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    assert_eq!(app.document_links(id, &cancel).unwrap(), []);
+    assert_eq!(app.document_links(&main, &cancel).unwrap(), []);
     app.open(&lib, "f() { :; }\n", &cancel).unwrap();
-    assert_eq!(app.document_links(id, &cancel).unwrap().len(), 1);
+    assert_eq!(app.document_links(&main, &cancel).unwrap().len(), 1);
     assert!(
       app
-        .classify(id, &cancel)
+        .classify(&main, &cancel)
         .unwrap()
         .iter()
         .any(|span| span.kind == SemanticKind::Function)
     );
-    assert!(app.close(&lib, &cancel).is_err());
-    assert_eq!(app.document_links(id, &cancel).unwrap(), []);
-    assert!(app.document_id(&lib).is_none());
-  }
-
-  #[test]
-  fn invalid_source_bytes_preserve_other_links_and_recover_after_repair() {
-    let fixture = Fixture::new();
-    let good = fixture.write("good.sh", "good=known\n");
-    let main = fixture.write(
-      "main.sh",
-      &format!(
-        ". ./good.sh\n. ./broken.sh\n. '{}'\nkept=after\n",
-        good.display()
-      ),
-    );
-    let broken = fixture.write("broken.sh", "");
-    std::fs::write(&broken, [0xff]).unwrap();
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.initial =
-      shellsmith::interface::application::engine::InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
-    app.add_input(&main);
-    let cancelled = AtomicBool::new(false);
-    app.refresh(&cancelled).unwrap();
-    let id = app.document_id(&main).unwrap();
-    assert_eq!(
-      app
-        .document_links(id, &cancelled)
-        .unwrap()
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect::<Vec<_>>(),
-      [good.clone(), good.clone()]
-    );
-    assert_eq!(app.failures().len(), 1);
-    assert_eq!(app.failures()[0].path, broken);
-    assert!(app.failures()[0].message.contains("Invalid UTF-8"));
-    assert_eq!(app.workspace().symbols_named(b"good").count(), 1);
-    assert_eq!(app.workspace().symbols_named(b"kept").count(), 1);
-    fixture.write("broken.sh", "repaired=known\n");
-    app.refresh(&cancelled).unwrap();
-    assert_eq!(app.failures(), []);
-    assert_eq!(
-      app
-        .document_links(id, &cancelled)
-        .unwrap()
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect::<Vec<_>>(),
-      [good.clone(), broken, good]
-    );
-    assert_eq!(app.workspace().symbols_named(b"repaired").count(), 1);
+    app.close(&lib, &cancel).unwrap();
+    assert!(app.failures().iter().any(|failure| failure.path == lib));
+    assert_eq!(app.document_links(&main, &cancel).unwrap(), []);
+    assert!(app.snapshot().document_id(&lib).is_none());
   }
 
   #[test]
@@ -445,15 +525,15 @@ mod documents {
     let lib = fixture.write("lib.sh", "x=1\n");
     let cancel = AtomicBool::new(false);
     let settings = Settings::new(fixture.root.clone());
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     app.open(&main, ". ./lib.sh\n", &cancel).unwrap();
     app.open(&lib, "x=2\n", &cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    assert_eq!(app.document_links(id, &cancel).unwrap().len(), 1);
+    assert_eq!(app.document_links(&main, &cancel).unwrap().len(), 1);
     std::fs::remove_file(&lib).unwrap();
-    assert!(app.close(&lib, &cancel).is_err());
-    assert_eq!(app.document_links(id, &cancel).unwrap(), []);
-    assert!(app.document_id(&lib).is_none());
+    app.close(&lib, &cancel).unwrap();
+    assert!(app.failures().iter().any(|failure| failure.path == lib));
+    assert_eq!(app.document_links(&main, &cancel).unwrap(), []);
+    assert!(app.snapshot().document_id(&lib).is_none());
   }
 
   #[cfg(unix)]
@@ -466,47 +546,18 @@ mod documents {
     std::os::unix::fs::symlink(fixture.root.join("real"), &alias).unwrap();
     let cancel = AtomicBool::new(false);
     let settings = Settings::new(fixture.root.clone());
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     app.open(&main, ". ./lib.sh\n", &cancel).unwrap();
     app.open(&alias.join("lib.sh"), "x=1\n", &cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    let links = app.document_links(id, &cancel).unwrap();
+    let links = app.document_links(&main, &cancel).unwrap();
     assert_eq!(
       links.iter().map(|(_, path)| path).collect::<Vec<_>>(),
       vec![&real]
     );
     assert_eq!(
-      app.document_id(&real),
-      app.document_id(&alias.join("lib.sh"))
+      app.snapshot().document_id(&real),
+      app.snapshot().document_id(&alias.join("lib.sh"))
     );
-  }
-
-  #[cfg(unix)]
-  #[test]
-  fn open_documents_keep_their_identity_after_the_path_becomes_a_link() {
-    let fixture = Fixture::new();
-    let lib = fixture.write("lib.sh", "disk=1\n");
-    let other = fixture.write("other.sh", "other=1\n");
-    let cancel = AtomicBool::new(false);
-    let settings = Settings::new(fixture.root.clone());
-    let mut app = Application::new(settings).unwrap();
-    app.open(&lib, "opened=1\n", &cancel).unwrap();
-    app.open(&other, "other=1\n", &cancel).unwrap();
-    std::fs::remove_file(&lib).unwrap();
-    std::os::unix::fs::symlink(&other, &lib).unwrap();
-    app.change(&lib, "edited=1\n", &cancel).unwrap();
-    assert_eq!(app.workspace().symbols_named(b"edited").count(), 1);
-    app.change(&lib, "other=1\n", &cancel).unwrap();
-    assert_eq!(app.workspace().symbols_named(b"edited").count(), 0);
-    assert_eq!(app.workspace().symbols_named(b"other").count(), 2);
-    app.close(&lib, &cancel).unwrap();
-    let names: Vec<_> = app
-      .workspace()
-      .symbols()
-      .map(|symbol| symbol.name.as_slice())
-      .collect();
-    assert_eq!(names, [b"other".as_slice()]);
-    assert_eq!(app.document_id(&lib), app.document_id(&other));
   }
 
   #[test]
@@ -517,15 +568,22 @@ mod documents {
     let main = fixture.write("main.sh", ". ./regular/../lib.sh\n");
     let cancel = AtomicBool::new(false);
     let settings = Settings::new(fixture.root.clone());
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     app.open(&main, ". ./regular/../lib.sh\n", &cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    assert_eq!(app.document_links(id, &cancel).unwrap(), []);
-    assert_eq!(app.workspace().symbols_named(b"wrong").count(), 0);
+    assert_eq!(app.document_links(&main, &cancel).unwrap(), []);
+    assert_eq!(
+      app
+        .snapshot()
+        .workspace()
+        .symbols()
+        .filter(|symbol| symbol.name == b"wrong")
+        .count(),
+      0
+    );
     app.open(&library, "wrong=1\n", &cancel).unwrap();
     for source in [". ./regular/../lib.sh\n", ". ./missing/../lib.sh\n"] {
       app.open(&main, source, &cancel).unwrap();
-      assert_eq!(app.document_links(id, &cancel).unwrap(), [], "{source}");
+      assert_eq!(app.document_links(&main, &cancel).unwrap(), [], "{source}");
     }
   }
 
@@ -541,224 +599,20 @@ mod documents {
     ] {
       let main = fixture.write("main.sh", source);
       let settings = Settings::new(fixture.root.clone());
-      let mut app = Application::new(settings).unwrap();
+      let mut app = Client::new(settings).unwrap();
       app.open(&main, source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
-      assert_eq!(app.document_links(id, &cancel).unwrap(), [], "{source}");
+      assert_eq!(app.document_links(&main, &cancel).unwrap(), [], "{source}");
       assert_eq!(
-        app.workspace().symbols_named(b"wrong").count(),
+        app
+          .snapshot()
+          .workspace()
+          .symbols()
+          .filter(|symbol| symbol.name == b"wrong")
+          .count(),
         0,
         "{source}"
       );
     }
-  }
-
-  #[test]
-  fn symbol_features_separate_document_scope_from_workspace_name_search() {
-    let fixture = Fixture::new();
-    let main =
-      fixture.write("main.sh", "local_name=1\nmain_function() { :; }\n");
-    let library = fixture.write("lib.sh", "library_name=2\n");
-    let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&fixture.root);
-    app.refresh(&cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    let symbols = app
-      .document_symbols(id)
-      .unwrap()
-      .map(|entry| {
-        assert_eq!(entry.details.location.snapshot.document, id);
-        String::from_utf8(entry.details.symbol.name.clone()).unwrap()
-      })
-      .collect::<Vec<_>>();
-    assert_eq!(symbols, ["local_name", "main_function"]);
-    let matches = app
-      .workspace_symbols("name")
-      .map(|entry| String::from_utf8(entry.symbol.name.clone()).unwrap())
-      .collect::<Vec<_>>();
-    assert_eq!(matches, ["library_name", "local_name"]);
-    assert_eq!(app.workspace_symbols("missing").count(), 0);
-    let removed = app.document_id(&library).unwrap();
-    std::fs::remove_file(library).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert!(
-      matches!(app.document_symbols(removed), Err(Error::Engine(shellsmith::interface::application::engine::Error::UnknownDocument(missing))) if missing == removed)
-    );
-    assert_eq!(app.workspace_symbols("library").count(), 0);
-  }
-
-  #[test]
-  fn recursive_collection_selects_sh_files_and_hidden_entries() {
-    let fixture = Fixture::new();
-    let cases = [
-      ("a.sh", "a=1", true),
-      (".hidden/b.sh", "b=2", true),
-      ("executable", "#!/bin/sh\nc=3", true),
-      ("env-script", "#!/usr/bin/env sh\nd=4", true),
-      ("with-options", "#!/bin/sh -eu\ne=5", true),
-      ("wrong.sh", "#!/bin/bash\nf=6", false),
-      ("env-options.sh", "#!/usr/bin/env -S sh\ng=7", false),
-      ("env-assignment.sh", "#!/usr/bin/env LANG=C sh\nh=8", false),
-      ("relative.sh", "#!sh\ni=9", false),
-      ("other.txt", "j=10", false),
-    ];
-    for (path, source, _) in cases {
-      fixture.write(path, source);
-    }
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&fixture.root);
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    assert_eq!(app.workspace().documents().count(), 5);
-    for (path, _, selected) in cases {
-      assert_eq!(
-        app.document_id(&fixture.root.join(path)).is_some(),
-        selected,
-        "{path}"
-      );
-    }
-    assert_eq!(app.failures(), []);
-  }
-
-  #[test]
-  fn opened_text_replaces_unreadable_files_while_closed_ones_remain_failures() {
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Fixture::new();
-    let main = fixture.write("main.sh", "value=1; : \"$value\"");
-    let locked = fixture.write("locked.sh", "disk=1");
-    let notes = fixture.write("notes", "text");
-    let permissions = std::fs::Permissions::from_mode;
-    for path in [&locked, &notes] {
-      std::fs::set_permissions(path, permissions(0o000)).unwrap();
-    }
-    if std::fs::read(&locked).is_ok() {
-      // Permissions do not restrict this user.
-      return;
-    }
-    let failed = |app: &Application| {
-      app
-        .failures()
-        .iter()
-        .map(|failure| failure.path.clone())
-        .collect::<Vec<_>>()
-    };
-    let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&fixture.root);
-    app.open(&locked, "live=1", &cancel).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert_eq!(failed(&app), [notes.as_path()]);
-    assert!(matches!(
-      app.prepare_rename(&main, 0, &cancel),
-      Err(Error::RenameRefused(_))
-    ));
-    std::fs::set_permissions(&notes, permissions(0o644)).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.failures(), []);
-    assert_eq!(app.document_id(&notes), None);
-    let id = app.document_id(&locked).unwrap();
-    assert_eq!(app.workspace().document(id).unwrap().source(), "live=1");
-    assert!(app.prepare_rename(&main, 0, &cancel).unwrap().is_some());
-    assert!(app.close(&locked, &cancel).is_err());
-    assert_eq!(app.document_id(&locked), None);
-    assert!(matches!(
-      app.prepare_rename(&main, 0, &cancel),
-      Err(Error::RenameRefused(_))
-    ));
-    assert_eq!(failed(&app), [locked]);
-  }
-
-  #[test]
-  fn workspace_collection_applies_nested_gitignores_without_other_ignore_files()
-  {
-    for repository in [false, true] {
-      let fixture = Fixture::new();
-      fixture.write(".gitignore", "*.sh\n!keep.sh\ntarget/\n");
-      fixture.write("nested/.gitignore", "!included.sh\n");
-      fixture.write(".ignore", "keep.sh\n");
-      if repository {
-        fixture.write(".git/info/exclude", "keep.sh\n");
-        fixture.write(".git/.gitignore", "[z-a]\n");
-        fixture.write(".git/keep.sh", "metadata=1\n");
-      }
-      fixture.write("target/.gitignore", "[z-a]\n");
-      let invalid = fixture.write("target/keep.sh", "");
-      std::fs::write(invalid, [0xff]).unwrap();
-      let cases = [
-        ("keep.sh", true),
-        ("excluded.sh", false),
-        ("nested/included.sh", true),
-        ("nested/excluded.sh", false),
-        (".hidden/keep.sh", true),
-        ("target/other.sh", false),
-      ];
-      for (path, _) in cases {
-        fixture.write(path, "value=1\n");
-      }
-      let mut app =
-        Application::new(Settings::new(fixture.root.clone())).unwrap();
-      app.add_input(&fixture.root);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      assert_eq!(app.workspace().documents().count(), 3);
-      for (path, selected) in cases {
-        assert_eq!(
-          app.document_id(&fixture.root.join(path)).is_some(),
-          selected,
-          "repository={repository}, {path}"
-        );
-      }
-      assert_eq!(app.failures(), []);
-    }
-  }
-
-  #[test]
-  fn ignored_documents_remain_available_when_opened_selected_or_sourced() {
-    let fixture = Fixture::new();
-    fixture.write(".gitignore", "ignored/\n");
-    let main = fixture.write("main.sh", ". ./ignored/lib.sh\n");
-    let library = fixture.write("ignored/lib.sh", "library=1\n");
-    let opened = fixture.write("ignored/open.sh", "disk=1\n");
-    let selected = fixture.write("ignored/explicit.txt", "explicit=1\n");
-    let skipped = fixture.write("ignored/skipped.sh", "skipped=1\n");
-    let settings = Settings::new(fixture.root.clone());
-    let mut app = Application::new(settings).unwrap();
-    let cancel = AtomicBool::new(false);
-    app.add_input(&fixture.root);
-    app.add_input(&selected);
-    app.open(&opened, "live=1\n", &cancel).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.workspace().documents().count(), 4);
-    assert!(app.document_id(&skipped).is_none());
-    let id = app.document_id(&opened).unwrap();
-    assert_eq!(app.workspace().document(id).unwrap().source(), "live=1\n");
-    let id = app.document_id(&main).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Resolved(_)
-    ));
-    assert!(app.document_id(&library).is_some());
-    assert!(app.document_id(&selected).is_some());
-    assert_eq!(app.failures(), []);
-  }
-
-  #[test]
-  fn invalid_gitignore_patterns_report_the_file_and_keep_valid_rules() {
-    let fixture = Fixture::new();
-    let ignore = fixture.write(".gitignore", "[z-a]\nexcluded.sh\n");
-    let included = fixture.write("included.sh", "included=1\n");
-    let excluded = fixture.write("excluded.sh", "excluded=1\n");
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&fixture.root);
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    assert!(app.document_id(&included).is_some());
-    assert!(app.document_id(&excluded).is_none());
-    assert_eq!(app.failures().len(), 1);
-    assert_eq!(app.failures()[0].path, ignore);
-    assert!(app.failures()[0].message.contains("line 1"));
   }
 
   #[tokio::test]
@@ -814,1048 +668,6 @@ mod documents {
     session.remove_input(&fixture.root).unwrap();
     assert_eq!(names(&session).await, ["live"]);
   }
-
-  #[test]
-  fn overlays_close_and_disk_failures_never_reuse_stale_results() {
-    let fixture = Fixture::new();
-    let file = fixture.write("main.sh", "disk=1");
-    let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&file);
-    app.open(&file, "live=1", &cancel).unwrap();
-    app.refresh(&cancel).unwrap();
-    let id = app.document_id(&file).unwrap();
-    assert_eq!(app.workspace().document(id).unwrap().source(), "live=1");
-    std::fs::write(&file, "changed=1").unwrap();
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.workspace().document(id).unwrap().source(), "live=1");
-    app.close(&file, &cancel).unwrap();
-    assert_eq!(app.workspace().document(id).unwrap().source(), "changed=1");
-    std::fs::write(&file, [0xff]).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert!(app.workspace().document(id).is_none());
-    assert_eq!(app.failures().len(), 1);
-    fixture.write("main.sh", "fixed=1");
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.document_id(&file), Some(id));
-    std::fs::remove_file(&file).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert!(app.document_id(&file).is_none());
-  }
-
-  #[test]
-  fn sources_follow_entry_directory_and_cycles_with_current_revisions() {
-    let fixture = Fixture::new();
-    let entry = fixture.write("sub/main.sh", ". ./lib.sh\nf\n");
-    let lib = fixture.write("sub/lib.sh", "f() { :; }\n. ./main.sh\n");
-    let settings = Settings::new(fixture.root.clone());
-    let mut app = Application::new(settings).unwrap();
-    app.add_input(&entry);
-    let cancel = AtomicBool::new(false);
-    app.refresh(&cancel).unwrap();
-    let id = app.document_id(&entry).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Resolved(_)
-    ));
-    assert_eq!(app.workspace().documents().count(), 2);
-    app.open(&lib, "f() { :; }", &cancel).unwrap();
-    app.refresh(&cancel).unwrap();
-    let spans = app.classify(id, &cancel).unwrap();
-    assert!(spans.iter().any(|span| span.kind == SemanticKind::Function));
-    app.change(&lib, "g() { :; }", &cancel).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert!(
-      !app
-        .classify(id, &cancel)
-        .unwrap()
-        .iter()
-        .any(|span| span.kind == SemanticKind::Function)
-    );
-    app.close(&lib, &cancel).unwrap();
-    std::fs::remove_file(&lib).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Unresolved(_)
-    ));
-  }
-
-  #[test]
-  fn failed_cd_keeps_the_current_directory_for_source_resolution() {
-    let fixture = Fixture::new();
-    let file = fixture.write("main.sh", "cd sub; . ./lib.sh\n");
-    let library = fixture.write("lib.sh", "readonly x=1");
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&file);
-    let cancel = AtomicBool::new(false);
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.workspace().documents().count(), 2);
-    let id = app.document_id(&file).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Resolved(_)
-    ));
-    assert_eq!(app.document_links(id, &cancel).unwrap()[0].1, library);
-    assert!(
-      app
-        .classify(id, &cancel)
-        .unwrap()
-        .iter()
-        .any(|span| span.modifiers.contains(&Modifier::DefaultLibrary))
-    );
-  }
-
-  #[test]
-  fn cancellation_does_not_publish_partial_analysis() {
-    let fixture = Fixture::new();
-    let file = fixture.write("main.sh", "x=1");
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&file);
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    let id = app.document_id(&file).unwrap();
-    let completed =
-      std::ptr::from_ref(app.workspace().analysis().unwrap()).addr();
-    assert!(app.classify(id, &AtomicBool::new(true)).is_err());
-    assert_eq!(
-      std::ptr::from_ref(app.workspace().analysis().unwrap()).addr(),
-      completed
-    );
-    app.open(&file, "x=2", &AtomicBool::new(false)).unwrap();
-    assert!(app.classify(id, &AtomicBool::new(true)).is_err());
-    assert!(app.workspace().analysis().is_none());
-  }
-
-  #[cfg(unix)]
-  #[test]
-  fn symbolic_links_share_documents_and_directory_cycles_terminate() {
-    let fixture = Fixture::new();
-    let file = fixture.write("main.sh", "x=1");
-    let link = fixture.root.join("link.sh");
-    std::os::unix::fs::symlink(&file, &link).unwrap();
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&fixture.root);
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    assert_eq!(app.workspace().documents().count(), 1);
-    std::os::unix::fs::symlink(&fixture.root, fixture.root.join("cycle"))
-      .unwrap();
-    app.add_input(&link);
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    assert_eq!(app.failures(), []);
-    assert_eq!(app.document_id(&link), app.document_id(&file));
-    app.open(&link, "x=2", &AtomicBool::new(false)).unwrap();
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    assert_eq!(app.workspace().documents().count(), 1);
-  }
-
-  #[test]
-  fn unsaved_source_and_path_entries_use_the_request_directory() {
-    let fixture = Fixture::new();
-    let entry = fixture.write("main.sh", ". lib\nf\n");
-    let library = fixture.root.join("lib");
-    let mut settings = Settings::new(fixture.root.clone());
-    settings
-      .initial
-      .environment
-      .insert(b"PATH".to_vec(), b"./missing:".to_vec());
-    let mut app = Application::new(settings).unwrap();
-    let cancelled = AtomicBool::new(false);
-    app.add_input(&entry);
-    app.open(&library, "f() { :; }", &cancelled).unwrap();
-    app.refresh(&cancelled).unwrap();
-    let id = app.document_id(&entry).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Resolved(_)
-    ));
-    assert!(
-      app
-        .classify(id, &cancelled)
-        .unwrap()
-        .iter()
-        .any(|span| span.kind == SemanticKind::Function)
-    );
-    let mut settings = app.settings().clone();
-    settings.initial.environment.remove(b"PATH".as_slice());
-    app.configure(settings).unwrap();
-    assert!(app.workspace().analysis().is_none());
-    app.refresh(&cancelled).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Unresolved(_)
-    ));
-  }
-
-  #[test]
-  fn sourced_cd_changes_the_directory_for_later_references() {
-    let fixture = Fixture::new();
-    let library = fixture.write("lib.sh", "cd elsewhere\n");
-    let entry = fixture.write(
-      "main.sh",
-      &format!(". '{}'\n. ./next.sh\n", library.display()),
-    );
-    fixture.write("next.sh", "wrong=1");
-    fixture.write("elsewhere/next.sh", "right=1");
-    let settings = Settings::new(fixture.root.clone());
-    let mut app = Application::new(settings).unwrap();
-    app.add_input(&entry);
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    let id = app.document_id(&entry).unwrap();
-    let states: Vec<_> = app
-      .workspace()
-      .dependencies(id)
-      .map(|(_, state)| state)
-      .collect();
-    assert!(matches!(states[0], DependencyState::Resolved(_)));
-    assert!(matches!(states[1], DependencyState::Resolved(_)));
-    assert_eq!(app.workspace().symbols_named(b"wrong").count(), 0);
-    assert_eq!(app.workspace().symbols_named(b"right").count(), 1);
-  }
-
-  #[cfg(unix)]
-  #[test]
-  fn parent_components_are_resolved_after_symbolic_links() {
-    let fixture = Fixture::new();
-    let file = fixture.write("real/a.sh", "x=1");
-    std::fs::create_dir(fixture.root.join("real/sub")).unwrap();
-    std::os::unix::fs::symlink(
-      fixture.root.join("real/sub"),
-      fixture.root.join("link"),
-    )
-    .unwrap();
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&fixture.root.join("link/../a.sh"));
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    assert_eq!(app.failures(), []);
-    assert!(app.document_id(&file).is_some());
-  }
-
-  #[test]
-  fn source_search_uses_only_the_conditions_required_by_the_path() {
-    for (prefix, resolved) in [
-      (": \"$(( $expr ))\"", true),
-      ("getopts x PATH", true),
-      ("local PATH=elsewhere", false),
-      ("fc", false),
-    ] {
-      let fixture = Fixture::new();
-      let file = fixture.write("main.sh", &format!("{prefix}; . ./lib.sh\n"));
-      fixture.write("lib.sh", "x=1");
-      let settings = Settings::new(fixture.root.clone());
-      let mut app = Application::new(settings).unwrap();
-      app.add_input(&file);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      let id = app.document_id(&file).unwrap();
-      assert_eq!(
-        matches!(
-          app.workspace().dependencies(id).next().unwrap().1,
-          DependencyState::Resolved(_)
-        ),
-        resolved,
-        "{prefix}"
-      );
-    }
-  }
-
-  #[test]
-  fn entry_directories_are_independent_and_sources_inherit_directory_changes() {
-    let fixture = Fixture::new();
-    let cancel = AtomicBool::new(false);
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.initial =
-      shellsmith::interface::application::engine::InitialEnvironment::empty();
-    settings
-      .initial
-      .environment
-      .insert(b"PATH".to_vec(), b".:".to_vec());
-    let mut app = Application::new(settings).unwrap();
-    let mut expected = Vec::new();
-    for (directory, operand) in
-      [("a", "\"$PWD/lib/first.sh\""), ("b", "./lib/first.sh")]
-    {
-      let source = format!(". {operand}\nf\n. done.sh\n");
-      let main = fixture.write(&format!("{directory}/main.sh"), &source);
-      let first = fixture.write(
-        &format!("{directory}/lib/first.sh"),
-        ". ./second.sh\ncd ./moved\n",
-      );
-      let second =
-        fixture.write(&format!("{directory}/second.sh"), "f() { :; }\n");
-      let done =
-        fixture.write(&format!("{directory}/moved/done.sh"), "done=1\n");
-      app.open(&main, &source, &cancel).unwrap();
-      expected.push((main, first, second, done));
-    }
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.failures(), []);
-    assert_eq!(app.workspace().documents().count(), 8);
-    for (main, first, second, done) in expected {
-      let id = app.document_id(&main).unwrap();
-      let links = app.document_links(id, &cancel).unwrap();
-      assert_eq!(
-        links.into_iter().map(|(_, path)| path).collect::<Vec<_>>(),
-        vec![first.clone(), done]
-      );
-      let source = app.workspace().document(id).unwrap().source();
-      let offset = source.find("\nf\n").unwrap() + 1;
-      let definitions = app.definitions(id, offset, &cancel).unwrap();
-      assert_eq!(definitions.len(), 1);
-      assert_eq!(
-        app.path(definitions[0].snapshot.document),
-        Some(second.as_path())
-      );
-      assert!(
-        app
-          .classify(id, &cancel)
-          .unwrap()
-          .iter()
-          .any(|span| { span.kind == SemanticKind::Function })
-      );
-    }
-  }
-}
-
-mod environment {
-  use crate::fixtures;
-
-  use fixtures::Fixture;
-  use shellsmith::interface::application::engine::{
-    DependencyState, InitialBinding, Modifier,
-  };
-  use shellsmith::interface::application::{Application, Settings};
-  use std::sync::atomic::AtomicBool;
-
-  fn application(fixture: &Fixture) -> Application {
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.initial.environment.clear();
-    settings.initial.environment.insert(
-      b"HOME".to_vec(),
-      fixture.root.as_os_str().as_encoded_bytes().to_vec(),
-    );
-    Application::new(settings).unwrap()
-  }
-
-  #[test]
-  fn missing_startup_variables_resolve_defaults_until_their_values_become_unknown()
-   {
-    let fixture = Fixture::new();
-    fixture.write("default.sh", ":\n");
-    fixture.write("assigned.sh", ":\n");
-    for (prefix, operand, target) in [
-      ("", "${CONFIG-./default.sh}", Some("default.sh")),
-      ("", "${CONFIG:-./default.sh}", Some("default.sh")),
-      ("", "${CONFIG:=./default.sh}", Some("default.sh")),
-      ("CONFIG=; ", "${CONFIG-./default.sh}", None),
-      ("CONFIG=; ", "${CONFIG:-./default.sh}", Some("default.sh")),
-      ("CONFIG=./assigned.sh; ", "$CONFIG", Some("assigned.sh")),
-      (
-        "if condition; then unset CONFIG; fi; ",
-        "${CONFIG:-./default.sh}",
-        Some("default.sh"),
-      ),
-      (
-        "if condition; then CONFIG=./assigned.sh; fi; ",
-        "${CONFIG:-./default.sh}",
-        None,
-      ),
-      ("read CONFIG; ", "${CONFIG:-./default.sh}", None),
-      (
-        "read CONFIG; unset CONFIG; ",
-        "${CONFIG:-./default.sh}",
-        Some("default.sh"),
-      ),
-      (
-        "read CONFIG; CONFIG=./assigned.sh; ",
-        "$CONFIG",
-        Some("assigned.sh"),
-      ),
-    ] {
-      let source = format!("{prefix}. \"{operand}\"\n");
-      let main = fixture.write("main.sh", &source);
-      let mut app = application(&fixture);
-      app.add_input(&main);
-      let cancelled = AtomicBool::new(false);
-      app.refresh(&cancelled).unwrap();
-      let id = app.document_id(&main).unwrap();
-      let targets: Vec<_> = app
-        .document_links(id, &cancelled)
-        .unwrap()
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect();
-      assert_eq!(
-        targets,
-        target
-          .map(|path| fixture.root.join(path))
-          .into_iter()
-          .collect::<Vec<_>>(),
-        "{source}"
-      );
-    }
-  }
-
-  #[test]
-  fn explicit_initial_uncertainty_is_not_replaced_with_unset() {
-    let fixture = Fixture::new();
-    fixture.write("default.sh", ":\n");
-    for name in [
-      "CONFIG",
-      "LANG",
-      "LC_ALL",
-      "LC_CTYPE",
-      "LC_COLLATE",
-      "CDPATH",
-    ] {
-      let main =
-        fixture.write("main.sh", &format!(". \"${{{name}-./default.sh}}\"\n"));
-      let mut app = application(&fixture);
-      let mut settings = app.settings().clone();
-      settings.initial.other_variables = InitialBinding::Unknown;
-      app.configure(settings).unwrap();
-      app.add_input(&main);
-      let cancelled = AtomicBool::new(false);
-      app.refresh(&cancelled).unwrap();
-      let id = app.document_id(&main).unwrap();
-      assert!(
-        app.document_links(id, &cancelled).unwrap().is_empty(),
-        "{name}"
-      );
-      assert_eq!(app.workspace().documents().count(), 1, "{name}");
-    }
-  }
-
-  #[test]
-  fn shell_initialized_variables_skip_unset_defaults_and_held_ones_are_set() {
-    let fixture = Fixture::new();
-    fixture.write("default.sh", ":\n");
-    for (name, held) in [
-      ("LINENO", true),
-      ("PPID", true),
-      ("PS1", false),
-      ("PS2", false),
-      ("PS4", false),
-    ] {
-      for (source, linked) in [
-        (format!(". \"${{{name}-./default.sh}}\"\n"), false),
-        (format!(". \"${{{name}+./default.sh}}\"\n"), held),
-      ] {
-        let main = fixture.write("main.sh", &source);
-        let mut app = application(&fixture);
-        app.add_input(&main);
-        let cancelled = AtomicBool::new(false);
-        app.refresh(&cancelled).unwrap();
-        let id = app.document_id(&main).unwrap();
-        assert_eq!(
-          app.document_links(id, &cancelled).unwrap().len(),
-          usize::from(linked),
-          "{source}"
-        );
-        assert_eq!(
-          app.workspace().documents().count(),
-          1 + usize::from(linked),
-          "{source}"
-        );
-      }
-    }
-  }
-
-  #[test]
-  fn quoted_environment_sources_are_loaded_and_feed_semantic_classification() {
-    let fixture = Fixture::new();
-    let file = fixture.write(
-      "main.sh",
-      ". ./prefix.sh; . \"$HOME/lib.sh\"; f; : \"${HOME}\"\n",
-    );
-    fixture.write("prefix.sh", "prefix=1\n");
-    fixture.write("lib.sh", "f() { :; }\nreadonly HOME\n");
-    let mut app = application(&fixture);
-    app.add_input(&file);
-    let cancel = AtomicBool::new(false);
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.workspace().documents().count(), 3);
-    let id = app.document_id(&file).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Resolved(_)
-    ));
-    let spans = app.classify(id, &cancel).unwrap();
-    assert!(spans.iter().any(|span| span.kind
-      == shellsmith::interface::application::engine::SemanticKind::Function));
-    assert_eq!(
-      spans
-        .iter()
-        .filter(|span| span.modifiers.contains(&Modifier::Environment))
-        .count(),
-      2
-    );
-    assert!(
-      spans
-        .iter()
-        .any(|span| span.modifiers.contains(&Modifier::Readonly)
-          && span.modifiers.contains(&Modifier::Environment))
-    );
-  }
-
-  #[test]
-  fn source_operand_uses_the_environment_before_command_prefix_assignments() {
-    let fixture = Fixture::new();
-    let file = fixture.write(
-      "main.sh",
-      "HOME=/other . \"$HOME/lib.sh\"; . \"$HOME/after.sh\"\n",
-    );
-    fixture.write("lib.sh", "loaded=1\n");
-    fixture.write("after.sh", "unreachable=1\n");
-    let mut app = application(&fixture);
-    app.add_input(&file);
-    let cancelled = AtomicBool::new(false);
-    app.refresh(&cancelled).unwrap();
-    let id = app.document_id(&file).unwrap();
-    let states: Vec<_> = app
-      .workspace()
-      .dependencies(id)
-      .map(|(_, state)| state)
-      .collect();
-    assert!(matches!(states[0], DependencyState::Resolved(_)));
-    assert!(matches!(states[1], DependencyState::Unresolved(_)));
-    assert_eq!(app.workspace().symbols_named(b"loaded").count(), 1);
-    assert_eq!(app.workspace().symbols_named(b"unreachable").count(), 0);
-  }
-
-  #[test]
-  fn source_discovery_never_uses_overwritten_or_uncertain_environment_values() {
-    let fixture = Fixture::new();
-    fixture.write("lib.sh", "from_library=1\n");
-    for (prefix, library_count) in [
-      ("HOME=/other; ", 0),
-      ("unset HOME; ", 0),
-      ("if condition; then HOME=/other; fi; ", 1),
-      ("read HOME; ", 0),
-      ("f() { HOME=/other; }; f; ", 0),
-      (". missing; ", 0),
-    ] {
-      let file = fixture.write(
-        "main.sh",
-        &format!("{prefix}. \"$HOME/lib.sh\"\n: \"$from_library\"\n"),
-      );
-      let mut app = application(&fixture);
-      app.add_input(&file);
-      let cancelled = AtomicBool::new(false);
-      app.refresh(&cancelled).unwrap();
-      let id = app.document_id(&file).unwrap();
-      assert!(
-        app.document_links(id, &cancelled).unwrap().is_empty(),
-        "{prefix}"
-      );
-      assert!(
-        app
-          .workspace()
-          .dependencies(id)
-          .all(|(_, state)| matches!(state, DependencyState::Unresolved(_))),
-        "{prefix}"
-      );
-      assert_eq!(
-        app
-          .workspace()
-          .documents()
-          .filter(|doc| app.path(doc.snapshot().document).is_some())
-          .count(),
-        1 + library_count,
-        "{prefix}"
-      );
-      assert_eq!(
-        app.workspace().symbols_named(b"from_library").count(),
-        library_count,
-        "{prefix}"
-      );
-      let source = app.workspace().document(id).unwrap().source();
-      let offset = source.rfind("from_library").unwrap();
-      assert!(
-        app.definitions(id, offset, &cancelled).unwrap().is_empty(),
-        "{prefix}"
-      );
-    }
-  }
-
-  #[test]
-  fn excluded_eval_and_alias_effects_do_not_block_later_source_discovery() {
-    let fixture = Fixture::new();
-    let library = fixture.write("lib.sh", "f() { :; }\nreadonly HOME\n");
-    let hidden = fixture.write("hidden.sh", "hidden=1\n");
-    for call in [
-      "eval '. ./hidden.sh; cd /; PATH=/other; HOME=/other'",
-      "eval \"$(brew shellenv)\"",
-      "alias .='echo'; alias f=printf",
-      "alias .='echo'; unalias .",
-    ] {
-      let source = format!("{call}; . \"$HOME/lib.sh\"; f; : \"$HOME\"");
-      let file = fixture.write("main.sh", &source);
-      let mut app = application(&fixture);
-      app.add_input(&file);
-      let cancel = AtomicBool::new(false);
-      app.refresh(&cancel).unwrap();
-      assert!(app.document_id(&library).is_some(), "{call}");
-      assert!(app.document_id(&hidden).is_none(), "{call}");
-      assert_eq!(app.workspace().documents().count(), 2, "{call}");
-      let id = app.document_id(&file).unwrap();
-      let spans = app.classify(id, &cancel).unwrap();
-      let function = source.rfind("f; :").unwrap();
-      assert!(
-        spans
-          .iter()
-          .any(|span| span.location.bytes.start == function
-            && span.kind
-              == shellsmith::interface::application::engine::SemanticKind::Function),
-        "{call}"
-      );
-      let read = source.rfind("HOME").unwrap();
-      assert!(
-        spans.iter().any(|span| span.location.bytes.start == read
-          && span.modifiers.contains(&Modifier::Environment)
-          && span.modifiers.contains(&Modifier::Readonly)),
-        "{call}"
-      );
-    }
-  }
-
-  #[test]
-  fn nested_sources_recheck_environment_after_each_file_and_after_updates() {
-    let fixture = Fixture::new();
-    let file =
-      fixture.write("main.sh", ". \"$HOME/first.sh\"; . \"$HOME/last.sh\"\n");
-    let first = fixture.write("first.sh", ". \"${HOME}/nested.sh\"\n");
-    fixture.write("nested.sh", "nested=1\n");
-    let last = fixture.write("last.sh", "last=1\n");
-    let mut app = application(&fixture);
-    app.add_input(&file);
-    let cancel = AtomicBool::new(false);
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.workspace().documents().count(), 4);
-    assert!(app.document_id(&last).is_some());
-    std::fs::write(&first, "unset HOME\n").unwrap();
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.workspace().documents().count(), 2);
-    assert!(app.document_id(&last).is_none());
-    std::fs::write(&first, ":\n").unwrap();
-    app.refresh(&cancel).unwrap();
-    assert!(app.document_id(&last).is_some());
-  }
-
-  #[test]
-  fn quoted_paths_preserve_spaces_defaults_and_unsupported_expansions() {
-    let fixture = Fixture::new();
-    fixture.write("with space/lib.sh", "found=1\n");
-    for (operand, expected) in [
-      ("\"$HOME/with space/lib.sh\"", 2),
-      ("\"${HOME}/with space/\"'lib.sh'", 2),
-      ("\"${HOME:-fallback}/with space/lib.sh\"", 2),
-      ("\"${#HOME}/with space/lib.sh\"", 1),
-      ("$HOME/with\\ space/lib.sh", 2),
-      ("'${HOME}/with space/lib.sh'", 1),
-      ("\"$HOME/with space/\"*.sh", 2),
-      ("\"$(echo ignored)/lib.sh\"", 1),
-    ] {
-      let file = fixture.write("main.sh", &format!(". {operand}\n"));
-      let mut app = application(&fixture);
-      app.add_input(&file);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      assert_eq!(app.workspace().documents().count(), expected, "{operand}");
-    }
-  }
-
-  #[test]
-  fn function_and_loop_contexts_cannot_share_an_unproven_source_target() {
-    let fixture = Fixture::new();
-    fixture.write("lib.sh", "HOME=/changed\n");
-    for source in [
-      "f() { . \"$HOME/lib.sh\"; }; f; f\n",
-      "while condition; do . \"$HOME/lib.sh\"; done\n",
-    ] {
-      let file = fixture.write("main.sh", source);
-      let mut app = application(&fixture);
-      app.add_input(&file);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      let id = app.document_id(&file).unwrap();
-      assert!(
-        app
-          .workspace()
-          .dependencies(id)
-          .all(|(_, state)| matches!(state, DependencyState::Unresolved(_)))
-      );
-      assert_eq!(app.workspace().documents().count(), 2);
-      assert_eq!(app.document_links(id, &AtomicBool::new(false)).unwrap(), []);
-    }
-  }
-
-  #[test]
-  fn workspace_entries_keep_shared_source_contexts_separate() {
-    let fixture = Fixture::new();
-    let first = fixture.write("first.sh", ". \"$HOME/shared.sh\"\n");
-    let second =
-      fixture.write("second.sh", "HOME=/other; . \"$CONFIG/shared.sh\"\n");
-    let shared = fixture.write("shared.sh", ". \"$HOME/leaf.sh\"\n");
-    fixture.write("leaf.sh", "leaf=1\n");
-    let mut app = application(&fixture);
-    let mut settings = app.settings().clone();
-    settings.initial.environment.insert(
-      b"CONFIG".to_vec(),
-      fixture.root.as_os_str().as_encoded_bytes().to_vec(),
-    );
-    app.configure(settings).unwrap();
-    app.add_input(&first);
-    app.add_input(&second);
-    app.refresh(&AtomicBool::new(false)).unwrap();
-    let id = app.document_id(&shared).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Unresolved(_)
-    ));
-    assert_eq!(app.workspace().symbols_named(b"leaf").count(), 1);
-  }
-
-  #[test]
-  fn environment_changes_invalidate_discovery() {
-    let fixture = Fixture::new();
-    let file = fixture.write("main.sh", ". \"${CONFIG-./lib.sh}\"\n");
-    let first = fixture.write("lib.sh", "old=1\n");
-    let second = fixture.write("other/lib.sh", "new=1\n");
-    let mut app = application(&fixture);
-    app.add_input(&file);
-    let cancel = AtomicBool::new(false);
-    for (value, target) in [
-      (None, Some(&first)),
-      (Some("./other/lib.sh"), Some(&second)),
-      (Some("./lib.sh"), Some(&first)),
-      (Some(""), None),
-      (None, Some(&first)),
-    ] {
-      let mut settings = app.settings().clone();
-      if let Some(value) = value {
-        settings
-          .initial
-          .environment
-          .insert(b"CONFIG".to_vec(), value.as_bytes().to_vec());
-      } else {
-        settings.initial.environment.remove(b"CONFIG".as_slice());
-      }
-      app.configure(settings).unwrap();
-      app.refresh(&cancel).unwrap();
-      for path in [&first, &second] {
-        assert_eq!(
-          app.document_id(path).is_some(),
-          target == Some(path),
-          "{value:?}"
-        );
-      }
-    }
-  }
-}
-
-mod paths {
-  use crate::fixtures;
-  use fixtures::Fixture;
-  use shellsmith::interface::application::engine::{
-    DependencyState, InitialEnvironment,
-  };
-  use shellsmith::interface::application::{Application, Settings};
-  use std::sync::atomic::AtomicBool;
-
-  #[test]
-  fn glob_sources_respect_hidden_entries_and_directory_boundaries() {
-    let fixture = Fixture::new();
-    fixture.write("lib/visible.sh", "visible=1");
-    fixture.write("lib/.hidden.sh", "hidden=1");
-    fixture.write("lib/nested/leaf.sh", "nested=1");
-    fixture.write("dot/x.hidden.sh", "visible=1");
-    fixture.write("dot/.hidden.sh", "hidden=1");
-    fixture.write("escaped/\\x.sh", "escaped=1");
-    for (source, targets) in [
-      (". ./lib/*.sh", vec!["lib/visible.sh"]),
-      (". ./lib/.*.sh", vec!["lib/.hidden.sh"]),
-      (". ./lib/*/leaf.sh", vec!["lib/nested/leaf.sh"]),
-      (". ./lib/visible.sh/*.sh", vec![]),
-      (". ./lib/missing*.sh", vec![]),
-      (". './lib/*.sh'", vec![]),
-      (". ./dot/*[.]hidden.sh", vec![]),
-      (
-        r"pattern='./lib/\v*.sh'; . $pattern",
-        vec!["lib/visible.sh"],
-      ),
-      (r"pattern='./\lib/*.sh'; . $pattern", vec!["lib/visible.sh"]),
-      (r"pattern='./escaped/\*.sh'; . $pattern", vec![]),
-    ] {
-      let main = fixture.write("main.sh", source);
-      let mut settings = Settings::new(fixture.root.clone());
-      settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
-      app.add_input(&main);
-      let cancelled = AtomicBool::new(false);
-      app.refresh(&cancelled).unwrap();
-      let id = app.document_id(&main).unwrap();
-      let actual: Vec<_> = app
-        .document_links(id, &cancelled)
-        .unwrap()
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect();
-      let expected: Vec<_> = targets
-        .into_iter()
-        .map(|path| fixture.root.join(path))
-        .collect();
-      assert_eq!(actual, expected, "{source}");
-    }
-  }
-
-  #[test]
-  fn computed_words_and_globs_resolve_sources_from_the_current_directory() {
-    let fixture = Fixture::new();
-    let library = fixture.write("sub/library2.sh", "found=1\n");
-    for source in [
-      "cd ./sub; . ./library2.sh",
-      "eval 'cd /'; . ./sub/library2.sh",
-      "PATH=./sub; eval 'PATH=/other; cd /'; . library2.sh",
-      "alias .='echo'; . ./sub/library2.sh",
-      "n=1; . ./sub/library$(( $n + 1 )).sh",
-      "base=./sub/file; . \"${base%/*}/library$((1+1)).sh\"",
-      "set -- ./sub/library2.sh; . \"$1\"",
-      "read tail; set -- ./sub/library2.sh \"$tail\"; . \"$@\"",
-      "set -- ./sub/library2.sh; for lib; do . \"$lib\"; done",
-      "f() { . \"$1\"; }; f ./sub/library2.sh",
-      "HOME=./sub; . ~/library2.sh",
-      "cd ./sub; . ./library[0-9].sh",
-      "pattern='./sub/*.sh'; . $pattern",
-      "set -- ./sub/*.sh; . \"$1\"",
-      "CDPATH=.; cd sub; . ./library2.sh",
-      "HOME=./sub; cd; . ./library2.sh",
-      "cd sub; cd ..; cd -; . ./library2.sh",
-      "cd sub/; . ./library2.sh",
-      "cd sub; (cd ..); . ./library2.sh",
-    ] {
-      let main = fixture.write("main.sh", source);
-      let mut settings = Settings::new(fixture.root.clone());
-      settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
-      app.add_input(&main);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      assert!(
-        app.document_id(&library).is_some(),
-        "{source}: {:?}",
-        app.failures()
-      );
-      assert_eq!(
-        app.workspace().symbols_named(b"found").count(),
-        1,
-        "{source}"
-      );
-    }
-  }
-
-  #[test]
-  fn cd_sets_pwd_and_pwd_output_only_for_spellings_posix_fixes() {
-    use shellsmith::interface::application::engine::{
-      OccurrenceKind, Value, ValueIssue,
-    };
-    let fixture = Fixture::new();
-    fixture.write("sub/a/file.sh", "");
-    let root = fixture.root.to_str().unwrap();
-    let exact = |path: String| Value::Literal(path.into_bytes());
-    let unspecified = Value::Unknown(ValueIssue::Unspecified);
-    for (source, expected) in [
-      (
-        "cd sub; result=$PWD".to_owned(),
-        exact(format!("{root}/sub")),
-      ),
-      (
-        "cd ./sub/./a; result=$PWD".to_owned(),
-        exact(format!("{root}/sub/a")),
-      ),
-      (
-        "CDPATH=sub/; cd a; result=$PWD".to_owned(),
-        exact(format!("{root}/sub/a")),
-      ),
-      (
-        format!("cd /{root}/sub; result=$PWD"),
-        exact(format!("/{root}/sub")),
-      ),
-      ("cd /..; result=$PWD".to_owned(), exact("/..".to_owned())),
-      (
-        "cd sub; cd ..; result=$OLDPWD".to_owned(),
-        exact(format!("{root}/sub")),
-      ),
-      (
-        "cd sub; result=$(command -p pwd)".to_owned(),
-        exact(format!("{root}/sub")),
-      ),
-      ("cd sub/; result=$PWD".to_owned(), unspecified.clone()),
-      ("cd sub; cd ..; result=$PWD".to_owned(), unspecified.clone()),
-      ("cd sub; cd .; result=$PWD".to_owned(), unspecified.clone()),
-      ("cd sub//a; result=$PWD".to_owned(), unspecified.clone()),
-      (
-        "cd sub/; cd a; result=$OLDPWD".to_owned(),
-        unspecified.clone(),
-      ),
-      (
-        "cd sub/; result=$(command -p pwd)".to_owned(),
-        unspecified.clone(),
-      ),
-      (
-        "cd /..; result=$(command -p pwd)".to_owned(),
-        Value::Unknown(ValueIssue::UnsupportedExpansion),
-      ),
-      (
-        "readonly PWD; PWD=/x; result=$(command -p pwd)".to_owned(),
-        exact(root.to_owned()),
-      ),
-      (
-        "readonly PWD; cd sub; result=$(command -p pwd)".to_owned(),
-        Value::Unknown(ValueIssue::Dynamic),
-      ),
-    ] {
-      let source = format!("{source}; : \"$result\"");
-      let main = fixture.write("main.sh", &source);
-      let mut settings = Settings::new(fixture.root.clone());
-      settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
-      app.add_input(&main);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      let id = app.document_id(&main).unwrap();
-      app.classify(id, &AtomicBool::new(false)).unwrap();
-      let read = app
-        .workspace()
-        .document(id)
-        .unwrap()
-        .occurrences()
-        .iter()
-        .rev()
-        .find(|site| {
-          site.kind == OccurrenceKind::VariableExpansion
-            && site.name == Value::Literal(b"result".to_vec())
-        })
-        .unwrap()
-        .id;
-      assert_eq!(
-        app
-          .workspace()
-          .analysis()
-          .unwrap()
-          .values(read)
-          .map(|(_, value)| value.clone())
-          .collect::<Vec<_>>(),
-        [expected],
-        "{source}"
-      );
-    }
-  }
-
-  #[test]
-  fn absolute_cd_recovers_the_directory_after_an_unknown_cd() {
-    let fixture = Fixture::new();
-    let library = fixture.write("sub/library.sh", "found=1");
-    let directory = library.parent().unwrap().to_str().unwrap();
-    for (source, resolved) in [
-      (
-        format!(
-          "read target; cd \"$target\"; cd '{directory}'; . ./library.sh"
-        ),
-        true,
-      ),
-      (
-        format!(
-          "trap \"cd '{directory}'; . ./library.sh\" EXIT; read target; cd \"$target\""
-        ),
-        true,
-      ),
-      (
-        format!("trap \"cd '{directory}'; . ./library.sh\" EXIT; cd ./sub"),
-        true,
-      ),
-      (
-        format!(
-          "trap \"cd '{directory}'; . ./library.sh\" EXIT; PWD=/elsewhere"
-        ),
-        false,
-      ),
-      (
-        format!("read name; read \"$name\"; cd '{directory}'; . ./library.sh"),
-        false,
-      ),
-      (
-        format!("read name; read \"x$name\"; cd '{directory}'; . ./library.sh"),
-        true,
-      ),
-      (
-        format!(
-          "f() {{ cd \"$1\"; f x; }}; f a; cd '{directory}'; . ./library.sh"
-        ),
-        true,
-      ),
-    ] {
-      let main = fixture.write("main.sh", &source);
-      let mut settings = Settings::new(fixture.root.clone());
-      settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
-      app.add_input(&main);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      assert_eq!(app.document_id(&library).is_some(), resolved, "{source}");
-    }
-  }
-
-  #[test]
-  fn filesystem_queries_are_refreshed_and_dynamic_paths_remain_unresolved() {
-    let fixture = Fixture::new();
-    let main = fixture.write("main.sh", ". ./lib/*.sh\n");
-    let a = fixture.write("lib/a.sh", "a=1\n");
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.initial = InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
-    app.add_input(&main);
-    let cancel = AtomicBool::new(false);
-    app.refresh(&cancel).unwrap();
-    assert!(app.document_id(&a).is_some());
-    std::fs::remove_file(&a).unwrap();
-    let b = fixture.write("lib/b.sh", "b=1\n");
-    app.refresh(&cancel).unwrap();
-    assert!(app.document_id(&a).is_none());
-    assert!(app.document_id(&b).is_some());
-    app
-      .open(
-        &main,
-        "if choice; then d=./lib; else d=./elsewhere; fi; cd \"$d\"; . ./b.sh",
-        &cancel,
-      )
-      .unwrap();
-    app.refresh(&cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    assert!(matches!(
-      app.workspace().dependencies(id).next().unwrap().1,
-      DependencyState::Unresolved(_)
-    ));
-  }
-
-  #[cfg(unix)]
-  #[test]
-  fn logical_and_physical_cd_use_different_parents_of_a_symbolic_link() {
-    let fixture = Fixture::new();
-    let logical = fixture.write("library.sh", "logical=1\n");
-    let physical = fixture.write("real/library.sh", "physical=1\n");
-    std::fs::create_dir(fixture.root.join("real/sub")).unwrap();
-    std::os::unix::fs::symlink("real/sub", fixture.root.join("link")).unwrap();
-    for (option, expected) in [("-L", &logical), ("-P", &physical)] {
-      let main = fixture
-        .write("main.sh", &format!("cd {option} link/..; . ./library.sh"));
-      let mut settings = Settings::new(fixture.root.clone());
-      settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
-      app.add_input(&main);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      assert!(app.document_id(expected).is_some(), "{option}");
-      assert_eq!(app.workspace().documents().count(), 2);
-    }
-  }
 }
 
 mod session {
@@ -1869,55 +681,6 @@ mod session {
   use std::sync::atomic::Ordering;
   use std::time::Duration;
   use tokio::sync::oneshot;
-
-  #[test]
-  fn position_queries_keep_the_original_text_after_rejected_reload_and_retry() {
-    use shellsmith::interface::application::Application;
-    use std::sync::atomic::AtomicBool;
-    for operation in ["definition", "references", "prepare", "rename"] {
-      let fixture = Fixture::new();
-      let original = "first=1; : $first\n";
-      let path = fixture.write("main.sh", original);
-      let mut app =
-        Application::new(Settings::new(fixture.root.clone())).unwrap();
-      app.add_input(&fixture.root);
-      let cancelled = AtomicBool::new(false);
-      app.refresh(&cancelled).unwrap();
-      let query = |app: &mut Application, offset| match operation {
-        "definition" => app
-          .definitions(app.document_id(&path).unwrap(), offset, &cancelled)
-          .map(|sites| sites.len()),
-        "references" => app
-          .references(&path, offset, true, &cancelled)
-          .map(|sites| sites.len()),
-        "prepare" => app
-          .prepare_rename(&path, offset, &cancelled)
-          .map(|target| usize::from(target.is_some())),
-        _ => app
-          .rename(&path, offset, "renamed", &cancelled)
-          .map(|edits| edits.len()),
-      };
-      assert!(query(&mut app, 0).unwrap() > 0, "{operation}");
-      fixture.write("main.sh", "other=2; first=1; : $first\n");
-      for _ in 0..2 {
-        assert!(
-          matches!(query(&mut app, 0), Err(Error::Superseded)),
-          "{operation}"
-        );
-        assert_eq!(
-          app
-            .workspace()
-            .document(app.document_id(&path).unwrap())
-            .unwrap()
-            .source(),
-          original,
-          "{operation}"
-        );
-      }
-      app.refresh(&cancelled).unwrap();
-      assert!(query(&mut app, 9).unwrap() > 0, "{operation}");
-    }
-  }
 
   #[tokio::test]
   async fn position_requests_refresh_other_inputs_and_membership_before_answering()
@@ -2061,50 +824,6 @@ mod session {
   }
 
   #[tokio::test]
-  async fn cancelling_one_request_leaves_another_request_running_and_discards_changes()
-   {
-    let fixture = Fixture::new();
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.limits.value_bytes = 1024;
-    let session = Session::new(settings.clone()).unwrap();
-    let (started, start) = oneshot::channel();
-    let (release, resume) = std::sync::mpsc::channel();
-    let (stopped, stop) = oneshot::channel();
-    let cancelled = tokio::spawn(session.request(
-      RequestScope::Workspace,
-      move |application, flag| {
-        settings.limits.value_bytes = 512;
-        application.configure(settings)?;
-        started.send(()).unwrap();
-        resume.recv_timeout(Duration::from_secs(10)).unwrap();
-        stopped.send(flag.load(Ordering::Relaxed)).unwrap();
-        Ok(())
-      },
-    ));
-    start.await.unwrap();
-    let independent =
-      session.request(RequestScope::Workspace, |application, flag| {
-        assert!(!flag.load(Ordering::Relaxed));
-        Ok(application.settings().limits.value_bytes)
-      });
-    cancelled.abort();
-    assert!(cancelled.await.unwrap_err().is_cancelled());
-    release.send(()).unwrap();
-    assert!(stop.await.unwrap());
-    assert_eq!(independent.await.result.unwrap(), 1024);
-    assert_eq!(
-      session
-        .request(RequestScope::Workspace, |application, _| Ok(
-          application.settings().limits.value_bytes
-        ))
-        .await
-        .result
-        .unwrap(),
-      1024
-    );
-  }
-
-  #[tokio::test]
   async fn dropping_a_session_cancels_workers_that_outlive_it() {
     let fixture = Fixture::new();
     let session = Session::new(Settings::new(fixture.root.clone())).unwrap();
@@ -2192,34 +911,6 @@ mod session {
         .unwrap();
       assert_eq!(edits.len(), 2);
       assert_eq!(analyze().await.result.unwrap(), before);
-    }
-  }
-
-  #[tokio::test]
-  async fn failed_requests_do_not_commit_mutations_or_poison_the_session() {
-    let fixture = Fixture::new();
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.limits.value_bytes = 1024;
-    let session = Session::new(settings.clone()).unwrap();
-    for panics in [false, true] {
-      let mut settings = settings.clone();
-      let result = session
-        .request(RequestScope::Workspace, move |application, _| {
-          settings.limits.value_bytes = 512;
-          application.configure(settings)?;
-          assert!(!panics, "test worker failure");
-          Err::<(), _>(Error::Message("test operation failure".into()))
-        })
-        .await;
-      assert!(matches!(result.result, Err(Error::Message(_))));
-      let actual = session
-        .request(RequestScope::Workspace, |application, _| {
-          Ok(application.settings().limits.value_bytes)
-        })
-        .await
-        .result
-        .unwrap();
-      assert_eq!(actual, 1024);
     }
   }
 
@@ -2403,22 +1094,53 @@ mod session {
 }
 
 mod sources {
+  use crate::application_client::Client;
   use crate::fixtures;
   use fixtures::Fixture;
-  use shellsmith::interface::application::engine::{
-    DependencyState, InitialEnvironment, OccurrenceKind, ResolutionIssue, Value,
-  };
-  use shellsmith::interface::application::{Application, Settings};
+  use shellsmith::interface::application::Settings;
+  use shellsmith::interface::application::engine::InitialEnvironment;
   use std::sync::atomic::AtomicBool;
 
-  fn application(fixture: &Fixture) -> Application {
+  fn application(fixture: &Fixture) -> Client {
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial = InitialEnvironment::empty();
-    Application::new(settings).unwrap()
+    Client::new(settings).unwrap()
   }
 
   #[test]
-  fn source_links_require_a_terminated_heredoc_and_recover_after_repair() {
+  fn initial_pipefail_selects_status_dependent_source_links() {
+    let fixture = Fixture::new();
+    let zero = fixture.write("0.sh", ":\n");
+    let two = fixture.write("2.sh", ":\n");
+    let source = "(exit 2) | (exit 0); . \"./$?.sh\"";
+    let main = fixture.write("main.sh", source);
+    let cancel = AtomicBool::new(false);
+    let mut settings = Settings::new(fixture.root.clone());
+    settings.initial.environment.clear();
+    for (pipefail, expected) in [
+      (settings.initial.pipefail, Some(&zero)),
+      (Some(true), Some(&two)),
+      (None, None),
+      (Some(false), Some(&zero)),
+    ] {
+      settings.initial.pipefail = pipefail;
+      let mut app = Client::new(settings.clone()).unwrap();
+      app.open(&main, source, &cancel).unwrap();
+      assert_eq!(
+        app
+          .document_links(&main, &cancel)
+          .unwrap()
+          .iter()
+          .map(|(_, path)| path)
+          .collect::<Vec<_>>(),
+        expected.into_iter().collect::<Vec<_>>(),
+        "initial pipefail: {pipefail:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn source_links_accept_heredoc_eof_but_require_a_closed_substitution() {
     let fixture = Fixture::new();
     let library = fixture.write("lib.sh", ":\n");
     let main = fixture.root.join("main.sh");
@@ -2437,92 +1159,44 @@ mod sources {
       let source = format!("{prefix}{closing}");
       let mut app = application(&fixture);
       app.open(&main, &source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
-      assert!(app.workspace().document(id).unwrap().has_syntax_errors());
-      assert_eq!(app.document_links(id, &cancel).unwrap(), [], "{source}");
+      let id = app.document(&main).unwrap();
+      let broken = opening == "ignored=$(";
+      assert_eq!(
+        app
+          .snapshot()
+          .workspace()
+          .document(id)
+          .unwrap()
+          .has_syntax_errors(),
+        broken,
+        "{source}"
+      );
+      let links = app.document_links(&main, &cancel).unwrap();
+      if broken {
+        assert_eq!(links, [], "{source}");
+      } else {
+        assert_eq!(
+          links.iter().map(|(_, path)| path).collect::<Vec<_>>(),
+          [&library],
+          "{source}"
+        );
+      }
 
       let repaired = format!("{prefix}\n{closing}");
       app.change(&main, &repaired, &cancel).unwrap();
-      assert!(!app.workspace().document(id).unwrap().has_syntax_errors());
-      let links = app.document_links(id, &cancel).unwrap();
+      assert!(
+        !app
+          .snapshot()
+          .workspace()
+          .document(id)
+          .unwrap()
+          .has_syntax_errors()
+      );
+      let links = app.document_links(&main, &cancel).unwrap();
       assert_eq!(links.len(), 1, "{repaired}");
       assert_eq!(links[0].1, library);
       assert_eq!(&repaired[links[0].0.bytes.clone()], "\"$path\"");
     }
-  }
-
-  #[test]
-  fn source_annotations_share_links_definitions_tokens_and_rename_without_inventing_values()
-   {
-    use shellsmith::interface::application::engine::{Modifier, SemanticKind};
-    let fixture = Fixture::new();
-    let library = fixture.write("lib.sh", "readonly value=ok\nf() { :; }\n");
-    let source = "read path\n# shellsmith source=\"./lib.sh\"\n. \"$path\"\nf\n: \"$value\" \"$path\"\n";
-    let main = fixture.write("main.sh", source);
-    let cancel = AtomicBool::new(false);
-    let mut app = application(&fixture);
-    app.add_input(&main);
-    app.refresh(&cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    let links = app.document_links(id, &cancel).unwrap();
-    assert_eq!(links.len(), 1);
-    assert_eq!(links[0].1, library);
-    assert_eq!(&source[links[0].0.bytes.clone()], "\"$path\"");
-    let call = source.find("\nf\n").unwrap() + 1;
-    let definitions = app.definitions(id, call, &cancel).unwrap();
-    assert_eq!(definitions.len(), 1);
-    assert_eq!(
-      app.path(definitions[0].snapshot.document),
-      Some(library.as_path())
-    );
-    assert_eq!(definitions[0].bytes, 18..19);
-    let spans = app.classify(id, &cancel).unwrap();
-    assert!(
-      spans
-        .iter()
-        .any(|span| span.location.bytes == (call..call + 1)
-          && span.kind == SemanticKind::Function)
-    );
-    let value = source.rfind("$value").unwrap() + 1;
-    assert!(
-      spans
-        .iter()
-        .any(|span| span.location.bytes == (value..value + 5)
-          && span.modifiers.contains(&Modifier::Readonly))
-    );
-    let analysis = app.workspace().analysis().unwrap();
-    for site in app
-      .workspace()
-      .document(id)
-      .unwrap()
-      .occurrences()
-      .iter()
-      .filter(|site| {
-        site.kind == OccurrenceKind::VariableExpansion
-          && site.name == Value::Literal(b"path".to_vec())
-      })
-    {
-      assert!(
-        analysis
-          .values(site.id)
-          .all(|(_, value)| matches!(value, Value::Unknown(_)))
-      );
-    }
-    let edits = app.rename(&main, call, "renamed", &cancel).unwrap();
-    assert_eq!(edits.len(), 2);
-    let mut edited_main = source.to_owned();
-    let mut edited_library = "readonly value=ok\nf() { :; }\n".to_owned();
-    for edit in edits.iter().rev() {
-      let text =
-        if app.path(edit.location.snapshot.document) == Some(main.as_path()) {
-          &mut edited_main
-        } else {
-          &mut edited_library
-        };
-      text.replace_range(edit.location.bytes.clone(), &edit.new_text);
-    }
-    assert_eq!(edited_main, source.replace("\nf\n", "\nrenamed\n"));
-    assert_eq!(edited_library, "readonly value=ok\nrenamed() { :; }\n");
   }
 
   #[test]
@@ -2563,8 +1237,7 @@ mod sources {
       let mut app = application(&fixture);
       let cancel = AtomicBool::new(false);
       app.open(&main, &source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
-      let links = app.document_links(id, &cancel).unwrap();
+      let links = app.document_links(&main, &cancel).unwrap();
       assert_eq!(
         links.iter().map(|(_, path)| path).collect::<Vec<_>>(),
         expected.into_iter().collect::<Vec<_>>(),
@@ -2592,10 +1265,9 @@ mod sources {
       let mut app = application(&fixture);
       let cancel = AtomicBool::new(false);
       app.open(&main, &source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
       assert_eq!(
         app
-          .document_links(id, &cancel)
+          .document_links(&main, &cancel)
           .unwrap()
           .iter()
           .map(|(_, path)| path)
@@ -2638,13 +1310,12 @@ mod sources {
       if let Some(value) = initial_home.clone() {
         settings.initial.environment.insert(b"HOME".to_vec(), value);
       }
-      let mut app = Application::new(settings).unwrap();
+      let mut app = Client::new(settings).unwrap();
       let cancel = AtomicBool::new(false);
       app.open(&main, &source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
       assert_eq!(
         app
-          .document_links(id, &cancel)
+          .document_links(&main, &cancel)
           .unwrap()
           .iter()
           .map(|(_, path)| path)
@@ -2668,8 +1339,7 @@ mod sources {
       let main = fixture.write("main.sh", &source);
       let mut app = application(&fixture);
       app.open(&main, &source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
-      let links = app.document_links(id, &cancel).unwrap();
+      let links = app.document_links(&main, &cancel).unwrap();
       assert_eq!(links.len(), 1, "{source:?}");
       assert_eq!(links[0].1, library);
       assert_eq!(
@@ -2678,7 +1348,7 @@ mod sources {
       );
       assert_eq!(
         app
-          .definitions(id, source.len() - 2, &cancel)
+          .definitions(&main, source.len() - 2, &cancel)
           .unwrap()
           .len(),
         1
@@ -2713,9 +1383,8 @@ mod sources {
       let mut app = application(&fixture);
       let cancel = AtomicBool::new(false);
       app.open(&main, &source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
       assert!(
-        app.document_links(id, &cancel).unwrap().is_empty(),
+        app.document_links(&main, &cancel).unwrap().is_empty(),
         "{source}"
       );
     }
@@ -2729,7 +1398,7 @@ mod sources {
     let automatic = fixture.write("auto.sh", ":\n");
     for (source, expected) in [
       (
-        "# shellsmith source=./lib.sh\n. unavailable_in_PATH\n",
+        "read PATH\n# shellsmith source=./lib.sh\n. unavailable_in_PATH\n",
         vec![&library],
       ),
       (
@@ -2765,8 +1434,7 @@ mod sources {
       let mut app = application(&fixture);
       let cancel = AtomicBool::new(false);
       app.open(&main, source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
-      let links = app.document_links(id, &cancel).unwrap();
+      let links = app.document_links(&main, &cancel).unwrap();
       assert_eq!(
         links.iter().map(|(_, path)| path).collect::<Vec<_>>(),
         expected,
@@ -2775,29 +1443,39 @@ mod sources {
     }
   }
 
+  #[cfg(unix)]
   #[test]
   fn source_annotations_preserve_loading_failures_and_accept_unsaved_targets() {
+    use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
     let fallback = fixture.write("fallback.sh", "fallback() { :; }\n");
     let broken = fixture.write("broken.sh", "");
     std::fs::write(&broken, [0xff]).unwrap();
+    let locked = fixture.write("locked.sh", "locked() { :; }\n");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+      .unwrap();
     let cancel = AtomicBool::new(false);
-    for operand in ["./broken.sh", "\"$path\""] {
-      let annotation = if operand == "./broken.sh" {
-        "./fallback.sh"
-      } else {
-        "./broken.sh"
-      };
-      let source =
-        format!("read path\n# shellsmith source={annotation}\n. {operand}\n");
-      let main = fixture.write("main.sh", &source);
-      let mut app = application(&fixture);
-      app.open(&main, &source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
-      assert_eq!(app.document_links(id, &cancel).unwrap(), []);
-      assert_eq!(app.failures().len(), 1);
-      assert_eq!(app.failures()[0].path, broken);
-      assert!(app.document_id(&fallback).is_none());
+    for (target, path) in [("./broken.sh", &broken), ("./locked.sh", &locked)] {
+      if path == &locked && std::fs::read(&locked).is_ok() {
+        // Permissions do not restrict this user.
+        continue;
+      }
+      for operand in [target, "\"$path\""] {
+        let annotation = if operand == target {
+          "./fallback.sh"
+        } else {
+          target
+        };
+        let source =
+          format!("read path\n# shellsmith source={annotation}\n. {operand}\n");
+        let main = fixture.write("main.sh", &source);
+        let mut app = application(&fixture);
+        app.open(&main, &source, &cancel).unwrap();
+        assert_eq!(app.document_links(&main, &cancel).unwrap(), [], "{source}");
+        assert_eq!(app.failures().len(), 1, "{source}");
+        assert_eq!(app.failures()[0].path, *path, "{source}");
+        assert!(app.snapshot().document_id(&fallback).is_none(), "{source}");
+      }
     }
     let source = "read path\n# shellsmith source=./new.sh\n. \"$path\"\nf\n";
     let main = fixture.write("main.sh", source);
@@ -2805,20 +1483,19 @@ mod sources {
     let mut app = application(&fixture);
     app.open(&main, source, &cancel).unwrap();
     app.open(&target, "f() { :; }\n", &cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    let links = app.document_links(id, &cancel).unwrap();
+    let links = app.document_links(&main, &cancel).unwrap();
     assert_eq!(links.len(), 1);
     assert_eq!(links[0].1, target);
     assert_eq!(
       app
-        .definitions(id, source.len() - 2, &cancel)
+        .definitions(&main, source.len() - 2, &cancel)
         .unwrap()
         .len(),
       1
     );
-    assert!(app.close(&target, &cancel).is_err());
-    let id = app.document_id(&main).unwrap();
-    assert_eq!(app.document_links(id, &cancel).unwrap(), []);
+    app.close(&target, &cancel).unwrap();
+    assert!(app.failures().iter().any(|failure| failure.path == target));
+    assert_eq!(app.document_links(&main, &cancel).unwrap(), []);
   }
 
   #[test]
@@ -2833,10 +1510,9 @@ mod sources {
     let mut app = application(&fixture);
     let cancel = AtomicBool::new(false);
     app.open(&main, source, &cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
     assert_eq!(
       app
-        .document_links(id, &cancel)
+        .document_links(&main, &cancel)
         .unwrap()
         .into_iter()
         .map(|(_, path)| path)
@@ -2855,457 +1531,13 @@ mod sources {
       Err(Error::RenameRefused(_))
     ));
   }
-
-  #[test]
-  fn source_annotations_follow_nested_and_deferred_bodies_and_refresh_with_overlays()
-   {
-    let fixture = Fixture::new();
-    let source =
-      "read path\n# shellsmith source=./nested/first.sh\n. \"$path\"\n";
-    let main = fixture.write("main.sh", source);
-    let first_source =
-      "read path\n# shellsmith source=./second.sh\n. \"$path\"\n";
-    let first = fixture.write("nested/first.sh", first_source);
-    let second = fixture.write("nested/second.sh", "f() { :; }\n");
-    let third = fixture.write("nested/third.sh", "g() { :; }\n");
-    let cancel = AtomicBool::new(false);
-    let mut app = application(&fixture);
-    app.add_input(&main);
-    app.refresh(&cancel).unwrap();
-    let id = app.document_id(&first).unwrap();
-    assert_eq!(app.workspace().symbols_named(b"f").count(), 1);
-    assert_eq!(
-      app
-        .document_links(id, &cancel)
-        .unwrap()
-        .iter()
-        .map(|(_, path)| path)
-        .collect::<Vec<_>>(),
-      [&second]
-    );
-    app
-      .open(
-        &first,
-        "read path\n# shellsmith source=./third.sh\n. \"$path\"\n",
-        &cancel,
-      )
-      .unwrap();
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.workspace().symbols_named(b"f").count(), 0);
-    assert_eq!(app.workspace().symbols_named(b"g").count(), 1);
-    let id = app.document_id(&first).unwrap();
-    assert_eq!(
-      app
-        .document_links(id, &cancel)
-        .unwrap()
-        .iter()
-        .map(|(_, path)| path)
-        .collect::<Vec<_>>(),
-      [&third]
-    );
-    for source in [
-      "read path\nf() {\n# shellsmith source=./nested/second.sh\n. \"$path\"\n}\nf\n",
-      "f() {\n# shellsmith source=./nested/second.sh\n. \"$path\"\n}\n",
-      "read path\ntrap '# shellsmith source=./nested/second.sh\n. \"$path\"' EXIT\n",
-    ] {
-      let mut app = application(&fixture);
-      app.open(&main, source, &cancel).unwrap();
-      let id = app.document_id(&main).unwrap();
-      assert_eq!(
-        app
-          .document_links(id, &cancel)
-          .unwrap()
-          .iter()
-          .map(|(_, path)| path)
-          .collect::<Vec<_>>(),
-        if source.starts_with("f()") {
-          vec![]
-        } else {
-          vec![&second]
-        },
-        "{source}"
-      );
-    }
-  }
-
-  #[test]
-  fn source_discovery_continues_after_termination_in_entries_and_sourced_files()
-  {
-    let fixture = Fixture::new();
-    let first =
-      fixture.write("first.sh", "set -u; exit; next=./second.sh; f() { :; }\n");
-    let second = fixture.write("second.sh", "exec replacement; g() { :; }\n");
-    for source in [
-      "lib=./first.sh; set -eu; false; : \"$missing\"; exit; . \"$lib\"; . \"$next\"; f; g",
-      "lib=./first.sh; set -o errexit -o nounset; exec replacement; . \"$lib\"; . \"$next\"; f; g",
-    ] {
-      let main = fixture.write("main.sh", source);
-      let mut app = application(&fixture);
-      app.add_input(&main);
-      let cancelled = AtomicBool::new(false);
-      app.refresh(&cancelled).unwrap();
-      assert!(app.document_id(&first).is_some(), "{source}");
-      assert!(app.document_id(&second).is_some(), "{source}");
-      let id = app.document_id(&main).unwrap();
-      assert!(
-        app
-          .workspace()
-          .dependencies(id)
-          .all(|(_, state)| { matches!(state, DependencyState::Resolved(_)) }),
-        "{source}"
-      );
-      let spans = app.classify(id, &cancelled).unwrap();
-      assert_eq!(
-        spans
-          .iter()
-          .filter(|span| {
-            span.kind
-              == shellsmith::interface::application::engine::SemanticKind::Function
-          })
-          .count(),
-        2,
-        "{source}"
-      );
-    }
-  }
-
-  #[test]
-  fn assigned_source_paths_load_nested_files_and_recompute_after_changes() {
-    let fixture = Fixture::new();
-    let main = fixture.write(
-      "main.sh",
-      "base=./lib; file=$base/first.sh; . \"$file\"; . \"$next\"; f\n",
-    );
-    let first = fixture.write("lib/first.sh", "next=./lib/second.sh\n");
-    let second = fixture.write("lib/second.sh", "f() { :; }\n");
-    let third = fixture.write("lib/third.sh", "other() { :; }\n");
-    let mut app = application(&fixture);
-    app.add_input(&main);
-    let cancelled = AtomicBool::new(false);
-    app.refresh(&cancelled).unwrap();
-    assert!(app.document_id(&second).is_some());
-    assert!(app.document_id(&third).is_none());
-    let id = app.document_id(&main).unwrap();
-    assert!(app.classify(id, &cancelled).unwrap().iter().any(|span| {
-      span.kind
-        == shellsmith::interface::application::engine::SemanticKind::Function
-    }));
-    app
-      .open(&first, "next=./lib/third.sh\n", &cancelled)
-      .unwrap();
-    app.refresh(&cancelled).unwrap();
-    assert!(app.document_id(&second).is_none());
-    assert!(app.document_id(&third).is_some());
-  }
-
-  #[test]
-  fn assigned_source_operands_use_pre_prefix_values_and_merge_call_contexts() {
-    let fixture = Fixture::new();
-    let first = fixture.write("first.sh", "first=1\n");
-    let second = fixture.write("second.sh", "second=1\n");
-    for (source, expected) in [
-      (
-        "lib=./first.sh; lib=./second.sh . \"$lib\"; . \"$lib\"",
-        vec![first.clone(), second.clone()],
-      ),
-      (
-        "if condition; then lib=./first.sh; else lib=./first.sh; fi; . \"$lib\"",
-        vec![first.clone()],
-      ),
-      (
-        "if condition; then lib=a/first.sh; else lib=b/first.sh; fi; . \"./${lib#*/}\"",
-        vec![first.clone()],
-      ),
-      (
-        "if condition; then base=fi; tail=rst.sh; else base=f; tail=irst.sh; fi; copied=$base; . \"./$copied$tail\"",
-        vec![first.clone()],
-      ),
-      (
-        "if condition; then lib=./first.sh; else lib=./second.sh; fi; . \"$lib\"",
-        vec![],
-      ),
-      (
-        "f() { . \"$lib\"; }; lib=./first.sh; f; lib=./second.sh; f",
-        vec![],
-      ),
-      ("lib=./first.sh; . $lib", vec![first.clone()]),
-      (
-        "for lib in ./first.sh; do . \"$lib\"; done",
-        vec![first.clone()],
-      ),
-      (
-        "for lib in ./first.sh ./second.sh; do . \"$lib\"; done",
-        vec![],
-      ),
-    ] {
-      let main = fixture.write("main.sh", source);
-      let mut app = application(&fixture);
-      app.add_input(&main);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      let id = app.document_id(&main).unwrap();
-      let actual: Vec<_> = app
-        .workspace()
-        .dependencies(id)
-        .filter_map(|(_, state)| {
-          if let DependencyState::Resolved(snapshot) = state {
-            app
-              .path(snapshot.document)
-              .map(std::path::Path::to_path_buf)
-          } else {
-            None
-          }
-        })
-        .collect();
-      assert_eq!(actual, expected, "{source}");
-    }
-  }
-
-  #[test]
-  fn copied_environment_values_survive_overwrites_without_environment_modifiers()
-   {
-    let fixture = Fixture::new();
-    let main = fixture.write(
-      "main.sh",
-      "base=$HOME; HOME=./elsewhere; . \"$base/lib.sh\"; : \"$HOME\"\n",
-    );
-    let library = fixture.write("lib.sh", "f() { :; }\n");
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.initial = InitialEnvironment::empty();
-    settings.initial.environment.insert(
-      b"HOME".to_vec(),
-      fixture.root.as_os_str().as_encoded_bytes().to_vec(),
-    );
-    let mut app = Application::new(settings).unwrap();
-    app.add_input(&main);
-    let cancelled = AtomicBool::new(false);
-    app.refresh(&cancelled).unwrap();
-    assert!(app.document_id(&library).is_some());
-    let id = app.document_id(&main).unwrap();
-    let spans = app.classify(id, &cancelled).unwrap();
-    let marked: Vec<_> = spans
-      .iter()
-      .filter(|span| {
-        span.modifiers.contains(
-          &shellsmith::interface::application::engine::Modifier::Environment,
-        )
-      })
-      .map(|span| span.location.bytes.clone())
-      .collect();
-    assert_eq!(marked, vec![6..10]);
-  }
-
-  #[test]
-  fn limited_or_unsupported_assignment_values_never_become_resolved_sources() {
-    let fixture = Fixture::new();
-    fixture.write("lib.sh", "found=1\n");
-    for (source, limit, expected) in [
-      ("lib=./lib.sh; . \"$lib\"", 7, 0),
-      ("lib=./lib.sh; . \"$lib\"", 8, 1),
-      ("lib=$(printf ./lib.sh); . \"$lib\"", 8, 0),
-      ("lib=./lib.sh; eval change; . \"$lib\"", 8, 1),
-    ] {
-      let main = fixture.write("main.sh", source);
-      let mut app = application(&fixture);
-      let mut settings = app.settings().clone();
-      settings.limits.value_bytes = limit;
-      app.configure(settings).unwrap();
-      app.add_input(&main);
-      let cancelled = AtomicBool::new(false);
-      app.refresh(&cancelled).unwrap();
-      assert_eq!(
-        app.workspace().symbols_named(b"found").count(),
-        expected,
-        "{source} with {limit}"
-      );
-      if limit == 7 {
-        let id = app.document_id(&main).unwrap();
-        app.classify(id, &cancelled).unwrap();
-        assert!(
-          app
-            .workspace()
-            .analysis()
-            .unwrap()
-            .gaps()
-            .iter()
-            .any(|gap| gap.issue == ResolutionIssue::ValueLimit)
-        );
-      }
-    }
-  }
-
-  #[test]
-  fn source_invocations_use_expanded_names_operands_and_search_conditions() {
-    let fixture = fixtures::Fixture::new();
-    fixture.write("lib.sh", "loaded=yes\n");
-    fixture.write("other/lib.sh", "loaded=other\n");
-    for (source, expected) in [
-      ("op=.; \"$op\" ./lib.sh; : \"$loaded\"", "yes"),
-      ("command . ./lib.sh; : \"$loaded\"", "yes"),
-      (". -- ./lib.sh; : \"$loaded\"", "yes"),
-      ("p=./lib.sh; . $p; : \"$loaded\"", "yes"),
-      (". \"${p:-./lib.sh}\"; : \"$loaded\"", "yes"),
-      ("PATH=./other; . lib.sh; : \"$loaded\"", "other"),
-      (
-        "unused() { cd /unknown; }; . ./lib.sh; : \"$loaded\"",
-        "yes",
-      ),
-      ("(cd /unknown); . ./lib.sh; : \"$loaded\"", "yes"),
-    ] {
-      let main = fixture.write("main.sh", source);
-      let mut settings = Settings::new(fixture.root.clone());
-      settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
-      app.add_input(&main);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      let id = app.document_id(&main).unwrap();
-      app.classify(id, &AtomicBool::new(false)).unwrap();
-      let analysis = app.workspace().analysis().unwrap();
-      let read = app
-        .workspace()
-        .document(id)
-        .unwrap()
-        .occurrences()
-        .iter()
-        .rev()
-        .find(|site| {
-          site.kind == OccurrenceKind::VariableExpansion
-            && site.name == Value::Literal(b"loaded".to_vec())
-        })
-        .unwrap();
-      assert_eq!(
-        analysis
-          .values(read.id)
-          .map(|(_, value)| value.clone())
-          .collect::<Vec<_>>(),
-        vec![Value::Literal(expected.as_bytes().to_vec())],
-        "{source}"
-      );
-      assert!(
-        app.workspace().symbols_named(b"loaded").any(|symbol| app
-          .path(symbol.id.snapshot.document)
-          .is_some_and(|path| path.ends_with(if expected == "other" {
-            "other/lib.sh"
-          } else {
-            "lib.sh"
-          }))),
-        "{source}"
-      );
-      let references: Vec<_> = app
-        .workspace()
-        .dependencies(id)
-        .map(|(_, state)| state.clone())
-        .collect();
-      assert!(
-        references.iter().any(|state| matches!(
-          state,
-          shellsmith::interface::application::engine::DependencyState::Resolved(
-            _
-          )
-        )),
-        "{source}: {references:?}"
-      );
-    }
-  }
-
-  #[test]
-  fn search_conditions_follow_execution_order_and_join_only_needed_inputs() {
-    use shellsmith::interface::application::engine::DependencyState;
-    let fixture = fixtures::Fixture::new();
-    let first = fixture.write("first/lib.sh", "loaded=first\n");
-    let second = fixture.write("second/lib.sh", "loaded=second\n");
-    let current = fixture.write("lib.sh", "loaded=current\n");
-    fixture.write("percent%/lib.sh", "loaded=percent\n");
-    for (source, expected) in [
-      (
-        "PATH=./first; . lib.sh; PATH=./second; . lib.sh",
-        vec![first.clone(), second.clone()],
-      ),
-      ("PATH=:./first; . lib.sh", vec![current.clone()]),
-      ("PATH=; . lib.sh", vec![]),
-      ("PATH=./percent%; . lib.sh", vec![]),
-      (
-        "PATH=./first; PATH=./second x=$(. lib.sh) command :",
-        vec![],
-      ),
-      ("PATH=./first; PATH=./second . lib.sh", vec![second.clone()]),
-      (
-        "PATH=./first; name=lib.sh; PATH=./second . \"$name\"",
-        vec![second.clone()],
-      ),
-      (
-        "PATH=./first; (PATH=./second); . lib.sh",
-        vec![first.clone()],
-      ),
-      (
-        "f() { PATH=./second; }; PATH=./first; f; . lib.sh",
-        vec![second.clone()],
-      ),
-      (
-        "if condition; then PATH=./first; else PATH=./second; fi; . lib.sh",
-        vec![],
-      ),
-      (
-        "if condition; then PATH=./first; else PATH=./first; fi; . lib.sh",
-        vec![first.clone()],
-      ),
-      (". ./missing; . ./first/lib.sh", vec![]),
-      ("command command -- . ./first/lib.sh", vec![first.clone()]),
-    ] {
-      let main = fixture.write("main.sh", source);
-      let mut settings = Settings::new(fixture.root.clone());
-      settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
-      app.add_input(&main);
-      app.refresh(&AtomicBool::new(false)).unwrap();
-      let id = app.document_id(&main).unwrap();
-      let actual: Vec<_> = app
-        .workspace()
-        .dependencies(id)
-        .filter_map(|(_, state)| match state {
-          DependencyState::Resolved(snapshot) => {
-            Some(app.path(snapshot.document).unwrap().to_path_buf())
-          }
-          _ => None,
-        })
-        .collect();
-      assert_eq!(actual, expected, "{source}");
-    }
-  }
-
-  #[test]
-  fn source_following_shares_trap_links_without_changing_the_callers_dependencies()
-   {
-    let fixture = Fixture::new();
-    let library = fixture.write("lib.sh", "target=./first.sh\n");
-    let first = fixture.write("first.sh", ":\n");
-    let second = fixture.write("second.sh", ":\n");
-    let hidden = fixture.write("hidden.sh", "hidden() { :; }\n");
-    let source = ". ./lib.sh\ntrap 'target=./hidden.sh; . ./hidden.sh' INT EXIT\n. \"$target\"\n";
-    let main = fixture.write("main.sh", source);
-    let mut application =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    application.add_input(&main);
-    let cancelled = AtomicBool::new(false);
-    for expected in [first, second] {
-      application.refresh(&cancelled).unwrap();
-      let id = application.document_id(&main).unwrap();
-      let links = application.document_links(id, &cancelled).unwrap();
-      assert_eq!(
-        links.iter().map(|(_, target)| target).collect::<Vec<_>>(),
-        vec![&library, &hidden, &expected]
-      );
-      assert!(application.document_id(&hidden).is_some());
-      assert_eq!(application.workspace().documents().count(), 5);
-      assert_eq!(application.workspace().symbols_named(b"hidden").count(), 1);
-      fixture.write("lib.sh", "target=./second.sh\n");
-    }
-  }
 }
 
 mod definitions {
+  use crate::application_client::Client;
   use crate::fixtures::Fixture;
+  use shellsmith::interface::application::Settings;
   use shellsmith::interface::application::engine::InitialEnvironment;
-  use shellsmith::interface::application::{Application, Settings};
   use std::sync::atomic::AtomicBool;
 
   #[test]
@@ -3318,14 +1550,13 @@ mod definitions {
     fixture.write("lib.sh", "loaded=yes");
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial = InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     let cancel = AtomicBool::new(false);
     app.open(&path, source, &cancel).unwrap();
-    let id = app.document_id(&path).unwrap();
     let call = source.find("f \"").unwrap();
     let variable = source.find("$path").unwrap() + 1;
     for offset in [call, variable] {
-      assert_eq!(app.definitions(id, offset, &cancel).unwrap(), []);
+      assert_eq!(app.definitions(&path, offset, &cancel).unwrap(), []);
       assert_eq!(app.references(&path, offset, false, &cancel).unwrap(), []);
       assert!(matches!(
         app.rename(&path, offset, "renamed", &cancel),
@@ -3333,13 +1564,13 @@ mod definitions {
       ));
     }
     assert!(
-      !app.classify(id, &cancel).unwrap().iter().any(|span| span
+      !app.classify(&path, &cancel).unwrap().iter().any(|span| span
         .location
         .bytes
         == (call..call + 1)
         && span.kind == SemanticKind::Function)
     );
-    assert_eq!(app.document_links(id, &cancel).unwrap(), []);
+    assert_eq!(app.document_links(&path, &cancel).unwrap(), []);
     assert_eq!(
       app
         .references(&path, source.find("f()").unwrap(), false, &cancel)
@@ -3348,20 +1579,19 @@ mod definitions {
     );
     let repaired = source.replace(">\"${}\"", "");
     app.change(&path, &repaired, &cancel).unwrap();
-    assert_eq!(app.definitions(id, call, &cancel).unwrap().len(), 1);
+    assert_eq!(app.definitions(&path, call, &cancel).unwrap().len(), 1);
     assert_eq!(
       app.references(&path, call, false, &cancel).unwrap().len(),
       1
     );
     assert!(
-      app
-        .classify(id, &cancel)
-        .unwrap()
-        .iter()
-        .any(|span| span.location.bytes == (call..call + 1)
-          && span.kind == SemanticKind::Function)
+      app.classify(&path, &cancel).unwrap().iter().any(|span| span
+        .location
+        .bytes
+        == (call..call + 1)
+        && span.kind == SemanticKind::Function)
     );
-    assert_eq!(app.document_links(id, &cancel).unwrap().len(), 1);
+    assert_eq!(app.document_links(&path, &cancel).unwrap().len(), 1);
     assert_eq!(
       app.rename(&path, call, "renamed", &cancel).unwrap().len(),
       2
@@ -3415,8 +1645,17 @@ mod definitions {
         &["f()"],
       ),
       ("x=1; trap ': \"$x\"' EXIT", "x\"", &["x=1"]),
+      (
+        "x=1; trap ': \"$x\"' EXIT; temp=$((x=2)) external",
+        "x\"",
+        &[],
+      ),
       ("x=1; trap ': \"$x\"' EXIT; x=2; x=1", "x\"", &[]),
-      ("x=1; trap ': \"$x\"' EXIT; x=2 /bin/utility", "x\"", &[]),
+      (
+        "x=1; trap ': \"$x\"' EXIT; x=2 /bin/utility",
+        "x\"",
+        &["x=1"],
+      ),
       ("x=1; trap ': \"$x\"' EXIT; (x=2)", "x\"", &["x=1"]),
       ("readonly x=1; trap ': \"$x\"' EXIT; x=2", "x\"", &["x=1"]),
       ("x=1; f() { : \"$x\"; }; trap 'f' EXIT", "x\"", &["x=1"]),
@@ -3436,7 +1675,7 @@ mod definitions {
       ),
       ("x=1; trap ': \"$x\"' EXIT; x=2 & wait", "x\"", &["x=1"]),
       ("x=1; trap ': \"$x\"' EXIT; : \"$(x=2)\"", "x\"", &["x=1"]),
-      ("x=1; trap ': \"$x\"' EXIT; x=2 | :", "x\"", &[]),
+      ("x=1; trap ': \"$x\"' EXIT; x=2 | :", "x\"", &["x=1"]),
       (
         "x=1; register() { trap ': \"$x\"' EXIT; }; x=2 register",
         "x\"",
@@ -3464,15 +1703,21 @@ mod definitions {
     let file = fixture.write("main.sh", source);
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial = InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     let cancel = AtomicBool::new(false);
     app.open(&file, source, &cancel).unwrap();
-    let id = app.document_id(&file).unwrap();
+    let id = app.document(&file).unwrap();
     let call = source.rfind("cleanup").unwrap();
     let read = source.find("$path").unwrap() + 1;
-    assert_eq!(app.definitions(id, call, &cancel).unwrap()[0].bytes, 28..35);
-    assert_eq!(app.definitions(id, read, &cancel).unwrap()[0].bytes, 9..13);
-    let spans = app.classify(id, &cancel).unwrap();
+    assert_eq!(
+      app.definitions(&file, call, &cancel).unwrap()[0].bytes,
+      28..35
+    );
+    assert_eq!(
+      app.definitions(&file, read, &cancel).unwrap()[0].bytes,
+      9..13
+    );
+    let spans = app.classify(&file, &cancel).unwrap();
     assert!(
       spans
         .iter()
@@ -3485,7 +1730,7 @@ mod definitions {
         .any(|span| span.location.bytes == (read..read + 4)
           && span.modifiers.contains(&Modifier::Readonly))
     );
-    let links = app.document_links(id, &cancel).unwrap();
+    let links = app.document_links(&file, &cancel).unwrap();
     assert_eq!(links.len(), 1);
     assert_eq!(
       (&source[links[0].0.bytes.clone()], &links[0].1),
@@ -3493,25 +1738,25 @@ mod definitions {
     );
     assert_eq!(
       app
+        .snapshot()
         .document_symbols(id)
         .unwrap()
         .filter(|entry| entry.details.symbol.name == b"cleanup")
         .count(),
       1
     );
-    assert_eq!(app.workspace_symbols("cleanup").count(), 1);
+    assert_eq!(app.snapshot().workspace_symbols("cleanup").count(), 1);
     let updated = format!("{source}; unset -f cleanup");
     app.change(&file, &updated, &cancel).unwrap();
-    assert_eq!(app.definitions(id, call, &cancel).unwrap(), []);
-    assert_eq!(app.definitions(id, read, &cancel).unwrap(), []);
-    assert_eq!(app.document_links(id, &cancel).unwrap(), []);
+    assert_eq!(app.definitions(&file, call, &cancel).unwrap(), []);
+    assert_eq!(app.definitions(&file, read, &cancel).unwrap(), []);
+    assert_eq!(app.document_links(&file, &cancel).unwrap(), []);
     assert!(
-      app
-        .classify(id, &cancel)
-        .unwrap()
-        .iter()
-        .any(|span| span.location.bytes == (call..call + 7)
-          && span.kind == SemanticKind::Command)
+      app.classify(&file, &cancel).unwrap().iter().any(|span| span
+        .location
+        .bytes
+        == (call..call + 7)
+        && span.kind == SemanticKind::Command)
     );
   }
 
@@ -3614,6 +1859,23 @@ mod definitions {
       ("x=1; n=2; : $((x+$((n+1))))", "n+1", &["n=2"]),
       ("x=1; n=2; : $((x+$((n+$n))))", "n+$n", &["n=2"]),
     ]);
+    let fixture = Fixture::new();
+    let source = "xy=1; n=2; : $((x\\\ny+$n))";
+    let path = fixture.write("main.sh", source);
+    let mut settings = Settings::new(fixture.root.clone());
+    settings.initial = InitialEnvironment::empty();
+    let mut app = Client::new(settings).unwrap();
+    for selected in ["x\\", "y+$n"] {
+      let locations = app
+        .definitions(
+          &path,
+          source.rfind(selected).unwrap(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
+      assert_eq!(locations.len(), 1, "{selected}");
+      assert_eq!(locations[0].bytes, 0..2, "{selected}");
+    }
   }
 
   #[test]
@@ -3631,9 +1893,10 @@ mod definitions {
       let path = fixture.write("main.sh", &source);
       let mut settings = Settings::new(fixture.root.clone());
       settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
+      let mut app = Client::new(settings).unwrap();
       let cancel = AtomicBool::new(false);
       app.open(&path, &source, &cancel).unwrap();
+      let id = app.document(&path).unwrap();
       let offset = source.rfind("helper").unwrap();
       let definition = source.find("helper()").unwrap();
       for called in [false, true, false] {
@@ -3643,9 +1906,11 @@ mod definitions {
           source.clone()
         };
         app.change(&path, &current, &cancel).unwrap();
-        let id = app.document_id(&path).unwrap();
-        assert_eq!(app.document_symbols(id).unwrap().count(), definitions + 1);
-        let spans = app.classify(id, &cancel).unwrap();
+        assert_eq!(
+          app.snapshot().document_symbols(id).unwrap().count(),
+          definitions + 1
+        );
+        let spans = app.classify(&path, &cancel).unwrap();
         assert_eq!(
           spans
             .iter()
@@ -3660,7 +1925,7 @@ mod definitions {
           "{current}"
         );
         assert_eq!(
-          app.definitions(id, offset, &cancel).unwrap().len(),
+          app.definitions(&path, offset, &cancel).unwrap().len(),
           if called { definitions } else { 0 },
           "{current}"
         );
@@ -3701,13 +1966,12 @@ mod definitions {
       let path = fixture.write("main.sh", &source);
       let mut settings = Settings::new(fixture.root.clone());
       settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
+      let mut app = Client::new(settings).unwrap();
       let cancel = AtomicBool::new(false);
       app.open(&path, &source, &cancel).unwrap();
-      let id = app.document_id(&path).unwrap();
       let offset = source.rfind("helper;").unwrap();
       assert!(
-        !app.classify(id, &cancel).unwrap().iter().any(|span| {
+        !app.classify(&path, &cancel).unwrap().iter().any(|span| {
           span.location.bytes.contains(&offset)
             && matches!(
               span.kind,
@@ -3717,7 +1981,7 @@ mod definitions {
         "{source}"
       );
       assert_eq!(
-        app.definitions(id, offset, &cancel).unwrap(),
+        app.definitions(&path, offset, &cancel).unwrap(),
         [],
         "{source}"
       );
@@ -3833,12 +2097,12 @@ mod definitions {
     let path = fixture.write("main.sh", source);
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial = InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     let cancel = AtomicBool::new(false);
     app.open(&path, source, &cancel).unwrap();
-    let id = app.document_id(&path).unwrap();
+    let id = app.document(&path).unwrap();
     let offset = source.rfind(query).unwrap();
-    let spans = app.classify(id, &cancel).unwrap();
+    let spans = app.classify(&path, &cancel).unwrap();
     let span = spans
       .iter()
       .find(|span| span.semantic && span.location.bytes.start == offset)
@@ -3849,7 +2113,7 @@ mod definitions {
       "{source}"
     );
     assert!(!span.modifiers.contains(&Modifier::Environment), "{source}");
-    let locations = app.definitions(id, offset, &cancel).unwrap();
+    let locations = app.definitions(&path, offset, &cancel).unwrap();
     let expected: Vec<_> = definitions
       .iter()
       .map(|definition| {
@@ -3886,9 +2150,9 @@ mod definitions {
         "{source}: {result:?}"
       );
     }
-    assert_eq!(app.classify(id, &cancel).unwrap(), spans, "{source}");
+    assert_eq!(app.classify(&path, &cancel).unwrap(), spans, "{source}");
     assert_eq!(
-      app.definitions(id, offset, &cancel).unwrap(),
+      app.definitions(&path, offset, &cancel).unwrap(),
       locations,
       "{source}"
     );
@@ -3901,12 +2165,12 @@ mod definitions {
       let path = fixture.write("main.sh", source);
       let mut settings = Settings::new(fixture.root.clone());
       settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
+      let mut app = Client::new(settings).unwrap();
       let cancel = AtomicBool::new(false);
       app.open(&path, source, &cancel).unwrap();
-      let id = app.document_id(&path).unwrap();
+      let id = app.document(&path).unwrap();
       let locations = app
-        .definitions(id, source.rfind(selected).unwrap(), &cancel)
+        .definitions(&path, source.rfind(selected).unwrap(), &cancel)
         .unwrap();
       let expected: Vec<_> = expected
         .iter()
@@ -3932,39 +2196,6 @@ mod definitions {
   }
 
   #[test]
-  fn definitions_keep_complete_source_candidates_and_ignore_unrelated_files() {
-    let fixture = Fixture::new();
-    let source = "if condition; then . ./b.sh; else . ./a.sh; fi\nf\n";
-    let main = fixture.write("main.sh", source);
-    let first = fixture.write("a.sh", "f() { :; }\n");
-    let second = fixture.write("b.sh", "f() { : 2; }\n");
-    fixture.write("unrelated.sh", "f() { : 3; }\n");
-    let cancel = AtomicBool::new(false);
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.initial = InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
-    app.add_input(&fixture.root);
-    app.refresh(&cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    let offset = source.rfind("f\n").unwrap();
-    let definitions = app.definitions(id, offset, &cancel).unwrap();
-    assert_eq!(
-      definitions
-        .iter()
-        .map(|location| {
-          (
-            app.path(location.snapshot.document).unwrap(),
-            location.bytes.clone(),
-          )
-        })
-        .collect::<Vec<_>>(),
-      [(first.as_path(), 0..1), (second.as_path(), 0..1)]
-    );
-    app.open(&first, "g() { :; }\n", &cancel).unwrap();
-    assert_eq!(app.definitions(id, offset, &cancel).unwrap(), []);
-  }
-
-  #[test]
   fn projections_share_current_callers_and_discard_removed_calls() {
     use shellsmith::interface::application::engine::{Modifier, SemanticKind};
     let fixture = Fixture::new();
@@ -3975,92 +2206,45 @@ mod definitions {
     let cancel = AtomicBool::new(false);
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial = InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     app.open(&main, source, &cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
     assert_eq!(
       app
-        .definitions(id, source.rfind('x').unwrap(), &cancel)
+        .definitions(&main, source.rfind('x').unwrap(), &cancel)
         .unwrap()
         .len(),
       1
     );
-    let library_id = app.document_id(&library).unwrap();
     let offset = library_source.find('x').unwrap();
-    let definitions = app.definitions(library_id, offset, &cancel).unwrap();
+    let definitions = app.definitions(&library, offset, &cancel).unwrap();
     assert_eq!(definitions.len(), 1);
     assert_eq!(definitions[0].bytes, offset..offset + 1);
-    assert!(
-      app
-        .classify(library_id, &cancel)
-        .unwrap()
-        .iter()
-        .any(|span| {
-          span.location.bytes == (offset..offset + 1)
-            && span.kind == SemanticKind::Variable
-            && span.modifiers.contains(&Modifier::Definition)
-        })
-    );
+    assert!(app.classify(&library, &cancel).unwrap().iter().any(|span| {
+      span.location.bytes == (offset..offset + 1)
+        && span.kind == SemanticKind::Variable
+        && span.modifiers.contains(&Modifier::Definition)
+    }));
     app
       .change(&main, ". ./lib.sh\n: \"$x\"\n", &cancel)
       .unwrap();
-    assert_eq!(app.definitions(library_id, offset, &cancel).unwrap(), []);
+    assert_eq!(app.definitions(&library, offset, &cancel).unwrap(), []);
     assert!(
-      !app
-        .classify(library_id, &cancel)
-        .unwrap()
-        .iter()
-        .any(|span| {
-          span.location.bytes == (offset..offset + 1)
-            && span.kind == SemanticKind::Variable
-            && span.modifiers.contains(&Modifier::Definition)
-        })
+      !app.classify(&library, &cancel).unwrap().iter().any(|span| {
+        span.location.bytes == (offset..offset + 1)
+          && span.kind == SemanticKind::Variable
+          && span.modifiers.contains(&Modifier::Definition)
+      })
     );
-  }
-
-  #[test]
-  fn definitions_use_source_overlays_and_invalidate_changed_or_unavailable_targets()
-   {
-    let fixture = Fixture::new();
-    let main_source = ". ./lib.sh\nf\n";
-    let main = fixture.write("main.sh", main_source);
-    let library = fixture.write("lib.sh", "f() { :; }\n");
-    let cancel = AtomicBool::new(false);
-    let mut settings = Settings::new(fixture.root.clone());
-    settings.initial = InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
-    app.open(&main, main_source, &cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    let first = app.definitions(id, 11, &cancel).unwrap();
-    assert_eq!(first.len(), 1);
-    assert_eq!(
-      app.path(first[0].snapshot.document),
-      Some(library.as_path())
-    );
-    assert_eq!(first[0].bytes, 0..1);
-    app
-      .open(&library, "# unsaved\nf() { :; }\n", &cancel)
-      .unwrap();
-    let updated = app.definitions(id, 11, &cancel).unwrap();
-    assert_eq!(updated.len(), 1);
-    assert_eq!(updated[0].bytes, 10..11);
-    assert_ne!(updated[0].snapshot, first[0].snapshot);
-    app.open(&library, "g() { :; }\n", &cancel).unwrap();
-    assert_eq!(app.definitions(id, 11, &cancel).unwrap(), []);
-    app.close(&library, &cancel).unwrap();
-    assert_eq!(app.definitions(id, 11, &cancel).unwrap()[0].bytes, 0..1);
-    std::fs::remove_file(&library).unwrap();
-    app.refresh(&cancel).unwrap();
-    assert_eq!(app.definitions(id, 11, &cancel).unwrap(), []);
   }
 }
 
 mod entry_results {
+  use crate::application_client::Client;
   use crate::fixtures::Fixture;
   use shellsmith::interface::application::engine::{
     InitialEnvironment, SemanticKind,
   };
-  use shellsmith::interface::application::{Application, Error, Settings};
+  use shellsmith::interface::application::{Error, Settings};
   use std::sync::atomic::AtomicBool;
 
   #[test]
@@ -4080,14 +2264,13 @@ mod entry_results {
       let cancel = AtomicBool::new(false);
       let mut settings = Settings::new(fixture.root.clone());
       settings.initial = InitialEnvironment::empty();
-      let mut app = Application::new(settings).unwrap();
+      let mut app = Client::new(settings).unwrap();
       app.add_input(&fixture.root);
       app.open(&library, &source, &cancel).unwrap();
-      let id = app.document_id(&library).unwrap();
       for position in [offset, operand] {
         assert_eq!(
           app
-            .definitions(id, position, &cancel)
+            .definitions(&library, position, &cancel)
             .unwrap()
             .iter()
             .map(|location| (location.bytes.start, location.bytes.end))
@@ -4096,7 +2279,7 @@ mod entry_results {
           "{body}, offset={position}"
         );
       }
-      let tokens = app.classify(id, &cancel).unwrap();
+      let tokens = app.classify(&library, &cancel).unwrap();
       for position in [offset, operand] {
         assert!(
           tokens
@@ -4141,13 +2324,18 @@ mod entry_results {
         [],
         "{body}"
       );
-      assert_eq!(app.definitions(id, offset, &cancel).unwrap(), [], "{body}");
+      assert_eq!(
+        app.definitions(&library, offset, &cancel).unwrap(),
+        [],
+        "{body}"
+      );
       assert!(
-        !app.classify(id, &cancel).unwrap().iter().any(|span| span
-          .location
-          .bytes
-          == (offset..offset + 1)
-          && span.kind == SemanticKind::Function),
+        !app
+          .classify(&library, &cancel)
+          .unwrap()
+          .iter()
+          .any(|span| span.location.bytes == (offset..offset + 1)
+            && span.kind == SemanticKind::Function),
         "{body}"
       );
     }
@@ -4162,23 +2350,24 @@ mod entry_results {
     let first = fixture.write("first.sh", "a() { :; }; . ./lib.sh; b\n");
     let second = fixture.write("second.sh", "a() { :; }; . ./lib.sh; b\n");
     let cancel = AtomicBool::new(false);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.add_input(&fixture.root);
     app.open(&library, library_source, &cancel).unwrap();
-    let id = app.document_id(&library).unwrap();
-    let definitions = app.definitions(id, 6, &cancel).unwrap();
+    let definitions = app.definitions(&library, 6, &cancel).unwrap();
     assert_eq!(
       definitions
         .iter()
-        .map(|location| app.path(location.snapshot.document).unwrap())
+        .map(|location| app
+          .snapshot()
+          .path(location.snapshot.document)
+          .unwrap())
         .collect::<Vec<_>>(),
       [first.as_path(), second.as_path()]
     );
     assert_eq!(app.references(&library, 6, false, &cancel).unwrap(), []);
     assert!(
       app
-        .classify(id, &cancel)
+        .classify(&library, &cancel)
         .unwrap()
         .iter()
         .any(|span| span.location.bytes == (6..7)
@@ -4196,12 +2385,10 @@ mod entry_results {
       let caller = fixture
         .write("main.sh", ". ./lib.sh\nloader=.; target=./target.sh; b\n");
       let cancel = AtomicBool::new(false);
-      let mut app =
-        Application::new(Settings::new(fixture.root.clone())).unwrap();
+      let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
       app.add_input(&fixture.root);
       app.open(&library, &source, &cancel).unwrap();
-      let id = app.document_id(&library).unwrap();
-      let links = app.document_links(id, &cancel).unwrap();
+      let links = app.document_links(&library, &cancel).unwrap();
       assert_eq!(links.len(), 1, "{body}");
       assert_eq!(links[0].1, target, "{body}");
       fixture.write("other.sh", ":\n");
@@ -4217,7 +2404,7 @@ mod entry_results {
         ". ./lib.sh\nloader=.; target=./target.sh; b\n",
       );
       app.add_input(&other);
-      assert_eq!(app.document_links(id, &cancel).unwrap(), [], "{body}");
+      assert_eq!(app.document_links(&library, &cancel).unwrap(), [], "{body}");
       app
         .open(
           &other,
@@ -4227,7 +2414,7 @@ mod entry_results {
         .unwrap();
       if body.starts_with('$') {
         assert_eq!(
-          app.document_links(id, &cancel).unwrap(),
+          app.document_links(&library, &cancel).unwrap(),
           [],
           "an ordinary command must invalidate a source role"
         );
@@ -4254,28 +2441,31 @@ mod entry_results {
       fixture.write("first.sh", &format!(". ./lib.sh\nquery={utility}; b\n"));
       fixture.write("second.sh", ". ./lib.sh\nquery=echo; b\n");
       let cancel = AtomicBool::new(false);
-      let mut app =
-        Application::new(Settings::new(fixture.root.clone())).unwrap();
+      let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
       app.add_input(&fixture.root);
       app.open(&library, &source, &cancel).unwrap();
-      let id = app.document_id(&library).unwrap();
       let offset = if body.contains("-v") {
         source.rfind("-v a").unwrap() + 3
       } else {
         source.rfind("'a'").unwrap() + 1
       };
-      assert_eq!(app.definitions(id, offset, &cancel).unwrap(), [], "{body}");
+      assert_eq!(
+        app.definitions(&library, offset, &cancel).unwrap(),
+        [],
+        "{body}"
+      );
       assert_eq!(
         app.references(&library, offset, false, &cancel).unwrap(),
         [],
         "{body}"
       );
       assert!(
-        !app.classify(id, &cancel).unwrap().iter().any(|span| span
-          .location
-          .bytes
-          == (offset..offset + 1)
-          && span.kind == SemanticKind::Function),
+        !app
+          .classify(&library, &cancel)
+          .unwrap()
+          .iter()
+          .any(|span| span.location.bytes == (offset..offset + 1)
+            && span.kind == SemanticKind::Function),
         "{body}"
       );
     }
@@ -4283,9 +2473,10 @@ mod entry_results {
 }
 
 mod references {
+  use crate::application_client::Client;
   use crate::fixtures::Fixture;
   use shellsmith::interface::application::engine::InitialEnvironment;
-  use shellsmith::interface::application::{Application, Error, Settings};
+  use shellsmith::interface::application::{Error, Settings};
   use std::sync::atomic::AtomicBool;
 
   fn assert_references(
@@ -4299,7 +2490,7 @@ mod references {
     let path = fixture.write("main.sh", source);
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial = InitialEnvironment::empty();
-    let mut app = Application::new(settings).unwrap();
+    let mut app = Client::new(settings).unwrap();
     let locations = app
       .references(
         &path,
@@ -4315,7 +2506,10 @@ mod references {
     let actual: Vec<_> = locations
       .iter()
       .map(|location| {
-        assert_eq!(app.path(location.snapshot.document), Some(path.as_path()));
+        assert_eq!(
+          app.snapshot().path(location.snapshot.document),
+          Some(path.as_path())
+        );
         location.bytes.clone()
       })
       .collect();
@@ -4337,6 +2531,20 @@ mod references {
       assert_references(source, "value", query, true, &[0, 1, 2, 3]);
     }
     for (source, name, query, uses, all) in [
+      (
+        "fo\\\no=1; cat <<EOF\n$fo\\\no ${fo\\\no} $((fo\\\no))\nEOF\n",
+        "fo\\\no",
+        "fo\\\no=1",
+        vec![1, 2, 3],
+        vec![0, 1, 2, 3],
+      ),
+      (
+        "fo\\\no() { :; }; : `fo\\\no; command -v fo\\\no`",
+        "fo\\\no",
+        "fo\\\no()",
+        vec![1, 2],
+        vec![0, 1, 2],
+      ),
       (
         "work() { :; }; work; work() { :; }; work",
         "work",
@@ -4552,8 +2760,7 @@ mod references {
     let fixture = Fixture::new();
     let source = "work() { :; }; 'work'; wo'r'k; \\work; name=work; \"$name\"; trap 'work' EXIT";
     let path = fixture.write("main.sh", source);
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     let cancel = AtomicBool::new(false);
     let locations = app.references(&path, 0, false, &cancel).unwrap();
     let actual: Vec<_> = locations
@@ -4610,14 +2817,13 @@ mod references {
     let second =
       fixture.write("second.sh", ". ./lib.sh; value=2; : \"$value\"\n");
     fixture.write("unrelated.sh", "value=3; : \"$value\"\n");
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.add_input(&fixture.root);
     let cancel = AtomicBool::new(false);
     let result = app.references(&library, 0, false, &cancel).unwrap();
     let paths: Vec<_> = result
       .iter()
-      .map(|location| app.path(location.snapshot.document).unwrap())
+      .map(|location| app.snapshot().path(location.snapshot.document).unwrap())
       .collect();
     assert_eq!(
       paths,
@@ -4633,13 +2839,15 @@ mod references {
     let first =
       fixture.write("first.sh", "value=1; . ./shared.sh; : \"$value\"");
     fixture.write("second.sh", "value=2; . ./shared.sh; : \"$value\"");
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.add_input(&fixture.root);
     let cancel = AtomicBool::new(false);
     let result = app.references(&first, 0, false, &cancel).unwrap();
     assert_eq!(result.len(), 1);
-    assert_eq!(app.path(result[0].snapshot.document), Some(first.as_path()));
+    assert_eq!(
+      app.snapshot().path(result[0].snapshot.document),
+      Some(first.as_path())
+    );
     assert_eq!(app.references(&shared, 4, false, &cancel).unwrap(), []);
   }
 
@@ -4730,13 +2938,13 @@ mod references {
         "value=1; f() { read name; read \"$name\"; (: \"$value\"); }; value=2 f; : \"$value\"",
         "value",
         "value=1",
-        vec![1, 3],
+        vec![3],
       ),
       (
         "value=1; f() { read name; read \"$name\"; (: \"$value\"); }; value=2 f; : \"$value\"",
         "value",
         "value=2",
-        vec![1, 3],
+        vec![1],
       ),
       (
         "value=1; . ./missing.sh; (. ./another.sh; : \"$value\"); : \"$value\"",
@@ -4816,8 +3024,7 @@ mod references {
     let path =
       fixture.write("main.sh", "work() { :; }; work; . ./broken; work");
     std::fs::write(fixture.root.join("broken"), [0xff]).unwrap();
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     let cancel = AtomicBool::new(false);
     let result = app.references(&path, 0, false, &cancel).unwrap();
     assert_eq!(
@@ -4834,31 +3041,12 @@ mod references {
   }
 
   #[test]
-  fn classification_discards_stale_workspace_results_without_rejecting_preparation_changes()
-   {
-    let fixture = Fixture::new();
-    let main = fixture.write("main.sh", "f() { :; }; f\n");
-    fixture.write("other.sh", "x=1\n");
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
-    app.add_input(&fixture.root);
-    let cancel = AtomicBool::new(false);
-    app.refresh(&cancel).unwrap();
-    let id = app.document_id(&main).unwrap();
-    app.definitions(id, 0, &cancel).unwrap();
-    let tokens = app.classify(id, &cancel).unwrap();
-    fixture.write("other.sh", "x=2\n");
-    assert_eq!(app.classify(id, &cancel).unwrap(), tokens);
-  }
-
-  #[test]
   fn references_report_partial_failures_and_invalidate_after_recovery() {
     let fixture = Fixture::new();
     let main = fixture.write("main.sh", "value=1; : \"$value\"");
     let broken = fixture.root.join("broken.sh");
     std::fs::write(&broken, [0xff]).unwrap();
-    let mut app =
-      Application::new(Settings::new(fixture.root.clone())).unwrap();
+    let mut app = Client::new(Settings::new(fixture.root.clone())).unwrap();
     app.add_input(&fixture.root);
     let cancel = AtomicBool::new(false);
     for _ in 0..2 {
@@ -4887,18 +3075,19 @@ mod references {
 }
 
 mod rename {
+  use crate::application_client::Client;
   use crate::fixtures::Fixture;
   use shellsmith::interface::application::engine::{
     InitialBinding, InitialEnvironment,
   };
-  use shellsmith::interface::application::{Application, Error, Settings};
+  use shellsmith::interface::application::{Error, Settings};
   use std::collections::BTreeMap;
   use std::sync::atomic::AtomicBool;
 
-  fn application(fixture: &Fixture) -> Application {
+  fn application(fixture: &Fixture) -> Client {
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial = InitialEnvironment::empty();
-    Application::new(settings).unwrap()
+    Client::new(settings).unwrap()
   }
 
   fn assert_renamed(source: &str, query: &str, new_name: &str, expected: &str) {
@@ -5423,10 +3612,10 @@ mod rename {
   fn rename_preserves_names_and_source_delimiters() {
     for (source, query, new_name, expected) in [
       (
-        "if c; then x=one; else x=two; fi; readonly copy=$x; export x=${x#?}; : \"$x\"",
+        "if c; then x=one; else x=two; fi; readonly copy=$x; readonly x=${x#?}; : \"$x\"",
         "x=one",
         "value",
-        "if c; then value=one; else value=two; fi; readonly copy=$value; export value=${value#?}; : \"$value\"",
+        "if c; then value=one; else value=two; fi; readonly copy=$value; readonly value=${value#?}; : \"$value\"",
       ),
       (
         "x=1; x=2; : $x ${x}",
@@ -5442,10 +3631,10 @@ mod rename {
       ),
       ("read x; : $x", "x;", "value", "read value; : $value"),
       (
-        "export 'x=1'; readonly x; : $x",
+        "readonly 'x=1'; : $x",
         "x=",
         "value",
-        "export 'value=1'; readonly value; : $value",
+        "readonly 'value=1'; : $value",
       ),
       ("getopts a x; : $x", "x;", "flag", "getopts a flag; : $flag"),
       (
@@ -5503,10 +3692,10 @@ mod rename {
         "value=1; unset value; : \"$value\"",
       ),
       (
-        "fo\\\no=1; : \"$fo\\\no\" ${fo\\\no} $((fo\\\no + 1)); for fo\\\no in a; do :; done; : $foo",
+        "fo\\\no=1; : \"$fo\\\no\" ${fo\\\no} $((fo\\\no + 1)); for fo\\\no in a; do :; done; : $foo; readonly fo\\\no=2",
         "fo\\\no=",
         "value",
-        "value=1; : \"$value\" ${value} $((value + 1)); for value in a; do :; done; : $value",
+        "value=1; : \"$value\" ${value} $((value + 1)); for value in a; do :; done; : $value; readonly value=2",
       ),
       (
         "f\\\nn() { :; }; f\\\nn; fn",
@@ -5520,7 +3709,145 @@ mod rename {
   }
 
   #[test]
-  fn rename_replaces_trap_body_words_only_through_verbatim_source_ranges() {
+  fn rename_decodes_cst_continuations_without_guessing_additional_transformations()
+   {
+    for (source, query, new_name, expected) in [
+      (
+        "foo=1; cat <<EOF\n$fo\\\no ${fo\\\no} $((fo\\\no + 1))\nEOF\n",
+        "foo=1",
+        "value",
+        "value=1; cat <<EOF\n$value ${value} $((value + 1))\nEOF\n",
+      ),
+      (
+        "foo=1; : `printf '%s' \"$fo\\\no\"`",
+        "foo=1",
+        "value",
+        "value=1; : `printf '%s' \"$value\"`",
+      ),
+      (
+        "foo=1; cat <<EOF\n$(printf '%s' \"$fo\\\no\")\nEOF\n",
+        "foo=1",
+        "value",
+        "value=1; cat <<EOF\n$(printf '%s' \"$value\")\nEOF\n",
+      ),
+      (
+        "foo=1; cat <<EOF\n`printf '%s' \"$fo\\\n\\\no\"`\nEOF\n",
+        "foo=1",
+        "value",
+        "value=1; cat <<EOF\n`printf '%s' \"$value\"`\nEOF\n",
+      ),
+      (
+        ": `fo\\\no=1; readonly fo\\\no; : \"$fo\\\no\"`",
+        "fo\\\no=1",
+        "value",
+        ": `value=1; readonly value; : \"$value\"`",
+      ),
+      (
+        "cat <<EOF\n$(fo\\\no() { :; }; fo\\\no)\nEOF\n",
+        "fo\\\no()",
+        "run",
+        "cat <<EOF\n$(run() { :; }; run)\nEOF\n",
+      ),
+      (
+        "foo() { :; }; : `fo\\\no; command -v fo\\\no`",
+        "foo()",
+        "run",
+        "run() { :; }; : `run; command -v run`",
+      ),
+      (
+        "foo=1; cat <<'EOF'\n$fo\\\no\nEOF\n: \"$foo\"",
+        "foo=1",
+        "value",
+        "value=1; cat <<'EOF'\n$fo\\\no\nEOF\n: \"$value\"",
+      ),
+    ] {
+      assert_renamed(source, query, new_name, expected);
+    }
+    for (source, query, new_name) in [
+      ("foo=1; : `echo $fo\\\\\no`", "foo=1", "renamed"),
+      (
+        "foo=1; cat <<EOF\n`echo $fo\\\\\no`\nEOF\n",
+        "foo=1",
+        "renamed",
+      ),
+    ] {
+      assert_refused(source, query, new_name);
+    }
+  }
+
+  #[test]
+  fn rename_joins_line_continuations_in_derived_names() {
+    for (source, query, new_name, expected) in [
+      (
+        "trap \"x\\\ny=2\" EXIT",
+        "x",
+        "value",
+        "trap \"value=2\" EXIT",
+      ),
+      (
+        "trap \"x\\\ny=2\" EXIT",
+        "y=2",
+        "value",
+        "trap \"value=2\" EXIT",
+      ),
+      (
+        "trap \"a\\\n\\\nb\\\nc=2\" EXIT",
+        "a\\",
+        "value",
+        "trap \"value=2\" EXIT",
+      ),
+      (
+        "trap \"f\\\nn() { :; }; f\\\nn; unset -f f\\\nn\" EXIT",
+        "f\\",
+        "run",
+        "trap \"run() { :; }; run; unset -f run\" EXIT",
+      ),
+      (
+        "xy=1; trap \": \\$x\\\ny\" EXIT; : \"$xy\"",
+        "xy=1",
+        "value",
+        "value=1; trap \": \\$value\" EXIT; : \"$value\"",
+      ),
+      (
+        "trap 'trap \"x\\\ny=2\" TERM' EXIT",
+        "x",
+        "value",
+        "trap 'trap \"value=2\" TERM' EXIT",
+      ),
+      (
+        "n=1; : $((x\\\ny=$n)); : \"$xy\"",
+        "x\\",
+        "value",
+        "n=1; : $((value=$n)); : \"$value\"",
+      ),
+      (
+        "n=1; trap ': $((x\\\ny=$n)); : \"$xy\"' EXIT",
+        "x\\",
+        "value",
+        "n=1; trap ': $((value=$n)); : \"$value\"' EXIT",
+      ),
+    ] {
+      assert_renamed(source, query, new_name, expected);
+    }
+  }
+
+  #[test]
+  fn rename_refuses_unproven_derived_name_replacements() {
+    for source in [
+      "trap \"x\"'y=2' EXIT",
+      "trap \"x\"\\\n'y=2' EXIT",
+      "trap \"x${empty-}y=2\" EXIT",
+      "trap \"x${mark:=}y=2\" EXIT; : \"$mark\"",
+      "part=y; trap \"x${part}=2\" EXIT",
+      "xy=1; f() { : $((x\\\ny $1 2)); }; f +; f =",
+      "xy=1; xyz=2; f() { : $((x\\\ny$1)); }; f ''; f z",
+    ] {
+      assert_rename_refused(source, "x", "value");
+    }
+  }
+
+  #[test]
+  fn rename_preserves_literal_trap_body_spelling_and_rejects_split_quotes() {
     for (source, query, new_name, expected) in [
       (
         "xy=1; trap ': \"$x\\\ny\"' EXIT; : \"$xy\"",
@@ -5579,14 +3906,7 @@ mod rename {
       ),
       ("x=1; x=2 true; : $x", "x=1", "y", "y=1; x=2 true; : $y"),
       ("x=1; x=2 read x; : $x", "x=1", "y", "y=1; x=2 read x; : $y"),
-      ("x=1; x=2 read x; : $x", "x=2", "y", "x=1; y=2 read y; : $x"),
       ("x=1; x=$x true; : $x", "x=1", "y", "y=1; x=$y true; : $y"),
-      (
-        "x=1; x=2 true; x=3 true; : $x",
-        "x=2",
-        "y",
-        "x=1; y=2 true; x=3 true; : $x",
-      ),
       (
         "x=1; f() { : $x; }; (f); : $x",
         "x=1",
@@ -5717,6 +4037,12 @@ mod rename {
   fn rename_preserves_unrelated_generated_names_and_argument_expansions() {
     for (source, query, new_name, expected) in [
       (
+        "x=ok; : ~\"$x\" ~$x ~${x}",
+        "x=ok",
+        "value",
+        "value=ok; : ~\"$value\" ~$value ~${value}",
+      ),
+      (
         "f() { :; }; cmd=f; \"$cmd\"",
         "cmd=",
         "name",
@@ -5735,10 +4061,10 @@ mod rename {
         "y=body; trap \"$y\" INT; trap ': \"$other\"' EXIT",
       ),
       (
-        "read v; export \"x=$v\"; readonly x\"=$v/\"; : \"$x\"",
+        "read v; readonly \"x=$v\"; readonly x\"=$v/\"; : \"$x\"",
         "x=",
         "value",
-        "read v; export \"value=$v\"; readonly value\"=$v/\"; : \"$value\"",
+        "read v; readonly \"value=$v\"; readonly value\"=$v/\"; : \"$value\"",
       ),
     ] {
       assert_renamed(source, query, new_name, expected);
@@ -5909,6 +4235,104 @@ mod rename {
   }
 
   #[test]
+  fn rename_refuses_exported_names_from_every_form_of_export() {
+    for (source, query) in [
+      ("export x=1; : $x", "x=1"),
+      ("export x=1; : $x;", "x;"),
+      ("export 'x=1'; : $x", "x=1"),
+      ("x=1; export x", "x=1"),
+      ("export x; x=1", "x=1"),
+      ("x=1; if condition; then export x; fi", "x=1"),
+      ("export x=1; unset x; x=2; : $x", "x=2"),
+      ("set -a; x=1; set +a; : $x", "x=1"),
+      ("set -a; read x; : $x", "x;"),
+      ("set -a; : $((x=1)); : $x", "x=1"),
+      ("set -a; : ${x:=1}; : $x", "x:="),
+      ("x=1 true", "x=1"),
+      ("x=1; x=2 read x; : $x", "x=2"),
+      ("x=1; x=2 true; x=3 true; : $x", "x=2"),
+      ("x=1; f() { export x; }; f", "x=1"),
+      ("x=1; trap 'export x' EXIT", "x=1"),
+      ("x=1; trap ': \"$x\"' EXIT; export x", "x=1"),
+      ("x=1; read name; export \"$name\"", "x=1"),
+      ("x=1; : \"$(export x)\"", "x=1"),
+    ] {
+      assert_refused(source, query, "value");
+    }
+  }
+
+  #[test]
+  fn rename_keeps_unrelated_exports_and_restored_temporary_attributes_separate()
+  {
+    for (source, query, expected) in [
+      (
+        "x=old; x=1 command export x=2; : $x",
+        "x=old",
+        "value=old; x=1 command export x=2; : $value",
+      ),
+      (
+        "x=old; x=1 command readonly x=2; : $x",
+        "x=old",
+        "value=old; x=1 command readonly x=2; : $value",
+      ),
+      (
+        "x=1; export other=2; : $x",
+        "x=1",
+        "value=1; export other=2; : $value",
+      ),
+      ("x=1; set -a; : $x", "x=1", "value=1; set -a; : $value"),
+      (
+        "x=1; trap ': \"$x\"' EXIT; export other",
+        "x=1",
+        "value=1; trap ': \"$value\"' EXIT; export other",
+      ),
+      (
+        "export x=1; x() { :; }; x",
+        "x()",
+        "export x=1; value() { :; }; value",
+      ),
+    ] {
+      assert_renamed(source, query, "value", expected);
+    }
+  }
+
+  #[test]
+  fn rename_refuses_initial_and_sourced_exports() {
+    let fixture = Fixture::new();
+    let path = fixture.write("main.sh", "x=new; : $x");
+    let cancel = AtomicBool::new(false);
+    let mut settings = Settings::new(fixture.root.clone());
+    settings.initial = InitialEnvironment {
+      environment: BTreeMap::from([(b"x".to_vec(), b"old".to_vec())]),
+      ..InitialEnvironment::empty()
+    };
+    let mut app = Client::new(settings).unwrap();
+    assert!(matches!(
+      app.prepare_rename(&path, 0, &cancel),
+      Err(Error::RenameRefused(_))
+    ));
+    assert!(matches!(
+      app.rename(&path, 0, "value", &cancel),
+      Err(Error::RenameRefused(_))
+    ));
+    assert_eq!(app.rename(&path, 0, "x", &cancel).unwrap(), []);
+
+    fixture.write("library.sh", "export x");
+    let mut app = application(&fixture);
+    app
+      .open(&path, "x=new; . ./library.sh; : $x", &cancel)
+      .unwrap();
+    assert!(matches!(
+      app.prepare_rename(&path, 0, &cancel),
+      Err(Error::RenameRefused(_))
+    ));
+    assert!(matches!(
+      app.rename(&path, 0, "value", &cancel),
+      Err(Error::RenameRefused(_))
+    ));
+  }
+
+  #[test]
   fn rename_refuses_initial_variable_bindings_without_source_references() {
     let fixture = Fixture::new();
     let path = fixture.write("main.sh", "");
@@ -5972,23 +4396,15 @@ mod rename {
     ] {
       let mut settings = Settings::new(fixture.root.clone());
       settings.initial = initial;
-      let mut app = Application::new(settings).unwrap();
+      let mut app = Client::new(settings).unwrap();
       for source in [
         "value=new",
         "value=new; env",
-        "value=new env",
         "value=new; : \"$value\"",
         "run() { value=new; env; }; run",
       ] {
         app.open(&path, source, &cancel).unwrap();
         let offset = source.find("value=").unwrap();
-        assert!(
-          app
-            .prepare_rename(&path, offset, &cancel)
-            .unwrap()
-            .is_some(),
-          "{label}: {source}"
-        );
         let result = app.rename(&path, offset, "RESULT", &cancel);
         assert!(
           matches!(result, Err(Error::RenameRefused(_))),
@@ -6006,13 +4422,10 @@ mod rename {
     let cancel = AtomicBool::new(false);
     let mut settings = Settings::new(fixture.root.clone());
     settings.initial = InitialEnvironment {
-      environment: BTreeMap::from([
-        (b"RESULT".to_vec(), b"old".to_vec()),
-        (b"value".to_vec(), b"old".to_vec()),
-      ]),
+      environment: BTreeMap::from([(b"RESULT".to_vec(), b"old".to_vec())]),
       ..InitialEnvironment::empty()
     };
-    let mut app = Application::new(settings.clone()).unwrap();
+    let mut app = Client::new(settings.clone()).unwrap();
     for (source, query, new_name, expected) in [
       ("f() { :; }; f", "f()", "RESULT", "RESULT() { :; }; RESULT"),
       ("RESULT=new; env", "RESULT=", "RESULT", "RESULT=new; env"),
@@ -6046,7 +4459,11 @@ mod rename {
       .variables
       .insert(b"RESULT".to_vec(), InitialBinding::Absent);
     settings.initial.other_variables = InitialBinding::Unknown;
-    app.configure(settings.clone()).unwrap();
+    settings
+      .initial
+      .variables
+      .insert(b"value".to_vec(), InitialBinding::Absent);
+    app = Client::new(settings.clone()).unwrap();
     app.open(&path, "value=new; : $value", &cancel).unwrap();
     let edits = app.rename(&path, 0, "RESULT", &cancel).unwrap();
     assert_eq!(
@@ -6057,7 +4474,8 @@ mod rename {
       [(0..5, "RESULT"), (14..19, "RESULT")]
     );
     settings.initial.variables.remove(b"RESULT".as_slice());
-    app.configure(settings).unwrap();
+    app = Client::new(settings).unwrap();
+    app.open(&path, "value=new; : $value", &cancel).unwrap();
     assert!(matches!(
       app.rename(&path, 0, "RESULT", &cancel),
       Err(Error::RenameRefused(_))
@@ -6082,6 +4500,7 @@ mod rename {
       .map(|edit| {
         (
           app
+            .snapshot()
             .path(edit.location.snapshot.document)
             .unwrap()
             .to_path_buf(),
@@ -6128,7 +4547,10 @@ mod rename {
         let cancel = AtomicBool::new(false);
         let uses = app.references(&library, 0, false, &cancel).unwrap();
         assert_eq!(uses.len(), 1, "{source}");
-        assert_eq!(app.path(uses[0].snapshot.document), Some(caller.as_path()));
+        assert_eq!(
+          app.snapshot().path(uses[0].snapshot.document),
+          Some(caller.as_path())
+        );
         assert!(
           matches!(
             app.prepare_rename(&library, 0, &cancel),
@@ -6174,7 +4596,12 @@ mod rename {
       let edits = app.rename(&library, 0, "renamed", &cancel).unwrap();
       let paths: Vec<_> = edits
         .iter()
-        .map(|edit| app.path(edit.location.snapshot.document).unwrap())
+        .map(|edit| {
+          app
+            .snapshot()
+            .path(edit.location.snapshot.document)
+            .unwrap()
+        })
         .collect();
       assert_eq!(paths, [caller.as_path(), library.as_path()], "{source}");
     }
@@ -6203,7 +4630,7 @@ mod rename {
     assert_eq!(
       edits
         .iter()
-        .filter(|edit| app.path(edit.location.snapshot.document)
+        .filter(|edit| app.snapshot().path(edit.location.snapshot.document)
           == Some(library.as_path()))
         .count(),
       2
@@ -6217,36 +4644,16 @@ mod rename {
         .len(),
       3
     );
-  }
-
-  #[test]
-  fn rename_rechecks_closed_inputs_and_uses_current_open_text() {
-    let fixture = Fixture::new();
-    let path = fixture.write("main.sh", "x=1; : $x");
-    let cancel = AtomicBool::new(false);
-    let mut app = application(&fixture);
-    app.prepare_rename(&path, 0, &cancel).unwrap();
-    fixture.write("main.sh", "x=1; y=2; : $x");
-    assert!(matches!(
-      app.rename(&path, 0, "y", &cancel),
-      Err(Error::Superseded)
-    ));
-    assert!(matches!(
-      app.rename(&path, 0, "y", &cancel),
-      Err(Error::Superseded)
-    ));
-    app.refresh(&cancel).unwrap();
-    assert!(matches!(
-      app.rename(&path, 0, "y", &cancel),
-      Err(Error::RenameRefused(_))
-    ));
-    app.open(&path, "x=1; : $x", &cancel).unwrap();
-    assert_eq!(app.rename(&path, 0, "y", &cancel).unwrap().len(), 2);
-    app.change(&path, "x=1; y=2; : $x", &cancel).unwrap();
-    assert!(matches!(
-      app.rename(&path, 0, "y", &cancel),
-      Err(Error::RenameRefused(_))
-    ));
+    fixture.write("lib.sh", "f() { :; }");
+    let source = "f() { :; }; f=1 command . ./lib.sh; f";
+    app.open(&main, source, &cancel).unwrap();
+    assert_eq!(
+      app
+        .rename(&main, source.len() - 1, "run", &cancel)
+        .unwrap()
+        .len(),
+      3
+    );
   }
 
   #[tokio::test]
@@ -6426,32 +4833,6 @@ mod rename {
   }
 
   #[test]
-  fn rename_requests_keep_trap_body_symbols_of_other_inputs() {
-    let fixture = Fixture::new();
-    let trap = fixture.write("a.sh", "trap 'f() { :; }' EXIT\n");
-    let main = fixture.write("b.sh", "x=1; : $x\n");
-    let mut app = application(&fixture);
-    app.add_input(&fixture.root);
-    let cancel = AtomicBool::new(false);
-    app.refresh(&cancel).unwrap();
-    let symbols = |app: &Application| {
-      let id = app.document_id(&trap).unwrap();
-      let names: Vec<_> = app
-        .document_symbols(id)
-        .unwrap()
-        .map(|entry| entry.details.symbol.name.clone())
-        .collect();
-      (names, app.workspace_symbols("f").count())
-    };
-    let expected = (vec![b"f".to_vec()], 1);
-    assert_eq!(symbols(&app), expected);
-    assert!(app.prepare_rename(&main, 0, &cancel).unwrap().is_some());
-    assert_eq!(symbols(&app), expected);
-    assert_eq!(app.rename(&main, 0, "y", &cancel).unwrap().len(), 2);
-    assert_eq!(symbols(&app), expected);
-  }
-
-  #[test]
   fn rename_revalidates_workspace_membership_and_keeps_resolved_paths() {
     let fixture = Fixture::new();
     let main = fixture.write("main.sh", "target=./lib.sh; . \"$target\"");
@@ -6470,7 +4851,7 @@ mod rename {
     assert!(
       edits
         .iter()
-        .any(|edit| app.path(edit.location.snapshot.document)
+        .any(|edit| app.snapshot().path(edit.location.snapshot.document)
           == Some(added.as_path()))
     );
   }

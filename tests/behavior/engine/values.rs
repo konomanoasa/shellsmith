@@ -10,6 +10,50 @@ mod assignments {
   use support::analyze;
 
   #[test]
+  fn quoted_arithmetic_fails_without_invoking_commands_or_inventing_writes() {
+    for expression in [
+      r#""y" = 1"#,
+      r#"1 + "2""#,
+      "1 + '2'",
+      r#""${n:=7}" + $((m=8))"#,
+    ] {
+      let source =
+        format!("y=0; out=$(({expression})); : \"$out\" \"$y\" \"$n\" \"$m\"");
+      let document = support::parse(1, 1, &source);
+      assert!(!document.has_syntax_errors(), "{source}");
+      let (workspace, analysis) = analyze(&source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Unknown(ValueIssue::Arithmetic)],
+        "{source}"
+      );
+      assert_eq!(
+        reads(&workspace, &analysis, b"y"),
+        [Value::Literal(b"0".to_vec())]
+      );
+      if expression.contains("${n") {
+        assert_eq!(
+          reads(&workspace, &analysis, b"n"),
+          [Value::Literal(Vec::new()), Value::Literal(b"7".to_vec())]
+        );
+        assert_eq!(
+          reads(&workspace, &analysis, b"m"),
+          [Value::Literal(b"8".to_vec())]
+        );
+      }
+      assert!(analysis.unknown_effects().next().is_none(), "{source}");
+      assert_eq!(
+        workspace
+          .symbols()
+          .filter(|symbol| symbol.name == b"y")
+          .count(),
+        1,
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
   fn arithmetic_variable_contents_are_not_evaluated_recursively() {
     for (body, expected, y) in [
       ("x='y=5'; out=$((x))", None, "1"),
@@ -471,6 +515,12 @@ mod assignments {
   fn captured_output_uses_shared_results_and_restores_redirections() {
     for (body, expected) in [
       (":", ""),
+      ("<input", ""),
+      ("<input >output", ""),
+      (
+        "set -- '' exec; command -- $@ >output; command -p printf kept",
+        "",
+      ),
       ("command -v :", ":"),
       ("f() { :; }; command -v f", "f"),
       ("Version() { :; }; command -v Version", "Version"),
@@ -529,8 +579,8 @@ mod assignments {
       "command -p printf value & wait",
       "command -p printf value 2>&1",
       "command -p printf value | unknown_utility",
-      "<input",
-      "<input >output",
+      "read w; \"ex$w\" >output; command -p printf kept",
+      "read w; command \"ex$w\" >output; command -p printf kept",
       "if read c; then command() { :; }; fi; command exec >output; unset -f command; command -p printf kept",
       "command() { :; }; command exec <<'EOF'\nabc\nEOF\nunset -f command; read x; command -p printf %s \"$x\"",
     ] {
@@ -548,7 +598,7 @@ mod assignments {
 
   #[test]
   fn command_queries_may_report_words_an_implementation_reserves() {
-    for name in ["time", "[[", "select", "label:"] {
+    for name in ["time", "[[", "select"] {
       let source = format!("out=$(command -v '{name}'); : \"$out\"");
       let (workspace, analysis) = analyze(&source);
       let values = reads(&workspace, &analysis, b"out");
@@ -612,14 +662,12 @@ mod assignments {
   }
 
   #[test]
-  fn uncertain_input_and_evaluation_order_do_not_fabricate_values() {
+  fn uncertain_input_do_not_fabricate_values() {
     for source in [
       "{ { read -r out; : \"$out\"; } & wait; } <<'END'\nvalue\nEND\n",
       "f() { return 7; }; x=$(f) >\"$(command -p printf output)\"; out=$?; : \"$out\"",
       "{ : <\"$(unknown_utility)\"; read -r out; } <<'END'\none\ntwo\nEND\n: \"$out\"",
       "{ { if :; then :; else exec <<'INNER'\none\ntwo\nINNER\nfi; read first; } <&0; read -r out; } <<'END'\none\ntwo\nEND\n: \"$out\"",
-      "{ out=$(read first; command -p printf %s \"$first\") >\"$(read second; command -p printf output)\"; } <<'END'\none\ntwo\nEND\n: \"$out\"",
-      "{ ignored=$(read out; command -p printf %s \"$out\") : <<'INNER'\ninner\nINNER\n} <<'END'\nouter\nEND\n",
     ] {
       let (workspace, analysis) = analyze(source);
       let actual = reads(&workspace, &analysis, b"out");
@@ -672,15 +720,30 @@ mod assignments {
   }
 
   #[test]
+  fn read_processes_escapes_with_empty_ifs_unless_raw() {
+    for (options, line, expected) in [
+      ("", "\\value", "value"),
+      ("-r", "\\value", "\\value"),
+      ("", " a\\\\b\\ c ", " a\\b c "),
+      ("", "one\\\ntwo", "onetwo"),
+      ("-r", "one\\\ntwo", "one\\"),
+    ] {
+      let source =
+        format!("IFS= read {options} out <<'END'\n{line}\nEND\n: \"$out\"");
+      let (workspace, analysis) = analyze(&source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Literal(expected.as_bytes().to_vec())],
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
   fn known_input_and_option_arguments_produce_values_without_executing_commands()
    {
     for (source, expected) in [
       ("read -r out <<'END'\n./lib.sh\nEND\n: \"$out\"", "./lib.sh"),
-      ("IFS= read out <<'END'\n\\value\nEND\n: \"$out\"", "\\value"),
-      (
-        "IFS= read out <<'END'\none\\\ntwo\nEND\n: \"$out\"",
-        "onetwo",
-      ),
       (
         "{ unused=$(command -v :) >output; read -r out; } <<'END'\nvalue\nEND\n: \"$out\"",
         "value",
@@ -823,11 +886,33 @@ mod assignments {
       "first=foo; second=bar; read -r out <<END\n$first\\\n$second\nEND\n: \"$out\"",
       "read -r out <<END\n$(command -p printf %s 'foo\\\nbar')\nEND\n: \"$out\"",
       "read -r out <<END\n$(read -r inner <<'INNER'\nfoo\\\nbar\nINNER\ncommand -p printf %s \"$inner\")\nEND\n: \"$out\"",
+      "foo=foobar; read -r out <<END\n$fo\\\no\nEND\n: \"$out\"",
+      "foo=foobar; read -r out <<END\n${fo\\\no}\nEND\n: \"$out\"",
+      "foo=foobar; read -r out <<END\n$(command -p printf %s \"$fo\\\no\")\nEND\n: \"$out\"",
+      "foo=foobar; read -r out <<END\n`command -p printf %s \"$fo\\\n\\\no\"`\nEND\n: \"$out\"",
     ] {
       let (workspace, analysis) = analyze(source);
       assert_eq!(
         reads(&workspace, &analysis, b"out"),
         [Value::Literal(b"foobar".to_vec())],
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn backquote_line_continuations_preserve_names_values_and_argument_roles() {
+    for source in [
+      "foo=7; out=`command -p printf %s \"$fo\\\no\"`; : \"$out\"",
+      "out=`fo\\\no=7; command -p printf %s \"$foo\"`; : \"$out\"",
+      "out=`readonly fo\\\no=7; command -p printf %s \"$fo\\\no\"`; : \"$out\"",
+      "foo=6; out=`command -p printf %s \"$((fo\\\no + 1))\"`; : \"$out\"",
+      "out=`fo\\\no() { command -p printf %s 7; }; fo\\\no`; : \"$out\"",
+    ] {
+      let (workspace, analysis) = analyze(source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Literal(b"7".to_vec())],
         "{source}"
       );
     }
@@ -841,8 +926,7 @@ mod assignments {
       "{ exec <input; read -r out; } <<'END'\nvalue\nEND\n: \"$out\"",
       "OPTIND=1; getopts ab first -ab; read OPTIND; getopts ab out -ab; : \"$out\"",
       "OPTIND=1; getopts ab first -ab; unset OPTIND; OPTIND=2; getopts ab out -ab; : \"$out\"",
-      "OPTIND=1; readonly OPTIND; getopts a out -a; : \"$out\"",
-      "OPTIND=1; getopts a:: out -a; : \"$out\"",
+      "OPTIND=1; getopts -a out -a; : \"$out\"",
       "x=prefix$((1/0)); out=${x:+yes}; : \"$out\"",
     ] {
       let (workspace, analysis) = analyze(source);
@@ -858,8 +942,155 @@ mod assignments {
   }
 
   #[test]
-  fn getopts_sets_optind_only_after_option_arguments_and_keeps_its_position() {
+  fn getopts_preserves_completed_updates_when_an_assignment_fails() {
+    for (body, expected) in [
+      ("getopts a '' -a", "2/2/unset/keep"),
+      ("getopts a bad-name -a", "2/2/unset/keep"),
+      ("readonly target; getopts a target -a", "2/2/unset/keep"),
+      (
+        "readonly target; getopts a: target -a value",
+        "2/3/value/keep",
+      ),
+      (
+        "readonly OPTIND; getopts a: target -a value",
+        "2/1/value/keep",
+      ),
+      (
+        "readonly OPTARG; getopts a: target -a value",
+        "2/1/old/keep",
+      ),
+      ("readonly OPTARG; getopts a target -a", "2/1/old/keep"),
+      ("readonly OPTARG; getopts a target --", "2/1/old/keep"),
+      ("getopts :a '' -z", "2/2/z/keep"),
+      ("getopts :a: '' -a", "2/2/a/keep"),
+      ("set --; getopts a ''", "2/1/unset/keep"),
+      ("getopts a '' -- -a", "2/2/unset/keep"),
+    ] {
+      let source = format!(
+        "OPTIND=1; OPTARG=old; target=keep; {body}; out=$?/$OPTIND/${{OPTARG-unset}}/$target; : \"$out\""
+      );
+      let (workspace, analysis) = analyze(&source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Literal(expected.as_bytes().to_vec())],
+        "{source}"
+      );
+      assert!(analysis.unknown_effects().next().is_none(), "{source}");
+    }
+  }
+
+  #[test]
+  fn getopts_keeps_possible_failures_and_completed_updates() {
+    for (body, expected) in [
+      (
+        "if condition; then readonly OPTARG; fi; getopts a: target -a value",
+        [None, None, None, None],
+      ),
+      (
+        "if condition; then readonly OPTIND; fi; getopts a: target -a value",
+        [None, None, Some("value"), None],
+      ),
+      (
+        "if condition; then readonly target; fi; getopts a: target -a value",
+        [None, Some("3"), Some("value"), None],
+      ),
+      (
+        "if condition; then readonly OPTARG; fi; readonly target; getopts a: target -a value",
+        [Some("2"), None, None, Some("keep")],
+      ),
+      (
+        "read suffix; getopts a: \"tmp_$suffix\" -a value",
+        [None, Some("3"), Some("value"), Some("keep")],
+      ),
+      (
+        "if condition; then readonly OPTARG; fi; getopts a target -a",
+        [None, None, None, None],
+      ),
+    ] {
+      let source = format!(
+        "OPTIND=1; OPTARG=old; target=keep; {body}; status=$?; index=$OPTIND; arg=${{OPTARG-unset}}; value=$target; : \"$status\" \"$index\" \"$arg\" \"$value\""
+      );
+      let (workspace, analysis) = analyze(&source);
+      for (name, expected) in ["status", "index", "arg", "value"]
+        .into_iter()
+        .zip(expected)
+      {
+        let actual = reads(&workspace, &analysis, name.as_bytes());
+        if let Some(expected) = expected {
+          assert_eq!(
+            actual,
+            [Value::Literal(expected.as_bytes().to_vec())],
+            "{source}: {name}"
+          );
+        } else {
+          assert!(
+            matches!(
+              actual.as_slice(),
+              [Value::Unknown(_) | Value::Partial(_)]
+            ),
+            "{source}: {name}={actual:?}"
+          );
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn getopts_restarts_from_the_first_option_after_assignment_failure() {
+    for (body, expected) in [
+      (
+        "set -- -a -b; getopts ab ''; getopts ab next",
+        "0/a/2/unset",
+      ),
+      (
+        "set -- -abc; getopts abc first; getopts abc ''; getopts abc next",
+        "0/a/2/unset",
+      ),
+      (
+        "set -- -a -b -c; getopts abc first; getopts abc bad-name; getopts abc next",
+        "0/a/2/unset",
+      ),
+      (
+        "readonly target=keep; getopts abc first -abc; getopts abc target -abc; getopts abc next -abc",
+        "0/a/2/unset",
+      ),
+      (
+        "getopts a: '' -a value; getopts a: next -a value",
+        "0/a/3/value",
+      ),
+      (
+        "set -- -a; getopts a first; getopts a ''; getopts a next",
+        "0/a/2/unset",
+      ),
+      ("set -- -- -a; getopts a ''; getopts a next", "1/?/2/unset"),
+      (
+        "read input; getopts ab '' \"$input\"; getopts ab next -ab",
+        "0/a/2/unset",
+      ),
+    ] {
+      let source = format!(
+        "OPTIND=1; {body}; out=$?/$next/$OPTIND/${{OPTARG-unset}}; : \"$out\""
+      );
+      let (workspace, analysis) = analyze(&source);
+      assert_eq!(
+        reads(&workspace, &analysis, b"out"),
+        [Value::Literal(expected.as_bytes().to_vec())],
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn getopts_reports_the_consumed_argument_and_keeps_the_option_offset() {
     for (source, expected) in [
+      (
+        "OPTIND=1; OPTARG=old; getopts a option -a; out=${OPTARG-unset}; : \"$out\"",
+        Value::Literal(b"unset".to_vec()),
+      ),
+      (
+        "OPTIND=1; OPTARG=old; getopts a option; out=${OPTARG-unset}; : \"$out\"",
+        Value::Literal(b"unset".to_vec()),
+      ),
       (
         "OPTIND=1; getopts a: option -avalue; out=$OPTIND; : \"$out\"",
         Value::Literal(b"2".to_vec()),
@@ -874,11 +1105,19 @@ mod assignments {
       ),
       (
         "OPTIND=1; getopts ab option -ab; out=$OPTIND; : \"$out\"",
-        Value::Unknown(ValueIssue::Unspecified),
+        Value::Literal(b"2".to_vec()),
       ),
       (
         "OPTIND=1; getopts a option -a value; out=$OPTIND; : \"$out\"",
-        Value::Unknown(ValueIssue::Unspecified),
+        Value::Literal(b"2".to_vec()),
+      ),
+      (
+        "OPTIND=1; getopts 1a OPTIND -1a; first=$OPTIND; getopts 1a option -1a; out=$first/$option/$OPTIND; : \"$out\"",
+        Value::Literal(b"1/a/2".to_vec()),
+      ),
+      (
+        "OPTIND=1; getopts a: OPTARG -a value; out=$OPTARG/$OPTIND; : \"$out\"",
+        Value::Literal(b"a/3".to_vec()),
       ),
     ] {
       let (workspace, analysis) = analyze(source);
@@ -887,7 +1126,7 @@ mod assignments {
   }
 
   #[test]
-  fn getopts_resumes_only_within_one_function_depth() {
+  fn getopts_resets_for_functions_and_restores_the_callers_cursor() {
     for (source, expected) in [
       (
         "OPTIND=1; getopts ab first -ab; f() { :; }; f; getopts ab out -ab; : \"$out\"",
@@ -903,11 +1142,11 @@ mod assignments {
       ),
       (
         "OPTIND=1; getopts ab first -ab; f() { getopts ab out -ab; }; f; : \"$out\"",
-        Value::Unknown(ValueIssue::Unspecified),
+        Value::Literal(b"a".to_vec()),
       ),
       (
         "f() { getopts ab first -ab; }; OPTIND=1; f; getopts ab out -ab; : \"$out\"",
-        Value::Unknown(ValueIssue::Unspecified),
+        Value::Literal(b"a".to_vec()),
       ),
       (
         "OPTIND=1; getopts ab first -ab; f() { OPTIND=1; getopts ab out -ab; }; f; : \"$out\"",
@@ -934,7 +1173,7 @@ mod assignments {
           && site.name == Value::Literal(name.to_vec())
       })
       .flat_map(|site| {
-        analysis.values(site.id).map(|(context, value)| {
+        crate::support::values(analysis, site.id).map(|(context, value)| {
           assert_eq!(analysis.value(site.id, context), Some(value));
           value.clone()
         })
@@ -992,10 +1231,26 @@ mod assignments {
         "{source}"
       );
       assert_eq!(result.gaps(), [], "{source}");
-      let path = workspace.symbols_named(b"path").next().unwrap().id;
-      assert_eq!(result.references(path).count(), 1, "{source}");
-      let function = workspace.symbols_named(b"f").next().unwrap().id;
-      assert_eq!(result.references(function).count(), 1, "{source}");
+      let path = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"path")
+        .unwrap()
+        .id;
+      assert_eq!(
+        crate::support::references(&result, path).count(),
+        1,
+        "{source}"
+      );
+      let function = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"f")
+        .unwrap()
+        .id;
+      assert_eq!(
+        crate::support::references(&result, function).count(),
+        1,
+        "{source}"
+      );
       workspace.publish_analysis(result).unwrap();
       let spans = workspace.semantic_spans(DocumentId(1)).unwrap();
       assert_eq!(
@@ -1106,7 +1361,12 @@ mod assignments {
         [Value::Literal(b"kept".to_vec())],
         "{source}"
       );
-      assert!(analysis.has_recursive_calls());
+      assert!(
+        analysis
+          .gaps()
+          .iter()
+          .any(|gap| gap.issue == ResolutionIssue::Recursion)
+      );
     }
   }
 
@@ -1128,28 +1388,40 @@ mod assignments {
   }
 
   #[test]
-  fn recursion_summaries_include_any_function_an_undecoded_definition_may_name()
-  {
+  fn recursion_summaries_distinguish_decoded_and_undecoded_function_names() {
     use shellsmith::interface::application::engine::{
       ResolutionStatus, UseSite,
     };
-    let (workspace, analysis) = analyze(
-      "g() { :; }\ncat <<EOF\n$(f() { if c; then f; g; fi; h\\\nx() { :; }; }; f)\nEOF\n",
-    );
-    let call = workspace
-      .document(DocumentId(1))
-      .unwrap()
-      .occurrences()
-      .iter()
-      .rfind(|site| {
-        site.kind == OccurrenceKind::Command
-          && site.name == Value::Literal(b"g".to_vec())
-      })
-      .unwrap();
-    assert!(!matches!(
-      analysis.summarize(UseSite::Syntax(call.id)).status(),
-      ResolutionStatus::Resolved(_)
-    ));
+    for (source, resolved) in [
+      (
+        "g() { :; }\ncat <<EOF\n$(f() { if c; then f; g; fi; h\\\nx() { :; }; }; f)\nEOF\n",
+        true,
+      ),
+      (
+        "g() { :; }; : `f() { if c; then f; g; fi; h\\\\\nx() { :; }; }; f`",
+        false,
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      let document = workspace.document(DocumentId(1)).unwrap();
+      assert!(!document.has_syntax_errors(), "{source}");
+      let call = document
+        .occurrences()
+        .iter()
+        .rfind(|site| {
+          site.kind == OccurrenceKind::Command
+            && site.name == Value::Literal(b"g".to_vec())
+        })
+        .unwrap();
+      assert_eq!(
+        matches!(
+          analysis.summarize(UseSite::Syntax(call.id)).status(),
+          ResolutionStatus::Resolved(_)
+        ),
+        resolved,
+        "{source}"
+      );
+    }
   }
 
   #[test]
@@ -1378,7 +1650,7 @@ mod assignments {
         "path=./lib; path=${path:-other}; : \"$path\"",
         Some(b"./lib"),
       ),
-      ("path=./lib; path=~; : \"$path\"", None),
+      ("path=./lib; path=~; : \"$path\"", Some(b"~")),
       (
         "readonly path=./lib; path=./other; : \"$path\"",
         Some(b"./lib"),
@@ -1402,11 +1674,6 @@ mod assignments {
       } else {
         ValueIssue::Dynamic
       };
-      let issue = if source.contains("path=~") {
-        ValueIssue::Unspecified
-      } else {
-        issue
-      };
       let actual = reads(&workspace, &result, b"path");
       let actual = actual.last().expect("path read");
       if let Some(bytes) = expected {
@@ -1423,7 +1690,7 @@ mod assignments {
   }
 
   #[test]
-  fn tilde_values_are_unspecified_on_every_path_where_home_may_be_unset() {
+  fn tilde_expansion_keeps_literal_tilde_when_home_is_unset() {
     let (workspace, result) =
       analyze("HOME=/home/user; path=~/lib; : \"$path\"");
     assert_eq!(
@@ -1438,30 +1705,45 @@ mod assignments {
       panic!("{values:?}");
     };
     assert_eq!(value.issue, ValueIssue::Dynamic);
-    for (source, causes) in [
+    for (source, expected) in [
+      (r#"unset HOME; path=~/lib; : "$path""#, vec!["~/lib"]),
       (
-        "unset HOME; path=~/lib; : \"$path\"",
-        [ValueIssue::Unspecified].as_slice(),
+        r#"HOME=; while condition; do unset HOME; done; path=~; : "$path""#,
+        vec!["", "~"],
       ),
       (
-        "HOME=; while condition; do unset HOME; done; path=~; : \"$path\"",
-        &[ValueIssue::Unspecified],
+        r#"HOME=/home/user; while condition; do unset HOME; done; path=~/lib; : "$path""#,
+        vec!["/home/user/lib", "~/lib"],
       ),
       (
-        "HOME=/home/user; while condition; do unset HOME; done; path=~/lib; : \"$path\"",
-        &[ValueIssue::Dynamic, ValueIssue::Unspecified],
-      ),
-      (
-        "if condition; then HOME=/home/user; else unset HOME; fi; path=~/lib; : \"$path\"",
-        &[ValueIssue::Unspecified],
+        r#"if condition; then HOME=/home/user; else unset HOME; fi; path=~/lib; : "$path""#,
+        vec!["/home/user/lib", "~/lib"],
       ),
     ] {
       let (workspace, result) = analyze(source);
       let values = reads(&workspace, &result, b"path");
-      let [Value::Unknown(issue)] = values.as_slice() else {
-        panic!("{source}: {values:?}");
-      };
-      assert_eq!(issue.causes().collect::<Vec<_>>(), causes, "{source}");
+      match values.as_slice() {
+        [Value::Literal(bytes)] => assert_eq!(
+          expected,
+          [std::str::from_utf8(bytes).unwrap()],
+          "{source}"
+        ),
+        [Value::Partial(value)] => {
+          assert_eq!(value.issue, ValueIssue::Dynamic, "{source}");
+          for expected in expected {
+            assert!(
+              value.choices.iter().any(|choice| expected
+                .as_bytes()
+                .starts_with(&choice.prefix)
+                && expected.as_bytes().ends_with(&choice.suffix)
+                && expected.len() >= choice.minimum
+                && (!choice.exact || choice.prefix == expected.as_bytes())),
+              "{source}: {value:?}"
+            );
+          }
+        }
+        _ => panic!("{source}: {values:?}"),
+      }
     }
   }
 
@@ -1477,7 +1759,10 @@ mod assignments {
         "path=./old; path=./new echo ignored; : \"$path\"",
         Some(b"./old"),
       ),
-      ("path=./old; f() { :; }; path=./new f; : \"$path\"", None),
+      (
+        "path=./old; f() { :; }; path=./new f; : \"$path\"",
+        Some(b"./old"),
+      ),
       (
         "path=./same; f() { :; }; path=./same f; : \"$path\"",
         Some(b"./same"),
@@ -1555,6 +1840,40 @@ mod assignments {
         .unwrap();
       assert_eq!(reads(&workspace, &result, b"path"), vec![expected]);
     }
+    let document = support::parse(1, 1, "getopts a out -a; : \"$out\"");
+    let mut request = AnalysisRequest::new(document.snapshot());
+    request.initial = InitialEnvironment::empty();
+    request
+      .initial
+      .environment
+      .insert(b"OPTIND".to_vec(), b"1".to_vec());
+    let mut workspace = Workspace::default();
+    workspace.insert(document).unwrap();
+    for (binding, expected) in [
+      (None, Value::Literal(b"a".to_vec())),
+      (
+        Some(
+          shellsmith::interface::application::engine::InitialBinding::Unknown,
+        ),
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+    ] {
+      request.initial.variables.clear();
+      if let Some(binding) = binding {
+        request
+          .initial
+          .variables
+          .insert(b"OPTIND".to_vec(), binding);
+      }
+      let result = workspace
+        .analyze(
+          request.clone(),
+          &mut support::Inputs::default(),
+          &AtomicBool::new(false),
+        )
+        .unwrap();
+      assert_eq!(reads(&workspace, &result, b"out"), vec![expected]);
+    }
   }
 
   #[test]
@@ -1612,7 +1931,7 @@ mod assignments {
       ("(read x)", Value::Literal(b"old".to_vec())),
       (": \"$(read x)\"", Value::Literal(b"old".to_vec())),
       ("read x & wait", Value::Literal(b"old".to_vec())),
-      ("printf hi | read x", Value::Unknown(ValueIssue::Dynamic)),
+      ("printf hi | read x", Value::Literal(b"old".to_vec())),
       ("unset -v x", Value::Literal(Vec::new())),
       (
         "pair=x=updated; export \"$pair\"",
@@ -1629,7 +1948,7 @@ mod assignments {
       ("time :", Value::Literal(b"old".to_vec())),
       ("x=new [[ -n a ]]", Value::Literal(b"old".to_vec())),
       ("\\[[ -n a ]]", Value::Literal(b"old".to_vec())),
-      ("'label:' operand", Value::Literal(b"old".to_vec())),
+      ("label: operand", Value::Literal(b"old".to_vec())),
     ] {
       let source = format!(
         "x=old; y=keep; f() {{ :; }}; {command}; : \"$x\"; : \"$y\"; f"
@@ -1641,8 +1960,13 @@ mod assignments {
         [Value::Literal(b"keep".to_vec())],
         "{source}"
       );
-      let function = workspace.symbols_named(b"f").next().unwrap().id;
-      let calls: Vec<_> = result.references(function).collect();
+      let function = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"f")
+        .unwrap()
+        .id;
+      let calls: Vec<_> =
+        crate::support::references(&result, function).collect();
       assert_eq!(calls.len(), 1, "{source}");
       assert_eq!(
         calls[0].resolution.status(),
@@ -1689,8 +2013,18 @@ mod assignments {
         false,
         false,
       ),
-      ("export -p x=1", vec![EffectTarget::Variables], false, true),
-      ("export -n x=1", vec![EffectTarget::Variables], false, true),
+      (
+        "export -p x=1",
+        vec![EffectTarget::Variables, EffectTarget::Exports],
+        false,
+        true,
+      ),
+      (
+        "export -n x=1",
+        vec![EffectTarget::Variables, EffectTarget::Exports],
+        false,
+        true,
+      ),
       (
         "readonly -p x=1",
         vec![EffectTarget::Variables, EffectTarget::Attributes],
@@ -1734,17 +2068,15 @@ mod assignments {
         "{command}: {:?}",
         result.unknown_effects().collect::<Vec<_>>()
       );
-      let function = workspace.symbols_named(b"f").next().unwrap().id;
-      assert_eq!(
-        result
-          .references(function)
-          .next()
-          .unwrap()
-          .resolution
-          .is_complete(),
-        keep_function,
-        "{command}"
-      );
+      let function = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"f")
+        .unwrap()
+        .id;
+      let call = crate::support::references(&result, function)
+        .next()
+        .unwrap();
+      assert_eq!(call.resolution.is_complete(), keep_function, "{command}");
     }
   }
 
@@ -1778,10 +2110,7 @@ mod assignments {
     let [Value::Unknown(issue)] = values.as_slice() else {
       panic!("{values:?}")
     };
-    assert_eq!(
-      issue.causes().collect::<Vec<_>>(),
-      [ValueIssue::Dynamic, ValueIssue::Unspecified]
-    );
+    assert_eq!(issue.causes().collect::<Vec<_>>(), [ValueIssue::Dynamic]);
   }
 
   #[test]
@@ -1807,11 +2136,92 @@ mod assignments {
         Some(&Value::Literal(b"3".to_vec())),
         "{source}"
       );
-      let definition = workspace.symbols_named(b"kept").next().unwrap().id;
+      let definition = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"kept")
+        .unwrap()
+        .id;
       assert!(
-        result
-          .references(definition)
+        crate::support::references(&result, definition)
           .all(|site| site.resolution.is_complete()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn special_builtin_prefix_assignments_follow_redirection_expansions() {
+    let (workspace, result) =
+      analyze("x=0; x=$x y=1 : 2>/dev/null; : \"$x\" \"$y\"");
+    assert_eq!(
+      reads(&workspace, &result, b"x"),
+      [Value::Literal(b"0".to_vec()), Value::Literal(b"0".to_vec())]
+    );
+    assert_eq!(
+      reads(&workspace, &result, b"y"),
+      [Value::Literal(b"1".to_vec())]
+    );
+    let (workspace, result) = analyze("x=1 >${y=2} >\"$y\"");
+    assert_eq!(
+      reads(&workspace, &result, b"y").last(),
+      Some(&Value::Literal(b"2".to_vec()))
+    );
+    let (workspace, result) = analyze("x=0; x=1 : >$((x=2)); : \"$x\"");
+    assert_eq!(
+      reads(&workspace, &result, b"x"),
+      [Value::Literal(b"1".to_vec())]
+    );
+    assert_eq!(
+      workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
+        .map(|symbol| crate::support::references(&result, symbol.id).count())
+        .collect::<Vec<_>>(),
+      [0, 1, 0]
+    );
+  }
+
+  #[test]
+  fn temporary_assignments_preserve_the_effects_of_their_expansion() {
+    let (workspace, result) = analyze("y=0; x=$((y=1)) external; : \"$y\"");
+    assert_eq!(
+      reads(&workspace, &result, b"y"),
+      [Value::Literal(b"1".to_vec())]
+    );
+    assert_eq!(
+      workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"y")
+        .map(|symbol| crate::support::references(&result, symbol.id).count())
+        .collect::<Vec<_>>(),
+      [0, 1]
+    );
+    let (workspace, result) = analyze("y=0; x=${y:=1} external; : \"$y\"");
+    assert_eq!(
+      reads(&workspace, &result, b"y"),
+      [Value::Literal(b"0".to_vec()), Value::Literal(b"0".to_vec())]
+    );
+    let (workspace, result) = analyze("x=0; x=$((x=1))a external; : \"$x\"");
+    assert_eq!(
+      reads(&workspace, &result, b"x"),
+      [Value::Literal(b"1".to_vec())]
+    );
+    assert_eq!(
+      workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
+        .map(|symbol| crate::support::references(&result, symbol.id).count())
+        .collect::<Vec<_>>(),
+      [0, 0, 1]
+    );
+    {
+      let source = "read v; x=0; x=$(($v=1)) external; : \"$x\"";
+      let (workspace, result) = analyze(source);
+      assert!(
+        matches!(
+          reads(&workspace, &result, b"x").last(),
+          Some(Value::Unknown(_))
+        ),
         "{source}"
       );
     }
@@ -1869,9 +2279,10 @@ mod assignments {
     );
     assert_eq!(
       workspace
-        .projected_symbols(DocumentId(1))
-        .filter(|(symbol, _)| matches!(
-          symbol.name.as_slice(),
+        .document_symbol_details(DocumentId(1))
+        .iter()
+        .filter(|entry| matches!(
+          entry.symbol.name.as_slice(),
           b"OPTIND" | b"OPTARG"
         ))
         .count(),
@@ -1883,14 +2294,30 @@ mod assignments {
 mod expansion {
   use crate::support;
   use shellsmith::interface::application::engine::{
-    AnalysisRequest, CharacterEncoding, DocumentId, InitialEnvironment,
-    InputQuery, InputResult, PartialValue, Value, ValueConstraint, ValueIssue,
-    Workspace,
+    Access, AnalysisRequest, CharacterEncoding, Document, DocumentId,
+    InitialEnvironment, InputQuery, InputResult, PartialValue, Value,
+    ValueConstraint, ValueIssue, Workspace,
   };
   use std::sync::atomic::AtomicBool;
 
   fn last_value(source: &str, initial: InitialEnvironment) -> Value {
     last_value_with_limit(source, initial, 1024 * 1024)
+  }
+
+  fn exact_choices(choices: &[&[u8]]) -> Value {
+    Value::Partial(PartialValue {
+      choices: choices
+        .iter()
+        .map(|choice| ValueConstraint {
+          prefix: choice.to_vec(),
+          suffix: choice.to_vec(),
+          minimum: choice.len(),
+          required: choice.iter().copied().collect(),
+          exact: true,
+        })
+        .collect(),
+      issue: ValueIssue::Dynamic,
+    })
   }
 
   #[test]
@@ -1911,7 +2338,6 @@ mod expansion {
     ] {
       for enabled in [false, true] {
         let initial = InitialEnvironment {
-          errexit: Some(enabled),
           nounset: Some(enabled),
           noglob: Some(enabled),
           ..InitialEnvironment::empty()
@@ -1959,6 +2385,7 @@ mod expansion {
       "set -u; unset x; : \"${#x}\"",
       "set -u; set --; : \"$1\"",
       "set -u; unset x; : \"$((x))\"",
+      "set -u; unset x; : \"$((x += 1))\"",
       "if condition; then a=1; else a=2; fi; set -u; unset x; y=$((x + a))",
       ": < ''",
       ": > ''",
@@ -2027,7 +2454,6 @@ mod expansion {
         "if read condition; then x=yes; else unset x; fi; : \"${x:?missing}\"",
         ValueIssue::Dynamic,
       ),
-      ("x=$((9223372036854775807+1))", ValueIssue::Arithmetic),
     ] {
       let source = format!("{command}; result=$?; : \"$result\"");
       assert_eq!(
@@ -2109,7 +2535,11 @@ mod expansion {
       .rev()
       .find(|site| site.name == Value::Literal(b"result".to_vec()))
       .unwrap();
-    result.values(site.id).last().unwrap().1.clone()
+    crate::support::values(&result, site.id)
+      .last()
+      .unwrap_or_else(|| panic!("no result read: {source}"))
+      .1
+      .clone()
   }
 
   #[test]
@@ -2387,7 +2817,7 @@ mod expansion {
       };
       assert_eq!(
         issue.causes().collect::<Vec<_>>(),
-        [ValueIssue::SizeLimit, ValueIssue::Unspecified],
+        [ValueIssue::SizeLimit],
         "{source}"
       );
     }
@@ -2675,6 +3105,7 @@ mod expansion {
       "for item in x y; do :; done",
       ": | :",
       "unrelated=1 | :",
+      "a=3 | :",
       "f() { while outer; do for item in x y; do if skip; then continue; else if finish; then break 2; else return; fi; fi; done; done; }; f",
       "while outer; do while inner; do if skip; then continue 2; else break; fi; done; unrelated=1; done",
     ] {
@@ -2690,7 +3121,6 @@ mod expansion {
     for body in [
       "while condition; do a=3; done",
       "while condition; do a=$((a+1)); done",
-      "a=3 | :",
     ] {
       let source = format!(
         "if condition; then a=1; b=1; else a=2; b=2; fi; {body}; result=$((a-b)); : \"$result\""
@@ -2745,7 +3175,7 @@ mod expansion {
       );
       assert_eq!(
         last_value(&input, InitialEnvironment::empty()),
-        Value::Unknown(ValueIssue::Unspecified),
+        Value::Unknown(ValueIssue::Dynamic),
         "{command}"
       );
     }
@@ -2851,6 +3281,14 @@ mod expansion {
       ),
       ("n=0; result=$(( $((n=1)) + n )); : \"$result\"", "2"),
       ("n=2; result=$((n += n)); : \"$result\"", "4"),
+      (
+        "result=$(( (x=1) + (y=2) )); result=$result/$x/$y; : \"$result\"",
+        "3/1/2",
+      ),
+      (
+        "result=$(( (x=1) && (x=2) )); result=$result/$x; : \"$result\"",
+        "1/2",
+      ),
       ("result=$((1 + 2 * 3)); : \"$result\"", "7"),
       ("n='1+2'; result=$(( $n * 3 )); : \"$result\"", "7"),
       ("n=3; result=$(( $n + 2 )); : \"$result\"", "5"),
@@ -2894,14 +3332,7 @@ mod expansion {
         "{source}"
       );
     }
-    for expression in [
-      "1 / 0",
-      "9223372036854775807 + 1",
-      "1 << 64",
-      "-1 >> 2",
-      "1 / 0 ? 1 : 1",
-      "9223372036854775807 + 1 ? 1 : 2",
-    ] {
+    for expression in ["1 / 0", "1 / 0 ? 1 : 1"] {
       let source = format!("result=$(({expression})); : \"$result\"");
       assert_eq!(
         last_value(&source, InitialEnvironment::empty()),
@@ -2960,6 +3391,13 @@ mod expansion {
   {
     for (expression, expected) in [
       ("7 % 3", "1"),
+      ("9223372036854775807 + 1", "-9223372036854775808"),
+      ("1 << 64", "1"),
+      ("1 >> 64", "1"),
+      ("-1 >> 2", "-1"),
+      ("1 << -1", "-9223372036854775808"),
+      ("9223372036854775807 * 2", "-2"),
+      ("9223372036854775807 + 1 ? 1 : 2", "1"),
       ("-7 % 3", "-1"),
       ("8 >> 2", "2"),
       ("6 & 3", "2"),
@@ -2983,8 +3421,8 @@ mod expansion {
         "{expression}"
       );
     }
-    for expression in ["1 % 0", "1 >> 64", "1 << -1", "9223372036854775807 * 2"]
     {
+      let expression = "1 % 0";
       let source = format!("result=$(({expression})); : \"$result\"");
       assert_eq!(
         last_value(&source, InitialEnvironment::empty()),
@@ -3075,6 +3513,14 @@ mod expansion {
         Value::Literal(b"7".to_vec()),
       ),
       (
+        "f() { return ' \t+7\x0b '; }; f; result=$?; : \"$result\"",
+        Value::Literal(b"7".to_vec()),
+      ),
+      (
+        "f() { return '-0'; }; f; result=$?; : \"$result\"",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
         "f() { ! return 7; }; f; result=$?; : \"$result\"",
         Value::Literal(b"7".to_vec()),
       ),
@@ -3100,11 +3546,11 @@ mod expansion {
       ),
       (
         "f() { return 256; }; f; result=$?; : \"$result\"",
-        Value::Unknown(ValueIssue::Unspecified),
+        Value::Literal(b"256".to_vec()),
       ),
       (
         "f() { return -1; }; f; result=$?; : \"$result\"",
-        Value::Unknown(ValueIssue::Unspecified),
+        Value::Literal(b"2".to_vec()),
       ),
     ] {
       assert_eq!(
@@ -3161,41 +3607,157 @@ mod expansion {
   }
 
   #[test]
-  fn compound_commands_complete_with_zero_when_no_branch_or_body_runs() {
-    let statuses = |choices: &[&[u8]]| {
-      Value::Partial(PartialValue {
-        choices: choices
-          .iter()
-          .map(|status| ValueConstraint {
-            prefix: status.to_vec(),
-            suffix: status.to_vec(),
-            minimum: status.len(),
-            required: status.iter().copied().collect(),
-            exact: true,
-          })
-          .collect(),
-        issue: ValueIssue::Dynamic,
-      })
-    };
+  fn initial_pipefail_controls_status_until_explicitly_set() {
+    for (initial, expected) in [
+      (InitialEnvironment::empty(), Value::Literal(b"0".to_vec())),
+      (
+        InitialEnvironment {
+          pipefail: Some(true),
+          ..InitialEnvironment::empty()
+        },
+        Value::Literal(b"2".to_vec()),
+      ),
+      (InitialEnvironment::default(), exact_choices(&[b"0", b"2"])),
+    ] {
+      for (command, expected) in [
+        ("(exit 2) | (exit 0)", expected),
+        (
+          "set -o pipefail; (exit 2) | (exit 0)",
+          Value::Literal(b"2".to_vec()),
+        ),
+        (
+          "set +o pipefail; (exit 2) | (exit 0)",
+          Value::Literal(b"0".to_vec()),
+        ),
+        ("(exit 0) | (exit 0)", Value::Literal(b"0".to_vec())),
+        ("(exit 2) | (exit 3)", Value::Literal(b"3".to_vec())),
+      ] {
+        let source = format!("{command}; result=$?; : \"$result\"");
+        assert_eq!(
+          last_value(&source, initial.clone()),
+          expected,
+          "{source}, initial pipefail: {:?}",
+          initial.pipefail
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn pipefail_takes_the_rightmost_failed_stage_status_while_enabled() {
     for (command, expected) in [
-      ("if (exit 3); then (exit 3); fi", statuses(&[b"0", b"3"])),
+      ("(exit 2) | (exit 0)", Value::Literal(b"0".to_vec())),
+      (
+        "set -o pipefail; (exit 2) | (exit 0)",
+        Value::Literal(b"2".to_vec()),
+      ),
+      (
+        "set -opipefail; (exit 2) | (exit 5) | (exit 0)",
+        Value::Literal(b"5".to_vec()),
+      ),
+      (
+        "set -o pipefail; (exit 0) | (exit 0)",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
+        "set -o pipefail; (exit 300) | :",
+        Value::Literal(b"44".to_vec()),
+      ),
+      (
+        "set -o pipefail; ! (exit 2) | :",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
+        "set -o pipefail; x=$( (exit 2) | :)",
+        Value::Literal(b"2".to_vec()),
+      ),
+      (
+        "f() { set -o pipefail; }; f; (exit 2) | :",
+        Value::Literal(b"2".to_vec()),
+      ),
+      (
+        "set -o pipefail; set +o pipefail; (exit 2) | :",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
+        "(set -o pipefail); (exit 2) | :",
+        Value::Literal(b"0".to_vec()),
+      ),
+      (
+        "if condition; then set -o pipefail; fi; (exit 2) | :",
+        exact_choices(&[b"0", b"2"]),
+      ),
+      (
+        "set -o pipefail; (exit 2) | external",
+        Value::Unknown(ValueIssue::Dynamic),
+      ),
+    ] {
+      let source = format!("{command}; result=$?; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        expected,
+        "{source}"
+      );
+    }
+    let trap = "trap '(exit 2) | :; result=$?; : \"$result\"' EXIT";
+    for (source, expected) in [
+      (trap.to_owned(), Value::Literal(b"0".to_vec())),
+      (
+        format!("set -o pipefail; {trap}"),
+        Value::Literal(b"2".to_vec()),
+      ),
+      (
+        format!("{trap}; set -o pipefail"),
+        exact_choices(&[b"0", b"2"]),
+      ),
+    ] {
+      let (workspace, analysis) = support::analyze(&source);
+      let values: Vec<_> = workspace
+        .documents()
+        .flat_map(Document::occurrences)
+        .filter(|site| {
+          site.access == Access::Read
+            && site.name == Value::Literal(b"result".to_vec())
+        })
+        .flat_map(|site| {
+          crate::support::values(&analysis, site.id)
+            .map(|(_, value)| value.clone())
+        })
+        .collect();
+      assert_eq!(values, [expected], "{source}");
+    }
+  }
+
+  #[test]
+  fn compound_commands_complete_with_zero_when_no_branch_or_body_runs() {
+    for (command, expected) in [
+      (
+        "if (exit 3); then (exit 3); fi",
+        exact_choices(&[b"0", b"3"]),
+      ),
       (
         "(exit 3); if (exit 3); then :; fi",
         Value::Literal(b"0".to_vec()),
       ),
       (
         "if (exit 3); then :; elif (exit 5); then (exit 4); fi",
-        statuses(&[b"0", b"4"]),
+        exact_choices(&[b"0", b"4"]),
       ),
-      ("while (exit 3); do (exit 3); done", statuses(&[b"0", b"3"])),
-      ("until (exit 0); do (exit 3); done", statuses(&[b"0", b"3"])),
+      (
+        "while (exit 3); do (exit 3); done",
+        exact_choices(&[b"0", b"3"]),
+      ),
+      (
+        "until (exit 0); do (exit 3); done",
+        exact_choices(&[b"0", b"3"]),
+      ),
       (
         "(exit 3); while (exit 0); do :; done",
         Value::Literal(b"0".to_vec()),
       ),
       (
         "(exit 4); for item in a; do (exit 3); done",
-        statuses(&[b"0", b"3"]),
+        exact_choices(&[b"0", b"3"]),
       ),
       (
         "(exit 3); for item in; do :; done",
@@ -3208,7 +3770,7 @@ mod expansion {
       ("(exit 3); case a in esac", Value::Literal(b"0".to_vec())),
       (
         "(exit 7); case a in a) (exit 3);; esac",
-        statuses(&[b"0", b"3"]),
+        Value::Literal(b"3".to_vec()),
       ),
       (
         "(exit 7); case a in a) ;& b) :;; esac",
@@ -3216,11 +3778,11 @@ mod expansion {
       ),
       (
         "(exit 7); case a in a) ;& b) (exit \"$?\");; esac",
-        statuses(&[b"0", b"7"]),
+        Value::Literal(b"7".to_vec()),
       ),
       (
         "(exit 7); case a in a) ;& b) ;& c) (exit 3);; esac",
-        statuses(&[b"0", b"3"]),
+        Value::Literal(b"3".to_vec()),
       ),
       (
         "(exit 7); case a in a) ;; esac; :",
@@ -3285,6 +3847,13 @@ EOF
 
   #[test]
   fn parameter_lengths_and_pattern_removal_respect_quotes_and_match_extent() {
+    assert_eq!(
+      last_value(
+        "LC_ALL=C; p=日本語; result=${#p}; : \"$result\"",
+        InitialEnvironment::empty(),
+      ),
+      Value::Unknown(ValueIssue::Locale)
+    );
     for (expression, expected) in [
       ("${#p}", "12"),
       ("${p#*/}", "b/file.txt"),
@@ -3322,6 +3891,24 @@ EOF
     ] {
       assert_eq!(
         last_value(source, InitialEnvironment::empty()),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn heredoc_delimiters_are_inert_text_with_parser_defined_quoting() {
+    for (delimiter, end, expected) in [
+      ("'${name}'", "${name}", "$value"),
+      ("$(;)", "$(;)", "kept"),
+      ("$((1+\"2\"))", "$((1+\"2\"))", "kept"),
+    ] {
+      let source = format!(
+        "value=kept; read -r result <<{delimiter}\n$value\n{end}\n: \"$result\""
+      );
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
         Value::Literal(expected.as_bytes().to_vec()),
         "{source}"
       );
@@ -3404,8 +3991,7 @@ EOF
   }
 
   #[test]
-  fn expanded_backslashes_escape_pattern_characters_unless_posix_leaves_them_unspecified()
-   {
+  fn expanded_backslashes_and_brackets_follow_dash_pattern_rules() {
     for (assignments, expression, expected) in [
       (r"x='a*b' p='\*'", "${x#*$p}", Some("b")),
       (r"x='a*b' p='\*'", "${x%$p*}", Some("a")),
@@ -3413,32 +3999,185 @@ EOF
       (r"x='*b' p='\'", "${x#$p*}", Some("b")),
       (r"x='\b' p='\\'", "${x#$p}", Some("b")),
       (r"x='a*b' p='\*'", r#"${x#*"$p"}"#, Some("a*b")),
-      (r"x=ab p='a\'", "${x#$p}", None),
-      (r"x='*b' p='\'", r#"${x#$p""*}"#, None),
-      (r"x='*b' p='\'", "${x#$p'*'}", None),
-      (r"x='*b' p='\'", r"${x#$p\*}", None),
-      (r"x='\b' p='[\]'", "${x#$p}", None),
-      ("x=abc", "${x#[^a]}", None),
-      ("x=bcd", "${x#[[=a=]-c]}", None),
+      (r"x=ab p='a\'", "${x#$p}", Some("ab")),
+      (r"x='*b' p='\'", r#"${x#$p""*}"#, Some("b")),
+      (r"x='*b' p='\'", "${x#$p'*'}", Some("*b")),
+      (r"x='*b' p='\'", r"${x#$p\*}", Some("*b")),
+      (r"x='\b' p='[\]'", "${x#$p}", Some(r"\b")),
+      ("x=abc", "${x#[^a]}", Some("abc")),
+      ("x=bcd", "${x#[[=a=]-c]}", Some("bcd")),
     ] {
       let source =
         format!("LC_ALL=C; {assignments}; result={expression}; : \"$result\"");
       assert_eq!(
         last_value(&source, InitialEnvironment::empty()),
-        expected.map_or(Value::Unknown(ValueIssue::Unspecified), |expected| {
-          Value::Literal(expected.as_bytes().to_vec())
-        }),
+        Value::Literal(expected.unwrap().as_bytes().to_vec()),
         "{source}"
       );
     }
   }
 
   #[test]
-  fn dollar_single_quotes_decode_portable_escapes_without_expanding_text() {
+  fn dash_parameter_and_utility_semantics_preserve_scalar_values_and_fields() {
+    for (body, expected) in [
+      ("set -- a b; result=\"$@\"", "a b"),
+      ("set -- aa b; IFS=:; result=${#@}/${#*}", "4/4"),
+      ("set -- aa b; IFS=; result=${#@}/${#*}", "3/3"),
+      ("set --; result=${@:-fallback}", "fallback"),
+      ("set -- a; result=${@:+set}", "set"),
+      ("set -- a; result=${*+set}", "set"),
+      ("set -- a b; result=${#%2}", ""),
+      ("set --; x=; set -- \"$@$x\"; result=$#", "1"),
+      ("set -- aa ab; IFS=:; result=${@#a*b}", ""),
+      (
+        "set -- aa ab; IFS=:; set -- \"${@#a*b}\"; result=$#/$1/$2",
+        "2/aa/ab",
+      ),
+      (
+        "set -- aa ab; IFS=:; set -- \"${@#a}\"; result=$#/$1/$2",
+        "2/a/ab",
+      ),
+      (
+        "set -- aa ab; IFS=:; set -- \"${@%a*b}\"; result=$#/$1/$2",
+        "2/aa/",
+      ),
+      (
+        "set -- a b; set -- \"${@:-fallback}\"; result=$#/$1/$2",
+        "2/a/b",
+      ),
+      ("set -- '' ''; IFS=:; result=${@:-fallback}", ":"),
+      ("set --; set -- \"${@#x}\"; result=$#", "1"),
+      ("set -- '' a ''; IFS=; set -- $@; result=$#/$1/$2", "2//a"),
+      (
+        "set -- a '' b; IFS=:; set -- $*; result=$#/$1/$2/$3",
+        "3/a//b",
+      ),
+      (
+        "set -- '' '' a; IFS=': '; set -- x$@; result=$#/$1/$2/$3",
+        "3/x//a",
+      ),
+      ("set -- a '' ''; IFS=:; set -- $@; result=$#/$1/$2", "2/a/"),
+      (
+        "set -- a '' b; IFS=' :'; set -- $*; result=$#/$1/$2",
+        "2/a/b",
+      ),
+      (
+        "set -- a '' b; IFS=' '; set -- \"$@\"$*; result=$#/$3/$4",
+        "5/ba/",
+      ),
+      (
+        "set -- a '' b; IFS=' '; set -- $*\"$@\"; result=$#/$2/$3",
+        "4/ba/",
+      ),
+      ("unset x; x=${x:=1} external; result=$x", "1"),
+      ("x=0; x=1 y=$((x=2)) external; result=$x", "0"),
+      ("x=0; result=$x >out$((x=2))", "2"),
+      ("x=0; a=$((x=1)) : >out$((x=2)); result=$x", "1"),
+      ("x=12; y=${x#$((x=2))}; result=$y/$x", "12/2"),
+      ("x=0; case 1 in $((x=1))|$((x=2))) :;; esac; result=$x", "1"),
+      ("x=0; case 2 in $((x=1))|$((x=2))) :;; esac; result=$x", "2"),
+      (
+        "set -- -ab; OPTIND=1; getopts ab first; getopts ab second; getopts ab last; result=$first/$second/$last/$OPTIND/$?",
+        "a/b/?/2/1",
+      ),
+      (
+        "set -- -x -a; OPTIND=1; getopts :a: first; a=$OPTARG; getopts :a: second; result=$first/$a/$second/$OPTARG/$OPTIND",
+        "?/x/:/a/3",
+      ),
+      (
+        "set -- -x; OPTIND=1; getopts a option; result=$option/${OPTARG-unset}/$?",
+        "?/unset/0",
+      ),
+      (
+        "set -- -ab; OPTIND=1; getopts ab first; set -- -ba; getopts ab second; result=$first/$second",
+        "a/b",
+      ),
+      (
+        "set -- -ab; OPTIND=1; getopts ab first; getopts ab second -ba; result=$first/$second",
+        "a/a",
+      ),
+      (
+        "set -- -a -b; OPTIND=1; getopts ab first; f() { getopts ab inside; }; f \"$@\"; getopts ab after; result=$first/$inside/$after",
+        "a/a/b",
+      ),
+      ("f() { return 256; }; result=$(f); result=$?", "0"),
+      ("f() { return 256; }; (f); result=$?", "0"),
+      ("f() { return 256; }; : | f; result=$?", "0"),
+      ("result=$(exit 256); result=$?", "0"),
+      ("f() { return +256 2; }; f; result=$?", "256"),
+      (
+        "{ result=$(read first; command -p printf %s \"$first\") >\"$(read second; command -p printf output)\"; } <<'END'\none\ntwo\nEND",
+        "two",
+      ),
+    ] {
+      let source = format!("{body}\n: \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn positional_aggregates_stay_set_without_positional_parameters() {
+    for (body, expected) in [
+      ("set --; result=${@-fallback}${*-fallback}", ""),
+      ("set --; result=${@+set}/${*+set}", "set/set"),
+      ("set --; result=${@?missing}${*?missing}", ""),
+      ("set --; set -- \"${@-fallback}\"; result=$#/$1", "1/"),
+      ("set --; set -- ${@-fallback}; result=$#", "0"),
+    ] {
+      let source = format!("{body}; : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        Value::Literal(expected.as_bytes().to_vec()),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn echo_decodes_options_and_escapes_and_marks_nul_substitutions_unsupported()
+  {
+    for (arguments, expected) in [
+      ("-n hello", Ok(b"hello".as_slice())),
+      ("-n -n hello", Ok(b"-n hello")),
+      (r"'a\nb'", Ok(b"a\nb")),
+      (r"'a\cb' ignored", Ok(b"a")),
+      (r"'\x41\0102\q'", Ok(br"AB\q")),
+      (r"'\100\1234\01234'", Ok(b"@S4S4")),
+      (r"'\777'", Ok(&[255])),
+      (r"'\400tail'", Err(ValueIssue::Nul)),
+      (r"'\x'", Err(ValueIssue::Nul)),
+    ] {
+      let source =
+        format!("result=$(command -p echo {arguments}); : \"$result\"");
+      assert_eq!(
+        last_value(&source, InitialEnvironment::empty()),
+        expected
+          .map_or_else(Value::Unknown, |bytes| Value::Literal(bytes.to_vec())),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn dollar_single_quotes_decode_escapes_without_expanding_text() {
     for (word, expected) in [
       (r"$'\a\b\f\n\r\t\v'", b"\x07\x08\x0c\n\r\t\x0b".as_slice()),
       (r#"$'\\\'\"'"#, b"\\'\""),
       (r"$'\101\x42'", b"AB"),
+      (r"$'\q'", br"\q"),
+      (r"$'\777'", &[255]),
+      (r"$'\400'", b""),
+      (r"$'before\000tail'end", b"beforeend"),
+      (r"$'before\xtail'end", b"beforeend"),
+      (r"$'\cA\c?\e'", &[1, 127, 27]),
+      (r"$'\c\\\cé'", &[28, 3, 0xa9]),
+      (r"$'\u0041\U0001F600\ub'", "A😀\x0b".as_bytes()),
+      (r"$'\uD800\U00110000'", &[0xed, 0xa0, 0x80]),
+      (r"$'before\u0tail'end", b"beforeend"),
       (r"$'$HOME `cmd` $(cmd)'", b"$HOME `cmd` $(cmd)"),
     ] {
       let source = format!("result={word}; : \"$result\"");
@@ -3644,6 +4383,26 @@ EOF
         Value::Unknown(ValueIssue::Dynamic),
       ),
       (
+        "set -- '' y; set -- $@; result=$#",
+        Value::Literal(b"1".to_vec()),
+      ),
+      (
+        "set -- y ''; set -- x$*; result=$#",
+        Value::Literal(b"1".to_vec()),
+      ),
+      (
+        "set -- '' y; set -- x$@; result=$#/$1/$2",
+        Value::Literal(b"2/x/y".to_vec()),
+      ),
+      (
+        "set -- '' ''; set -- \"\"$@; result=$1",
+        Value::Literal(Vec::new()),
+      ),
+      (
+        "set -- ' ' y; set -- $@; result=$#/$1",
+        Value::Literal(b"1/y".to_vec()),
+      ),
+      (
         "set -- a ./s/*.sh; shift 2; result=$1",
         Value::Unknown(ValueIssue::Dynamic),
       ),
@@ -3670,19 +4429,7 @@ EOF
       ),
       (
         "x=' '; set -- \"$@\"$x; result=${1+set}",
-        Value::Partial(PartialValue {
-          choices: [b"".as_slice(), b"set"]
-            .into_iter()
-            .map(|choice| ValueConstraint {
-              prefix: choice.to_vec(),
-              suffix: choice.to_vec(),
-              minimum: choice.len(),
-              required: choice.iter().copied().collect(),
-              exact: true,
-            })
-            .collect(),
-          issue: ValueIssue::Dynamic,
-        }),
+        exact_choices(&[b"", b"set"]),
       ),
     ] {
       let mut initial = InitialEnvironment::empty();
@@ -3878,14 +4625,8 @@ EOF
   #[test]
   fn undefined_expansions_and_readonly_arithmetic_do_not_prove_values() {
     for source in [
-      "n=1; result=$((n += (n=2))); : \"$result\"",
-      "n=1; : $((n = (n=2) + 1)); result=$n; : \"$result\"",
       "readonly n=1; result=$((n=2)); : \"$result\"",
-      "set --; x=; set -- \"$@$x\"; result=$#; : \"$result\"",
       "read expression; result=$(( $expression )); : \"$result\"",
-      "set -- a; result=${@:+set}; : \"$result\"",
-      "set -- a; result=${*+set}; : \"$result\"",
-      "f() { result=$r; }; x=é; LC_ALL=en_US.UTF-8 r=${#x} f; : \"$result\"",
     ] {
       assert!(
         matches!(
@@ -3898,7 +4639,31 @@ EOF
   }
 
   #[test]
-  fn unordered_arithmetic_writes_keep_readonly_values() {
+  fn arithmetic_reads_and_writes_follow_dash_order() {
+    for (expression, result, final_x) in [
+      ("(x=1) + (x=2)", "3", "2"),
+      ("(x=1) + x", "2", "1"),
+      ("x + (x=2)", "2", "2"),
+      ("x += (x=2)", "4", "4"),
+      ("x = (x=2) + 1", "3", "3"),
+    ] {
+      for (parameter, expected) in
+        [("n", result), ("x", final_x), ("untouched", "7")]
+      {
+        let source = format!(
+          "x=0; untouched=7; n=$(( {expression} )); result=${parameter}; : \"$result\""
+        );
+        assert_eq!(
+          last_value(&source, InitialEnvironment::empty()),
+          Value::Literal(expected.as_bytes().to_vec()),
+          "{source}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn ordered_arithmetic_writes_keep_readonly_values() {
     for source in [
       "readonly n=1; : $(( (n=2) + n )); result=$n; : \"$result\"",
       "readonly n=1; : $(( n += (n=2) )); result=$n; : \"$result\"",
@@ -3924,7 +4689,7 @@ EOF
       InputResult::Path(b"/home/example".to_vec()),
     );
     assert_eq!(
-      last_value("result=$0/$$/$1/$2/$#; : \"$result\"", initial.clone()),
+      last_value("result=${00}/$$/$1/$2/$#; : \"$result\"", initial.clone()),
       Value::Literal(b"script/123/first/second/2".to_vec())
     );
     assert_eq!(
@@ -3969,8 +4734,7 @@ mod words {
           && site.name == Value::Literal(name.to_vec())
       })
       .unwrap();
-    result
-      .values(site.id)
+    crate::support::values(&result, site.id)
       .last()
       .expect("evaluated read")
       .1
@@ -4128,6 +4892,10 @@ mod words {
         "IFS=$(unknown); x='a b'; set -- $x; out=$#; : \"$out\"",
         Value::Unknown(ValueIssue::UnsupportedExpansion),
       ),
+      (
+        "IFS=$(unknown); set -- '' ''; set -- $*; out=$#; : \"$out\"",
+        Value::Unknown(ValueIssue::UnsupportedExpansion),
+      ),
     ] {
       assert_eq!(last_value(source, b"out"), expected, "{source}");
     }
@@ -4180,10 +4948,7 @@ mod words {
       ("set -f; x='*.sh'; . $x", Value::Literal(b"*.sh".to_vec())),
       (r"x='./\*.sh'; . $x", Value::Literal(br"./\*.sh".to_vec())),
       (r"x='./\'; . $x", Value::Literal(br"./\".to_vec())),
-      (
-        r#"x='./\'; . $x""*"#,
-        Value::Unknown(ValueIssue::Unspecified),
-      ),
+      (r#"x='./\'; . $x""*"#, Value::Literal(br"./\*".to_vec())),
       (
         "set -f; set +f; x='*.sh'; . $x",
         Value::Unknown(ValueIssue::Dynamic),
@@ -4321,8 +5086,7 @@ mod excluded_effects {
           && site.name == Value::Literal(name.to_vec())
       })
       .unwrap();
-    let values: Vec<_> = analysis
-      .values(read.id)
+    let values: Vec<_> = crate::support::values(analysis, read.id)
       .map(|(_, value)| value.clone())
       .collect();
     assert_eq!(values.len(), 1);
@@ -4453,10 +5217,7 @@ mod excluded_effects {
       ),
       ("while condition; do trap 'kept=changed' INT; done", &[]),
       ("(trap 'kept=changed' EXIT)", &[]),
-      (
-        "trap 'kept=changed' INT | :",
-        &[ResolutionIssue::PipelineEnvironment],
-      ),
+      ("trap 'kept=changed' INT | :", &[]),
       ("trap 'kept=changed' EXIT & wait", &[]),
       ("set -eu; trap 'kept=changed' EXIT; false; exit 1", &[]),
     ];
@@ -4502,20 +5263,39 @@ mod excluded_effects {
   #[test]
   fn self_reproducing_traps_stop_at_recurring_material_without_changing_the_caller()
    {
-    for body in [
-      r#"H="$H EXIT"; trap "$H" EXIT"#,
-      r#"copy="$H EXIT"; H=$copy; trap "$H" EXIT"#,
-      r#"H=$(command -p printf "%s%s" "$H" " EXIT"); trap "$H" EXIT"#,
-      r#"H=$(command -p printf "%s" "$H" " EXIT"); trap "$H" EXIT"#,
-      r#"H=$(command -p printf "%s\n" "$H EXIT"); trap "$H" EXIT"#,
-      r#"H=$(command -p echo "$H EXIT"); trap "$H" EXIT"#,
-      r#"H=$(command -p printf "%s" "$H"; command -p printf " EXIT"); trap "$H" EXIT"#,
-      r#"H=$(command -p printf "%s" "$(command -p printf "%s" "$H")" " EXIT"); trap "$H" EXIT"#,
+    for (setup, body) in [
+      ("", r#"H="$H EXIT"; trap "$H" EXIT"#),
+      ("", r#"copy="$H EXIT"; H=$copy; trap "$H" EXIT"#),
+      (
+        "",
+        r#"H=$(command -p printf "%s%s" "$H" " EXIT"); trap "$H" EXIT"#,
+      ),
+      (
+        "",
+        r#"H=$(command -p printf "%s" "$H" " EXIT"); trap "$H" EXIT"#,
+      ),
+      (
+        "",
+        r#"H=$(command -p printf "%s\n" "$H EXIT"); trap "$H" EXIT"#,
+      ),
+      ("", r#"H=$(command -p echo "$H EXIT"); trap "$H" EXIT"#),
+      (
+        "",
+        r#"H=$(command -p printf "%s" "$H"; command -p printf " EXIT"); trap "$H" EXIT"#,
+      ),
+      (
+        "",
+        r#"H=$(command -p printf "%s" "$(command -p printf "%s" "$H")" " EXIT"); trap "$H" EXIT"#,
+      ),
+      ("unset acc; ", r#"acc="$acc EXIT"; trap "$H$acc" EXIT"#),
+      ("acc=; ", r#"acc="$acc EXIT"; trap "$H$acc" EXIT"#),
+      ("export acc=; ", r#"acc="$acc EXIT"; trap "$H$acc" EXIT"#),
     ] {
-      let source =
-        format!(r#"kept=original; H='{body}'; trap "${{H}}" EXIT; : "$kept""#);
+      let source = format!(
+        r#"kept=original; {setup}H='{body}'; trap "${{H}}" EXIT; : "$kept""#
+      );
       let (workspace, analysis) = analyze(&source);
-      assert_eq!(workspace.documents().count(), 4, "{body}");
+      assert_eq!(workspace.documents().count(), 4, "{source}");
       assert_eq!(
         analysis
           .gaps()
@@ -4523,19 +5303,19 @@ mod excluded_effects {
           .filter(|gap| gap.issue == ResolutionIssue::Recursion)
           .count(),
         1,
-        "{body}"
+        "{source}"
       );
       assert!(
         !analysis
           .gaps()
           .iter()
           .any(|gap| gap.issue == ResolutionIssue::ValueLimit),
-        "{body}"
+        "{source}"
       );
       assert_eq!(
         last_value(&workspace, &analysis, b"kept"),
         Value::Literal(b"original".to_vec()),
-        "{body}"
+        "{source}"
       );
     }
     let (workspace, analysis) = analyze(
@@ -4594,7 +5374,8 @@ mod excluded_effects {
             && site.name == Value::Literal(b"marker".to_vec())
         })
         .flat_map(|site| {
-          analysis.values(site.id).map(|(_, value)| value.clone())
+          crate::support::values(&analysis, site.id)
+            .map(|(_, value)| value.clone())
         })
         .collect();
       assert_eq!(
@@ -4615,12 +5396,12 @@ mod excluded_effects {
   #[test]
   fn untraced_trap_transformations_require_the_body_to_repeat_before_recursion()
   {
-    let base = r#"H=${H% EXIT}; trap "$H""#;
-    let body = format!("{base}{}", " EXIT".repeat(12));
+    let base = r#"H=${H% pad}; trap "$H" EXIT; :"#;
+    let body = format!("{base}{}", " pad".repeat(12));
     let (workspace, analysis) =
       analyze(&format!(r#"H='{body}'; trap "$H" EXIT"#));
     for count in 0..=12 {
-      let expected = format!("{base}{}", " EXIT".repeat(count));
+      let expected = format!("{base}{}", " pad".repeat(count));
       assert!(
         workspace
           .documents()
@@ -4660,7 +5441,8 @@ mod excluded_effects {
               && site.name == Value::Literal(b"marker".to_vec())
           })
           .flat_map(|site| {
-            analysis.values(site.id).map(|(_, value)| value.clone())
+            crate::support::values(&analysis, site.id)
+              .map(|(_, value)| value.clone())
           })
           .collect();
         assert_eq!(markers, [Value::Literal(b"ok".to_vec())]);
@@ -4687,6 +5469,16 @@ mod excluded_effects {
       ),
       (
         "unset action; trap \"${action:=exit 1}\" INT; : \"$action\"",
+        b"action",
+        b"exit 1",
+      ),
+      (
+        "unset action; trap \"${action:=exit 1}\"; : \"$action\"",
+        b"action",
+        b"exit 1",
+      ),
+      (
+        "set --; unset action; trap -- \"${action:=exit 1}\" \"$@\"; : \"$action\"",
         b"action",
         b"exit 1",
       ),

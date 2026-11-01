@@ -1,5 +1,3 @@
-use imbl::OrdSet;
-use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
 use super::super::execution::{
@@ -10,8 +8,8 @@ use super::Expansion;
 use crate::interface::application::engine::word::{self, Word};
 use crate::interface::application::engine::workspace::parser;
 use crate::interface::application::engine::{
-  Access, DerivedOrigin, EffectTarget, ExecutionKind, OriginPart,
-  ResolutionIssue, Snapshot, Value, ValueIssue,
+  DerivedOrigin, EffectTarget, ExecutionKind, OccurrenceId, OriginPart,
+  ResolutionIssue, Value, ValueIssue,
 };
 
 type Number = Result<i64, ValueIssue>;
@@ -77,18 +75,17 @@ pub(super) fn binary(operator: &[u8], left: Number, right: Number) -> Number {
     (Err(issue), Ok(_)) | (Ok(_), Err(issue)) => return Err(issue),
   };
   match operator {
-    b"+" => a.checked_add(b),
-    b"-" => a.checked_sub(b),
-    b"*" => a.checked_mul(b),
+    b"+" => Some(a.wrapping_add(b)),
+    b"-" => Some(a.wrapping_sub(b)),
+    b"*" => Some(a.wrapping_mul(b)),
     b"/" => a.checked_div(b),
     b"%" => a.checked_rem(b),
-    b"<<" if a >= 0 => u32::try_from(b)
-      .ok()
-      .filter(|b| *b < 64)
-      .and_then(|b| i64::try_from(i128::from(a) << b).ok()),
-    b">>" if a >= 0 => {
-      u32::try_from(b).ok().filter(|b| *b < 64).map(|b| a >> b)
-    }
+    b"<<" => Some(
+      a.wrapping_shl(u32::try_from(b.rem_euclid(64)).expect("shift count")),
+    ),
+    b">>" => Some(
+      a.wrapping_shr(u32::try_from(b.rem_euclid(64)).expect("shift count")),
+    ),
     b"&" => Some(a & b),
     b"|" => Some(a | b),
     b"^" => Some(a ^ b),
@@ -109,7 +106,7 @@ pub(super) fn unary(operator: &[u8], operand: Number) -> Number {
   operand.and_then(|n| {
     match operator {
       b"+" => Some(n),
-      b"-" => n.checked_neg(),
+      b"-" => Some(n.wrapping_neg()),
       b"!" => Some(i64::from(n == 0)),
       b"~" => Some(!n),
       _ => None,
@@ -117,50 +114,6 @@ pub(super) fn unary(operator: &[u8], operand: Number) -> Number {
     .ok_or(ValueIssue::Arithmetic)
   })
 }
-
-#[derive(Clone, Default)]
-struct VariableAccess {
-  reads: OrdSet<Vec<u8>>,
-  writes: OrdSet<Vec<u8>>,
-}
-
-impl VariableAccess {
-  fn join(&mut self, other: &Self) {
-    union(&mut self.reads, &other.reads);
-    union(&mut self.writes, &other.writes);
-  }
-
-  /// Unsequenced access conflicts (C17 6.5p2).
-  fn conflicts(&self, other: &Self) -> bool {
-    intersects(&self.writes, &other.reads)
-      || intersects(&other.writes, &self.reads)
-      || intersects(&self.writes, &other.writes)
-  }
-}
-
-fn union(into: &mut OrdSet<Vec<u8>>, other: &OrdSet<Vec<u8>>) {
-  if into.len() < other.len() {
-    let smaller = std::mem::replace(into, other.clone());
-    into.extend(smaller);
-  } else {
-    into.extend(other.iter().cloned());
-  }
-}
-
-fn intersects(left: &OrdSet<Vec<u8>>, right: &OrdSet<Vec<u8>>) -> bool {
-  let (smaller, larger) = if left.len() <= right.len() {
-    (left, right)
-  } else {
-    (right, left)
-  };
-  smaller.iter().any(|name| larger.contains(name))
-}
-
-/// Caching avoids repeatedly walking operands of nested operators.
-#[derive(Default)]
-pub(in crate::interface::application::engine::analysis) struct ArithmeticAccess(
-  BTreeMap<(Snapshot, usize), VariableAccess>,
-);
 
 impl<'a> Resolver<'a> {
   pub(in crate::interface::application::engine::analysis) fn arithmetic(
@@ -176,6 +129,13 @@ impl<'a> Resolver<'a> {
       }
       let source = self.workspace.source(frame.snapshot.document);
       if let Some(expression) = node.child_by_field_name("expression") {
+        if expression.kind() == "arithmetic_source" {
+          return Self::invalid_arithmetic(
+            arithmetic_parts(vec![expression]).into_iter(),
+            env,
+            frame,
+          );
+        }
         let bytes = word::lexical(expression, source);
         if bytes.iter().all(u8::is_ascii_digit) {
           return result(integer(&Value::Literal(bytes)), env);
@@ -197,15 +157,13 @@ impl<'a> Resolver<'a> {
         result(integer(&Value::Literal(word::lexical(node, source))), env)
       }
       "arithmetic_variable" => {
-        let id = self.site(node, frame);
-        if let Some(id) = id {
-          self.read(id, &env, frame);
-        }
-        let number = id
-          .and_then(|id| self.variable_value(id, &env))
-          .map_or(Err(ValueIssue::Dynamic), |v| integer(v));
         let mut env = env;
-        env.require_parameter(&word::lexical(node, source));
+        let number = self.arithmetic_operand(
+          self.site(node, frame),
+          Some(&word::lexical(node, source)),
+          &mut env,
+          frame,
+        );
         result(number, env)
       }
       "arithmetic_unary_expression" => {
@@ -273,7 +231,7 @@ impl<'a> Resolver<'a> {
   fn calculate_binary(
     &mut self,
     node: Node<'a>,
-    mut env: Environment,
+    env: Environment,
     frame: Frame,
   ) -> Task<'a> {
     let (Some(left), Some(right), Some(operator)) = (
@@ -286,8 +244,6 @@ impl<'a> Resolver<'a> {
     let source = self.workspace.source(frame.snapshot.document);
     let op = word::lexical(operator, source);
     let short = matches!(op.as_slice(), b"&&" | b"||");
-    let conflict = !short && self.arithmetic_conflict(left, right, frame);
-    let order = conflict.then(|| self.unordered(node, &mut env, frame));
     Task::arithmetic(left, env, frame).then_word(move |_, left| {
       let a = integer(&left.word.scalar());
       let skip =
@@ -296,30 +252,24 @@ impl<'a> Resolver<'a> {
         return result(Ok(i64::from(op == b"||")), left.env);
       }
       let before = left.env.clone();
-      Task::arithmetic(right, left.env, frame).then_word(
-        move |resolver, mut right| {
-          let b = integer(&right.word.scalar());
-          if !conflict && matches!(op.as_slice(), b"/" | b"%") && b == Ok(0) {
-            right.env.failure = CommandFailure::Definite;
-          }
-          let mut number = binary(&op, a, b);
-          if short && a.is_err() {
-            right.env.join(&before);
-          }
-          if let Some(order) = order {
-            resolver.ordered(node, &mut right.env, frame, order);
-            number = Err(ValueIssue::Unspecified);
-          }
-          result(number, right.env)
-        },
-      )
+      Task::arithmetic(right, left.env, frame).then_word(move |_, mut right| {
+        let b = integer(&right.word.scalar());
+        if matches!(op.as_slice(), b"/" | b"%") && b == Ok(0) {
+          right.env.failure = CommandFailure::Definite;
+        }
+        let number = binary(&op, a, b);
+        if short && a.is_err() {
+          right.env.join(&before);
+        }
+        result(number, right.env)
+      })
     })
   }
 
   fn calculate_assignment(
     &mut self,
     node: Node<'a>,
-    mut env: Environment,
+    env: Environment,
     frame: Frame,
   ) -> Task<'a> {
     let (Some(mut left), Some(right), Some(operator)) = (
@@ -344,25 +294,9 @@ impl<'a> Resolver<'a> {
           Value::Literal(name) => Some(name.clone()),
           Value::Partial(_) | Value::Unknown(_) => None,
         });
-    let conflict = name.as_ref().is_some_and(|name| {
-      self.variable_access(right, frame).writes.contains(name)
-    });
-    let order = conflict.then(|| {
-      self.gap(node, frame, ResolutionIssue::EvaluationOrder);
-      self.unordered(node, &mut env, frame)
-    });
-    let old = if op == b"=" {
-      Ok(0)
-    } else {
-      if let Some(id) = id {
-        self.read(id, &env, frame);
-      }
-      id.and_then(|id| self.variable_value(id, &env))
-        .map_or(Err(ValueIssue::Dynamic), |v| integer(v))
-    };
     Task::arithmetic(right, env, frame).then_word(move |resolver, mut right| {
       let rhs = integer(&right.word.scalar());
-      if !conflict && matches!(op.as_slice(), b"/=" | b"%=") && rhs == Ok(0) {
+      if matches!(op.as_slice(), b"/=" | b"%=") && rhs == Ok(0) {
         right.env.failure = CommandFailure::Definite;
       }
       let readonly = name
@@ -370,19 +304,38 @@ impl<'a> Resolver<'a> {
         .is_some_and(|name| right.env.readonly(name).is_some());
       let number = if readonly {
         Err(ValueIssue::Dynamic)
-      } else if conflict {
-        Err(ValueIssue::Unspecified)
       } else if op == b"=" {
         rhs
       } else {
+        let old = resolver.arithmetic_operand(
+          id,
+          name.as_deref(),
+          &mut right.env,
+          frame,
+        );
         binary(&op[..op.len().saturating_sub(1)], old, rhs)
       };
       resolver.write(left, &mut right.env, frame, false, value(number));
-      if let Some(order) = order {
-        resolver.ordered(node, &mut right.env, frame, order);
-      }
       result(number, right.env)
     })
+  }
+
+  /// Variable operands, including the old value of a compound assignment.
+  fn arithmetic_operand(
+    &mut self,
+    id: Option<OccurrenceId>,
+    name: Option<&[u8]>,
+    env: &mut Environment,
+    frame: Frame,
+  ) -> Number {
+    if let Some(id) = id {
+      self.read(id, env, frame);
+    }
+    if let Some(name) = name {
+      env.require_parameter(name);
+    }
+    id.and_then(|id| self.variable_value(id, env))
+      .map_or(Err(ValueIssue::Dynamic), |v| integer(v))
   }
 
   fn calculate_conditional(
@@ -425,91 +378,6 @@ impl<'a> Resolver<'a> {
       )
     })
   }
-
-  fn arithmetic_conflict(
-    &mut self,
-    left: Node<'_>,
-    right: Node<'_>,
-    frame: Frame,
-  ) -> bool {
-    let conflict = self
-      .variable_access(left, frame)
-      .conflicts(&self.variable_access(right, frame));
-    if conflict {
-      self.gap(left, frame, ResolutionIssue::EvaluationOrder);
-    }
-    conflict
-  }
-
-  fn unordered(
-    &mut self,
-    node: Node<'_>,
-    env: &mut Environment,
-    frame: Frame,
-  ) -> BTreeSet<EffectTarget> {
-    let order = env.order.clone();
-    let writes = self.variable_access(node, frame).writes;
-    env
-      .order
-      .extend(writes.into_iter().map(EffectTarget::Variable));
-    order
-  }
-
-  fn ordered(
-    &mut self,
-    node: Node<'_>,
-    env: &mut Environment,
-    frame: Frame,
-    order: BTreeSet<EffectTarget>,
-  ) {
-    env.order = order;
-    for name in self.variable_access(node, frame).writes {
-      env.invalidate(
-        EffectTarget::Variable(name),
-        self.result.binding_context(frame.context),
-        ResolutionIssue::EvaluationOrder,
-        ValueIssue::Dynamic,
-      );
-    }
-  }
-
-  fn variable_access(
-    &mut self,
-    node: Node<'_>,
-    frame: Frame,
-  ) -> VariableAccess {
-    let key = |node: Node<'_>| (frame.snapshot, node.id());
-    let mut pending = vec![(node, false)];
-    while let Some((current, expanded)) = pending.pop() {
-      if self.arithmetic.0.contains_key(&key(current)) {
-        continue;
-      }
-      if !expanded {
-        pending.push((current, true));
-        pending
-          .extend(children(current).into_iter().map(|child| (child, false)));
-        continue;
-      }
-      let mut access = VariableAccess::default();
-      for child in children(current) {
-        access.join(&self.arithmetic.0[&key(child)]);
-      }
-      if let Some(site) = self
-        .site(current, frame)
-        .and_then(|id| self.workspace.occurrence(id))
-        && let Value::Literal(name) = &site.name
-      {
-        if !matches!(site.access, Access::Write | Access::Definition) {
-          access.reads.insert(name.clone());
-        }
-        if !matches!(site.access, Access::Read) {
-          access.writes.insert(name.clone());
-        }
-      }
-      self.arithmetic.0.insert(key(current), access);
-    }
-    self.arithmetic.0[&key(node)].clone()
-  }
 }
 
 struct ArithmeticSource<'a> {
@@ -522,6 +390,20 @@ struct ArithmeticSource<'a> {
 }
 
 impl<'a> Resolver<'a> {
+  fn invalid_arithmetic(
+    mut parts: std::vec::IntoIter<Node<'a>>,
+    mut env: Environment,
+    frame: Frame,
+  ) -> Task<'a> {
+    if let Some(part) = parts.next() {
+      return Task::expand(part, false, env, frame).then_word(
+        move |_, expanded| Self::invalid_arithmetic(parts, expanded.env, frame),
+      );
+    }
+    env.failure = CommandFailure::Definite;
+    result(Err(ValueIssue::Arithmetic), env)
+  }
+
   /// Damaged arithmetic expands its intact expansions in order, and its
   /// evaluation has unknown effects.
   fn damaged_arithmetic(

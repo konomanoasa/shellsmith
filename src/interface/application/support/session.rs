@@ -68,14 +68,14 @@ impl State {
     if let Some(analyses) = &application.analyses
       && analyses.supersedes(self.application.analyses.as_deref())
     {
-      self.application.analyses = Some(analyses.clone());
+      self.application.set_analyses(Some(analyses.clone()));
       self.updates.send_replace(());
     }
   }
 
   fn invalidate(&mut self) {
     self.generation = Arc::default();
-    self.application.analyses = None;
+    self.application.set_analyses(None);
     if let Some(task) = self.background.take() {
       task.abort();
     }
@@ -302,8 +302,7 @@ impl Session {
             if let Some(published) = published
               && published.supersedes(application.analyses.as_deref())
             {
-              application.analyses = Some(published);
-              application.names = None;
+              application.set_analyses(Some(published));
             }
             let output = (|| {
               application.prepare_request(&scope, flag)?;

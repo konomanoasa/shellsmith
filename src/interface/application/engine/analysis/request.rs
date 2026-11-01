@@ -66,9 +66,10 @@ pub struct InitialEnvironment {
   pub functions: BTreeMap<Vec<u8>, InitialBinding>,
   pub other_variables: InitialBinding,
   pub other_functions: InitialBinding,
-  pub errexit: Option<bool>,
   pub nounset: Option<bool>,
   pub noglob: Option<bool>,
+  pub allexport: Option<bool>,
+  pub pipefail: Option<bool>,
 }
 
 impl InitialEnvironment {
@@ -90,9 +91,10 @@ impl InitialEnvironment {
       special: BTreeMap::from([(b"?".to_vec(), b"0".to_vec())]),
       other_variables: InitialBinding::Absent,
       other_functions: InitialBinding::Absent,
-      errexit: Some(false),
       nounset: Some(false),
       noglob: Some(false),
+      allexport: Some(false),
+      pipefail: Some(false),
       ..Self::default()
     }
   }

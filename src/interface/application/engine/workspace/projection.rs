@@ -64,12 +64,14 @@ impl Workspace {
       })
     {
       let origin = &unit.origin.argument;
-      let group = groups.entry(unit.key.site.clone()).or_insert_with(|| {
-        ProjectedDocuments {
-          documents: Vec::new(),
-          complete: true,
-        }
-      });
+      let group =
+        groups
+          .entry(&unit.key.site)
+          .or_insert_with(|| ProjectedDocuments {
+            site: &unit.key.site,
+            documents: Vec::new(),
+            complete: true,
+          });
       group.documents.push(unit);
       group.complete &= !incomplete.contains(&unit.document.snapshot())
         && !gaps.contains(&(
@@ -110,10 +112,6 @@ impl Workspace {
     let analysis = self.analysis();
     let mut result = BTreeMap::new();
     for group in self.projections(snapshot, analysis) {
-      let Some(first) = group.documents.first() else {
-        continue;
-      };
-      let site = first.key.site.clone();
       let mut projected: BTreeMap<_, ProjectedResolution> = BTreeMap::new();
       for unit in &group.documents {
         for (range, resolution) in
@@ -130,7 +128,7 @@ impl Workspace {
         {
           projected.resolution = None;
         }
-        insert_nested(&mut result, range, &site, projected, |old, new| {
+        insert_nested(&mut result, range, group.site, projected, |old, new| {
           old.join(&new);
         });
       }
@@ -186,15 +184,52 @@ impl Workspace {
   ) -> impl Iterator<Item = Location> {
     locations
       .into_iter()
-      .flat_map(|location| self.project_locations(location).unwrap_or_default())
+      .flat_map(|location| {
+        let mut projected =
+          self.project_locations(location).unwrap_or_default();
+        if projected.len() > 1
+          && let Some(whole) = self.literal_location(location, &projected)
+        {
+          projected.push(whole);
+        }
+        projected
+      })
       .filter(move |location| {
         location.snapshot == snapshot
           && offset.is_none_or(|offset| location.bytes.contains(&offset))
       })
   }
+
+  pub(super) fn literal_location(
+    &self,
+    location: &Location,
+    projected: &[Location],
+  ) -> Option<Location> {
+    let first = projected.first()?;
+    let source = self.document(first.snapshot.document)?;
+    let mut text = self
+      .document(location.snapshot.document)?
+      .text(location)?
+      .as_bytes();
+    let mut end = first.bytes.start;
+    for part in projected {
+      let gap = source.source().as_bytes().get(end..part.bytes.start)?;
+      if !gap.chunks(2).all(|bytes| bytes == b"\\\n") {
+        return None;
+      }
+      text = text.strip_prefix(source.text(part)?.as_bytes())?;
+      end = part.bytes.end;
+    }
+    text.is_empty().then_some(Location {
+      snapshot: first.snapshot,
+      bytes: first.bytes.start..end,
+    })
+  }
 }
 
+/// Units derived from one argument site; a group is never empty.
 pub(super) struct ProjectedDocuments<'a> {
+  pub(super) site: &'a DerivedSite,
   pub(super) documents: Vec<&'a DerivedUnit>,
   pub(super) complete: bool,
 }
@@ -250,12 +285,11 @@ fn projection_groups<'a>(
     for group in
       workspace.projections(document.snapshot(), workspace.analysis())
     {
-      let Some(first) = group.documents.first() else {
-        continue;
-      };
       let attempted = workspace.analysis().is_some_and(|analysis| {
         analysis
-          .argument_summary(engine::UseSite::argument(&first.origin.argument))
+          .argument_summary(engine::UseSite::argument(
+            &group.documents[0].origin.argument,
+          ))
           .is_some()
           || group.documents.iter().any(|unit| {
             analysis.contexts().iter().any(|context| {
@@ -270,25 +304,33 @@ fn projection_groups<'a>(
           })
       });
       groups
-        .entry(first.key.site.clone())
+        .entry(group.site.clone())
         .or_default()
         .push((*workspace, group, attempted));
     }
   }
+  // Entries that reached a site decide it for the others.
+  let groups: BTreeMap<_, Vec<_>> = groups
+    .into_iter()
+    .map(|(site, groups)| {
+      let attempted = groups.iter().any(|(_, _, attempted)| *attempted);
+      let groups = groups
+        .into_iter()
+        .filter(|(_, _, reached)| !attempted || *reached)
+        .map(|(workspace, group, _)| (workspace, group))
+        .collect();
+      (site, groups)
+    })
+    .collect();
   let blocked: Vec<_> = groups
     .iter()
     .filter(|(site, groups)| {
-      let attempted = groups.iter().any(|(_, _, attempted)| *attempted);
       conflicting_body_roles(site, workspaces)
-        || groups.iter().any(|(_, group, reached)| {
-          (!attempted || *reached) && !group.complete
-        })
+        || groups.iter().any(|(_, group)| !group.complete)
     })
-    .map(|(site, _)| site)
-    .cloned()
+    .map(|(site, _)| site.clone())
     .collect();
   for (site, groups) in groups {
-    let attempted = groups.iter().any(|(_, _, attempted)| *attempted);
     if blocked.iter().any(|parent| {
       parent.root == site.root
         && parent.argument.0 <= site.argument.0
@@ -296,12 +338,8 @@ fn projection_groups<'a>(
     }) {
       continue;
     }
-    let groups: Vec<_> = groups
-      .into_iter()
-      .filter(|(_, _, reached)| !attempted || *reached)
-      .collect();
     let mut units: BTreeMap<_, Vec<_>> = BTreeMap::new();
-    for (workspace, group, _) in groups {
+    for (workspace, group) in groups {
       for unit in group.documents {
         units.entry(&unit.key).or_default().push((workspace, unit));
       }
@@ -324,10 +362,8 @@ pub(super) fn blocked_projections(
     .flat_map(|workspace| {
       workspace.projections(document.snapshot(), workspace.analysis())
     })
-    .filter_map(|group| {
-      let site = &group.documents.first()?.key.site;
-      (!accepted.contains(site)).then_some(site.argument.0..site.argument.1)
-    })
+    .filter(|group| !accepted.contains(group.site))
+    .map(|group| group.site.argument.0..group.site.argument.1)
     .collect()
 }
 

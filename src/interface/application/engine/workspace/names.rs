@@ -64,6 +64,7 @@ pub struct NameOccurrence {
   pub resolution: Option<Resolution>,
   pub compatible: bool,
   pub readonly: AttributeState,
+  pub exported: AttributeState,
   origins: BTreeSet<NameId>,
 }
 
@@ -171,8 +172,8 @@ impl NameRelations {
           })
         }
         NameEnvironment::Caller(_) => return unknown_caller,
-        NameEnvironment::Isolated(_) => {
-          isolated_parent(&self.scopes, environment)
+        NameEnvironment::Isolated(id) => {
+          self.scopes.get(&id).and_then(|scope| scope.parent)
         }
       };
     }
@@ -313,31 +314,6 @@ impl NameRelations {
     }
     Some(targets)
   }
-
-  #[must_use]
-  pub fn at(
-    &self,
-    snapshot: Snapshot,
-    offset: usize,
-  ) -> Vec<(usize, &NameOccurrence)> {
-    let mut matches = Vec::new();
-    let mut width = usize::MAX;
-    for (index, site) in self.occurrences.iter().enumerate() {
-      let Some(location) = site.spelling.editable().filter(|location| {
-        location.snapshot == snapshot && location.bytes.contains(&offset)
-      }) else {
-        continue;
-      };
-      if location.bytes.len() < width {
-        matches.clear();
-        width = location.bytes.len();
-      }
-      if location.bytes.len() == width {
-        matches.push((index, site));
-      }
-    }
-    matches
-  }
 }
 
 fn identity(identities: &[usize], mut index: usize) -> usize {
@@ -381,17 +357,6 @@ struct Relationships<'a> {
 struct SyntaxName {
   environment: NameEnvironment,
   definition: Option<SymbolId>,
-}
-
-fn isolated_parent(
-  scopes: &BTreeMap<ContextId, NameScope>,
-  environment: NameEnvironment,
-) -> Option<NameEnvironment> {
-  if let NameEnvironment::Isolated(id) = environment {
-    scopes.get(&id).and_then(|scope| scope.parent)
-  } else {
-    None
-  }
 }
 
 #[derive(Debug, Default)]
@@ -560,11 +525,16 @@ impl Workspace {
       .collect();
     for (symbol, context) in &analysis.writes {
       if let Some(definition) = self.symbol(*symbol) {
-        let site = arguments
-          .get(&(*symbol, *context))
-          .copied()
-          .unwrap_or(UseSite::Syntax(definition.definition));
-        sites.entry((site, *context)).or_default().insert(*symbol);
+        if let Some(site) = arguments.get(&(*symbol, *context)) {
+          sites.entry((*site, *context)).or_default().insert(*symbol);
+          if site.snapshot() != definition.definition.snapshot {
+            continue;
+          }
+        }
+        sites
+          .entry((UseSite::Syntax(definition.definition), *context))
+          .or_default()
+          .insert(*symbol);
       }
     }
     let uses = analysis.uses().map(|site| (site.site, site.context));
@@ -985,9 +955,11 @@ impl<'a> Relationships<'a> {
         })
         .or_else(|| deferred.map(|site| site.environment))
         .unwrap_or_else(|| self.deferred_environment(document, &location));
-      let temporary = context.and_then(|context| {
-        self.temporary_scope(site, context, text, &definitions)
-      });
+      let temporary = context
+        .filter(|_| kind == SymbolKind::Variable)
+        .and_then(|context| {
+          self.temporary_scope(site, context, text, &definitions)
+        });
       let key = NameKey {
         environment,
         kind,
@@ -1015,7 +987,7 @@ impl<'a> Relationships<'a> {
       .as_ref()
       .map_or_else(Vec::new, |_| self.project_spelling(&spelling));
     let spelling = text.as_ref().map_or(NameSpelling::Generated, |name| {
-      self.spelling(document, &location, &spans, name)
+      self.spelling(document, &location, &spelling, &spans, name)
     });
     let source = self.source_location(&location);
     let occurrence = NameOccurrence {
@@ -1032,6 +1004,9 @@ impl<'a> Relationships<'a> {
       resolution,
       compatible,
       readonly,
+      exported: context
+        .and_then(|context| self.analysis.attributes.get(&(site, context)))
+        .map_or(AttributeState::Unknown, |state| state.exported),
       origins,
     };
     self.undecoded_dependency(&occurrence, kind);
@@ -1052,20 +1027,9 @@ impl<'a> Relationships<'a> {
       let id = match origin {
         engine::BindingOrigin::Context(context) => {
           let temporary = (kind == SymbolKind::Variable)
-            .then(|| {
-              self
-                .analysis
-                .context_ancestors(*context)
-                .find_map(|ancestor| {
-                  self
-                    .analysis
-                    .temporary
-                    .get(&ancestor.id)?
-                    .get(&text)
-                    .copied()
-                })
-            })
-            .flatten();
+            .then(|| self.nearest_temporary(*context, &text))
+            .flatten()
+            .map(|(_, scope)| scope);
           self.name(NameKey {
             environment: NameEnvironment::Execution(
               self.analysis.name_environment(*context),
@@ -1154,42 +1118,40 @@ impl<'a> Relationships<'a> {
     if self.analysis.temporary.is_empty() {
       return None;
     }
-    for ancestor in self.analysis.context_ancestors(context) {
-      let Some(scope) = self
+    let (ancestor, scope) = self.nearest_temporary(context, text)?;
+    if !definitions.is_empty() {
+      return Some(scope);
+    }
+    let local =
+      self
         .analysis
-        .temporary
-        .get(&ancestor.id)
-        .and_then(|names| names.get(text))
-      else {
-        continue;
-      };
-      if !definitions.is_empty() {
-        return Some(*scope);
-      }
-      let local =
-        self
-          .analysis
-          .resolution(site, context)
-          .is_some_and(|resolution| {
-            resolution.candidates.iter().any(|symbol| {
+        .resolution(site, context)
+        .is_some_and(|resolution| {
+          resolution.candidates.iter().any(|symbol| {
+            self.analysis.write_contexts(*symbol).any(|written| {
               self
                 .analysis
-                .writes
-                .range(
-                  (*symbol, ExecutionContextId(0))
-                    ..=(*symbol, ExecutionContextId(usize::MAX)),
-                )
-                .any(|(_, written)| {
-                  self
-                    .analysis
-                    .context_ancestors(*written)
-                    .any(|context| context.id == ancestor.id)
-                })
+                .context_ancestors(written)
+                .any(|context| context.id == ancestor)
             })
-          });
-      return local.then_some(*scope);
-    }
-    None
+          })
+        });
+    local.then_some(scope)
+  }
+
+  /// The innermost temporary assignment of `text` around `context`.
+  fn nearest_temporary(
+    &self,
+    context: ExecutionContextId,
+    text: &[u8],
+  ) -> Option<(ExecutionContextId, UseSite)> {
+    self
+      .analysis
+      .context_ancestors(context)
+      .find_map(|ancestor| {
+        let scope = self.analysis.temporary.get(&ancestor.id)?.get(text)?;
+        Some((ancestor.id, *scope))
+      })
   }
 
   fn describe(
@@ -1223,9 +1185,13 @@ impl<'a> Relationships<'a> {
           fragments: syntax_spelling(document, occurrence),
           compatible: true,
           readonly: context
-            .and_then(|context| self.analysis.attributes.get(&(id, context)))
-            .copied()
-            .unwrap_or(AttributeState::Unknown),
+            .and_then(|context| {
+              self
+                .analysis
+                .attributes
+                .get(&(UseSite::Syntax(id), context))
+            })
+            .map_or(AttributeState::Unknown, |state| state.readonly),
         })
       }
       UseSite::Argument { .. } => {
@@ -1295,6 +1261,7 @@ impl<'a> Relationships<'a> {
     &self,
     document: &Document,
     location: &Location,
+    fragments: &[Location],
     projected: &[Location],
     name: &[u8],
   ) -> NameSpelling {
@@ -1320,36 +1287,34 @@ impl<'a> Relationships<'a> {
         return NameSpelling::Exact(exact);
       }
     }
-    if let Some(node) = document
-      .tree
-      .root_node()
-      .named_descendant_for_byte_range(location.bytes.start, location.bytes.end)
-      && node.byte_range() == location.bytes
-      && (engine::word::lexical(node, document.source().as_bytes()) == name
-        || engine::word::literal_value(node, document.source().as_bytes())
-          == Value::Literal(name.to_vec()))
-      && let Some(word) = self.verbatim_source(document, location)
-    {
-      return NameSpelling::LiteralWord(word);
-    }
-    NameSpelling::Fragments(projected.to_vec())
-  }
-
-  /// The source range that `location` copies byte for byte.
-  fn verbatim_source(
-    &self,
-    document: &Document,
-    location: &Location,
-  ) -> Option<Location> {
-    let [source] =
-      <[Location; 1]>::try_from(self.workspace.project_locations(location)?)
-        .ok()?;
-    (self
-      .workspace
-      .document(source.snapshot.document)?
-      .text(&source)?
-      == document.text(location)?)
-    .then_some(source)
+    let literal_word = |word: &Location| {
+      let node = document
+        .tree
+        .root_node()
+        .named_descendant_for_byte_range(word.bytes.start, word.bytes.end)?;
+      (node.byte_range() == word.bytes
+        && (engine::word::lexical(node, document.source().as_bytes()) == name
+          || engine::word::literal_value(node, document.source().as_bytes())
+            == Value::Literal(name.to_vec())))
+      .then_some(())?;
+      let projected = self.workspace.project_locations(word)?;
+      self.workspace.literal_location(word, &projected)
+    };
+    // A declaration assignment spells its name in a node inside the word.
+    literal_word(location)
+      .or_else(|| match fragments {
+        [fragment]
+          if fragment.snapshot == location.snapshot
+            && fragment.bytes != location.bytes =>
+        {
+          literal_word(fragment)
+        }
+        _ => None,
+      })
+      .map_or_else(
+        || NameSpelling::Fragments(projected.to_vec()),
+        NameSpelling::LiteralWord,
+      )
   }
 }
 

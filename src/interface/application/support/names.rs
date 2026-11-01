@@ -17,7 +17,7 @@ pub(in crate::interface::application) struct EntryMetadata {
 pub(in crate::interface::application) struct NameCollection {
   pub entries: Vec<EntryMetadata>,
   pub results: engine::NameResults,
-  pub documents: BTreeMap<engine::Snapshot, (PathBuf, Arc<str>)>,
+  pub documents: BTreeMap<engine::Snapshot, (PathBuf, Arc<engine::Document>)>,
   roots: BTreeSet<PathBuf>,
   selection: InputSelection,
 }
@@ -80,12 +80,11 @@ impl Application {
         dependencies,
         damaged: false,
       });
-      for document in workspace.documents() {
+      for document in workspace.shared_documents() {
         if let Some(path) = self.path(document.snapshot().document) {
-          collection.documents.insert(
-            document.snapshot(),
-            (path.to_path_buf(), Arc::from(document.source())),
-          );
+          collection
+            .documents
+            .insert(document.snapshot(), (path.to_path_buf(), document));
         }
       }
       workspaces.push(workspace);
@@ -116,10 +115,10 @@ impl Application {
   ) -> Result<NameCollection, Error> {
     let mut scratch = self.clone();
     scratch.cache.frozen = true;
-    for (path, source) in collection.documents.values() {
+    for (path, document) in collection.documents.values() {
       let Some(text) = changed
         .get(path)
-        .filter(|text| text.as_str() != source.as_ref())
+        .filter(|text| text.as_str() != document.source())
       else {
         continue;
       };

@@ -153,18 +153,10 @@ impl Application {
     &self.settings
   }
 
-  pub fn configure(&mut self, settings: Settings) -> Result<(), Error> {
-    self.settings = settings.checked()?;
-    self.invalidate_inputs();
-    Ok(())
-  }
-
   fn invalidate_inputs(&mut self) {
     self.limited = None;
     self.cache = InputCache::default();
-    self.names = None;
-    self.analyses = None;
-    self.workspace.clear_analysis();
+    self.clear_semantics();
   }
 
   #[must_use]
@@ -242,8 +234,7 @@ impl Application {
   pub fn add_input(&mut self, path: &Path) -> bool {
     let added = self.inputs.insert(self.settings.cwd.join(path));
     if added {
-      self.names = None;
-      self.analyses = None;
+      self.set_analyses(None);
     }
     added
   }
@@ -251,8 +242,7 @@ impl Application {
   pub fn remove_input(&mut self, path: &Path) -> bool {
     let removed = self.inputs.remove(&self.settings.cwd.join(path));
     if removed {
-      self.names = None;
-      self.analyses = None;
+      self.set_analyses(None);
       self.discovery.remove(&self.absolute(path));
     }
     removed
@@ -265,50 +255,6 @@ impl Application {
       .collect();
     self.discovery.changed(&paths);
     self.invalidate_inputs();
-  }
-
-  pub fn open(
-    &mut self,
-    path: &Path,
-    source: &str,
-    cancelled: &AtomicBool,
-  ) -> Result<(), Error> {
-    let path = self.document_path(path)?;
-    check_cancelled(cancelled)?;
-    self.set_overlay(path.clone(), Some(Arc::from(source)));
-    self.replace(&path, source.as_bytes(), cancelled)
-  }
-
-  pub fn change(
-    &mut self,
-    path: &Path,
-    source: &str,
-    cancelled: &AtomicBool,
-  ) -> Result<(), Error> {
-    let path = self.overlay_path(path, false)?;
-    if !self.opened.contains_key(&path) {
-      return Err(Error::Message("Document is not open".into()));
-    }
-    check_cancelled(cancelled)?;
-    self.set_overlay(path.clone(), Some(Arc::from(source)));
-    self.replace(&path, source.as_bytes(), cancelled)
-  }
-
-  /// Discards the overlay even if reloading from disk fails. A path that
-  /// now resolves elsewhere is no longer a document identity.
-  pub fn close(
-    &mut self,
-    path: &Path,
-    cancelled: &AtomicBool,
-  ) -> Result<(), Error> {
-    check_cancelled(cancelled)?;
-    let path = self.overlay_path(path, false)?;
-    self.set_overlay(path.clone(), None);
-    let current = self.absolute(&path);
-    if current != path {
-      self.discard(&path);
-    }
-    self.load(&current, cancelled)
   }
 
   fn discard(&mut self, path: &Path) {
@@ -366,8 +312,7 @@ impl Application {
     bytes: &[u8],
     cancelled: &AtomicBool,
   ) -> Result<(), Error> {
-    self.analyses = None;
-    self.names = None;
+    self.set_analyses(None);
     let document = self.documents.parse_entry(
       &mut self.entries,
       path,
@@ -404,25 +349,6 @@ impl Application {
     result
   }
 
-  /// Individual file errors go to `failures`; they do not fail the whole refresh.
-  pub fn refresh(&mut self, cancelled: &AtomicBool) -> Result<(), Error> {
-    self.discovery.invalidate();
-    self.refresh_for(None, cancelled)?;
-    let analyses = self.collect_analysis(BTreeSet::new(), cancelled)?;
-    if let Some(workspace) = analyses.entries.values().next_back() {
-      self.workspace = workspace.clone();
-    }
-    self.restore_analysis_documents(cancelled)?;
-    for (reference, state) in
-      engine::AnalysisResults::new(analyses.entries.values()).dependencies()
-    {
-      if self.workspace.reference_state(reference) != Some(&state) {
-        self.workspace.set_reference(reference, state)?;
-      }
-    }
-    Ok(check_cancelled(cancelled)?)
-  }
-
   pub(in crate::interface::application) fn refresh_for(
     &mut self,
     document: Option<&Path>,
@@ -431,8 +357,7 @@ impl Application {
     self.limited = None;
     check_cancelled(cancelled)?;
     self.failures.clear();
-    self.names = None;
-    self.analyses = None;
+    self.set_analyses(None);
     self.cache = InputCache::default();
     let selected = if let Some(path) = document {
       BTreeSet::from([self.absolute(path)])
@@ -518,9 +443,22 @@ impl Application {
   }
 
   pub(in crate::interface::application) fn clear_semantics(&mut self) {
-    self.names = None;
-    self.analyses = None;
+    self.set_analyses(None);
     self.workspace.clear_analysis();
+  }
+
+  /// Name results derive from the analyses and end with them.
+  pub(super) fn set_analyses(
+    &mut self,
+    analyses: Option<Arc<AnalysisCollection>>,
+  ) {
+    if !matches!(
+      (&self.analyses, &analyses),
+      (Some(old), Some(new)) if Arc::ptr_eq(old, new)
+    ) {
+      self.names = None;
+    }
+    self.analyses = analyses;
   }
 
   pub(super) fn share_workspace_documents(&mut self) {
@@ -547,3 +485,7 @@ impl Application {
     }
   }
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/implementation/application.rs"]
+mod tests;

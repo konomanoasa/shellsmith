@@ -3,8 +3,7 @@ use super::super::execution::{children, damage_outside};
 use super::super::expansion::Expansion;
 use super::super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
-  Document, Error, ResolutionIssue, Snapshot, Value, ValueIssue,
-  check_cancelled, word,
+  Document, Error, Snapshot, Value, ValueIssue, check_cancelled, word,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
@@ -96,20 +95,15 @@ impl<'a> Resolver<'a> {
     env: Environment,
     frame: Frame,
   ) -> Task<'a> {
-    let Some(document) = self.index.heredoc(frame.snapshot, node) else {
-      return Task::Done(self.opaque(
-        node,
-        env,
-        frame,
-        ResolutionIssue::Recovery,
-        None,
-      ));
-    };
+    let document = self.index.heredoc(frame.snapshot, node);
     let source = self.workspace.source(frame.snapshot.document);
     let fd = descriptor(node, source);
     // Damaged syntax outside the body ends the here-document content.
-    let rest = damage_outside(document, &["body"]);
-    let task = match document.child_by_field_name("body") {
+    let rest = document
+      .map_or_else(Vec::new, |document| damage_outside(document, &["body"]));
+    let task = match document
+      .and_then(|document| document.child_by_field_name("body"))
+    {
       Some(body) => self.expand_start(body, false, env, frame),
       None => Task::expanded(Expansion {
         expression: None,
@@ -276,11 +270,10 @@ impl Redirections {
         }
       }
       if let Some(stdout) = self.stdout {
-        env.io.stdout_redirected = stdout;
-        if self.may_persist
-          && let Some(output) = &mut env.io.output
-        {
-          output.fail(ValueIssue::Dynamic);
+        if self.may_persist {
+          env.io.unknown_descriptors();
+        } else {
+          env.io.stdout_redirected = stdout;
         }
       }
       if let Some(stderr) = self.stderr {

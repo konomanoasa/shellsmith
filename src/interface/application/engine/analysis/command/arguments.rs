@@ -36,6 +36,9 @@ pub(super) fn trap_action(args: &[Argument<'_>]) -> Result<Option<usize>, ()> {
     if first.count.boundary().is_err() {
       return Err(());
     }
+    if args.len() == 1 {
+      return Ok(None);
+    }
     match &first.value {
       Value::Literal(value) if value == b"--" => index = 1,
       Value::Literal(value) if value.starts_with(b"-") && value != b"-" => {
@@ -51,6 +54,9 @@ pub(super) fn trap_action(args: &[Argument<'_>]) -> Result<Option<usize>, ()> {
   };
   if action.count.boundary().is_err() {
     return Err(());
+  }
+  if index + 1 == args.len() {
+    return Ok(None);
   }
   if matches!(&action.value, Value::Literal(body)
     if body.is_empty() || body == b"-" || body.iter().all(u8::is_ascii_digit))
@@ -257,11 +263,18 @@ pub(super) fn classify_arguments(
   }
 }
 
+/// XCU getopts has no options, so other leading options are extensions.
 pub(super) fn getopts_operands(args: &[Argument<'_>]) -> Option<usize> {
-  match args.first() {
-    Some(first) if first.count.boundary().is_err() => None,
-    Some(first) if first.value == Value::Literal(b"--".to_vec()) => Some(1),
-    Some(first) if first.value.can_equal(b"--") => None,
+  let Some(first) = args.first() else {
+    return Some(0);
+  };
+  if first.count.boundary().is_err() {
+    return None;
+  }
+  match &first.value {
+    Value::Literal(value) if value == b"--" => Some(1),
+    Value::Literal(value) if value == b"-" => Some(0),
+    value if value.may_start_with(b"-") => None,
     _ => Some(0),
   }
 }
@@ -336,6 +349,9 @@ pub(super) fn unset_options(
   let mut namespace = None;
   let mut index = 0;
   while let Some(arg) = args.get(index) {
+    if arg.count.boundary().is_err() {
+      return None;
+    }
     match &arg.value {
       Value::Literal(value) if value == b"-f" || value == b"-v" => {
         // POSIX does not specify `-f` together with `-v`.
@@ -353,7 +369,7 @@ pub(super) fn unset_options(
       }
       Value::Literal(value) if !value.starts_with(b"-") => break,
       Value::Unknown(_) | Value::Partial(_)
-        if arg.count.boundary().is_ok() && !arg.value.may_start_with(b"-") =>
+        if !arg.value.may_start_with(b"-") =>
       {
         break;
       }

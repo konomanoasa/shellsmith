@@ -1,4 +1,3 @@
-use super::expansion::ArithmeticAccess;
 use super::result::EffectKey;
 use super::{deferred::InvariantInputs, execution, sources::SourceTracking};
 use crate::interface::application::engine;
@@ -10,8 +9,8 @@ use tree_sitter::Node;
 use engine::check_cancelled;
 use engine::workspace::parser;
 use engine::{
-  Access, AttributeState, Error, Location, OccurrenceId, ReferenceId, Snapshot,
-  SymbolId, SymbolKind, UseSite, Value, Workspace,
+  Access, Error, Location, OccurrenceId, ReferenceId, Snapshot, SymbolId,
+  SymbolKind, UseSite, Value, Workspace,
 };
 use engine::{
   Analysis, AnalysisGap, AnalysisInputs, AnalysisRequest, DerivedOrigin,
@@ -26,10 +25,7 @@ pub(super) struct Frame {
   pub(super) snapshot: Snapshot,
   pub(super) context: ExecutionContextId,
   pub(super) loops: u32,
-  pub(super) dynamic_loops: bool,
   pub(super) returnable: bool,
-  /// Function calls entered since the entry.
-  pub(super) functions: u32,
 }
 
 impl Frame {
@@ -38,9 +34,7 @@ impl Frame {
       snapshot,
       context: ExecutionContextId(0),
       loops: 0,
-      dynamic_loops: false,
       returnable: false,
-      functions: 0,
     }
   }
 
@@ -154,7 +148,6 @@ pub(super) struct Resolver<'a> {
   gaps: BTreeSet<EffectKey>,
   pub(super) invariants: InvariantInputs,
   pub(super) track_invariants: bool,
-  pub(super) arithmetic: ArithmeticAccess,
 }
 
 pub(in crate::interface::application::engine) fn analyze<'a>(
@@ -186,9 +179,8 @@ pub(in crate::interface::application::engine) fn analyze<'a>(
   resolver.budget.retain(initial_bytes);
   resolver.budget.work(initial_bytes.div_ceil(16));
   resolver.budget.check(cancelled)?;
-  let mut initial = Environment::new(&resolver.result.request.initial);
-  initial.alternatives.set_budget(resolver.budget.clone());
-  resolver.run(Task::eval(root, initial, Frame::entry(snapshot)))?;
+  let initial = Environment::new(&resolver.result.request.initial);
+  resolver.run_root(root, initial, Frame::entry(snapshot))?;
   resolver.finish()
 }
 
@@ -224,7 +216,6 @@ impl<'a> Resolver<'a> {
       gaps: BTreeSet::new(),
       invariants: InvariantInputs::default(),
       track_invariants,
-      arithmetic: ArithmeticAccess::default(),
       result: Analysis::new(
         request,
         ExecutionContext {
@@ -237,6 +228,19 @@ impl<'a> Resolver<'a> {
         readable,
       ),
     })
+  }
+
+  /// Evaluates an entry or body root; its symbolic values are charged to the
+  /// request budget.
+  pub(super) fn run_root(
+    &mut self,
+    root: Node<'a>,
+    mut env: Environment,
+    frame: Frame,
+  ) -> Result<(), Error> {
+    env.alternatives.set_budget(self.budget.clone());
+    self.run(Task::eval(root, env, frame))?;
+    Ok(())
   }
 }
 
@@ -269,7 +273,7 @@ impl Resolver<'_> {
       return Err(error);
     }
     self.commit_sources()?;
-    self.result.index_uses(self.cancelled)?;
+    self.result.validate_uses(self.cancelled)?;
     self.budget.check(self.cancelled)?;
     Ok(self.result)
   }
@@ -351,20 +355,38 @@ impl Resolver<'_> {
     context: ExecutionContextId,
     env: &Environment,
   ) {
-    let state =
-      self
-        .workspace
-        .occurrence(id)
-        .map_or(AttributeState::Unknown, |site| {
-          let Value::Literal(name) = &site.name else {
-            return AttributeState::Unknown;
-          };
-          env.readonly_attribute(name)
-        });
+    let Some(Value::Literal(name)) =
+      self.workspace.occurrence(id).map(|site| &site.name)
+    else {
+      return;
+    };
+    let name = name.clone();
+    self.record_site_attributes(UseSite::Syntax(id), context, &name, env);
+  }
+
+  pub(super) fn record_site_attributes(
+    &mut self,
+    site: UseSite,
+    context: ExecutionContextId,
+    name: &[u8],
+    env: &Environment,
+  ) {
+    self.budget.work(1);
+    if !self.result.attributes.contains_key(&(site, context)) {
+      self.budget.retain(std::mem::size_of::<(
+        UseSite,
+        ExecutionContextId,
+        engine::VariableAttributes,
+      )>());
+    }
+    if self.budget.exhausted() {
+      return;
+    }
+    let state = env.attributes(name);
     self
       .result
       .attributes
-      .entry((id, context))
+      .entry((site, context))
       .and_modify(|old| *old = old.join(state))
       .or_insert(state);
   }
@@ -377,6 +399,9 @@ impl Resolver<'_> {
     variable: Option<&[u8]>,
     env: &Environment,
   ) {
+    if let Some(name) = variable {
+      self.record_site_attributes(site, context, name, env);
+    }
     let records = resolution.candidates.len()
       + resolution.alternatives.len()
       + resolution.issues.len()
@@ -389,7 +414,7 @@ impl Resolver<'_> {
       return;
     }
     if variable.is_some_and(|name| env.uncertain_variable(name)) {
-      resolution.issues.insert(ResolutionIssue::EvaluationOrder);
+      resolution.issues.insert(ResolutionIssue::UnknownEffect);
       resolution.origins.insert(engine::BindingOrigin::Context(
         self.result.binding_context(context),
       ));
@@ -425,13 +450,13 @@ impl Resolver<'_> {
     let boundary =
       matches!(kind, ExecutionKind::Function(_) | ExecutionKind::Source(_));
     let frame = Frame {
-      loops: if separate || boundary { 0 } else { frame.loops },
-      dynamic_loops: !separate
-        && (frame.dynamic_loops || (boundary && frame.loops > 0)),
+      loops: if separate || matches!(kind, ExecutionKind::Function(_)) {
+        0
+      } else {
+        frame.loops
+      },
       returnable: !matches!(kind, ExecutionKind::Deferred(_))
         && (boundary || frame.returnable),
-      functions: frame.functions
-        + u32::from(matches!(kind, ExecutionKind::Function(_))),
       ..frame
     };
     let key = ContextKey {

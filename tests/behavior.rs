@@ -16,3 +16,6 @@ mod fixtures;
 mod lsp_client;
 #[path = "common/parse.rs"]
 mod support;
+
+#[path = "common/application.rs"]
+mod application_client;

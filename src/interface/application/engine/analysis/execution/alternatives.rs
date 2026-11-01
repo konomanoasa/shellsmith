@@ -95,6 +95,9 @@ enum Decision {
 
 type Outcomes = BTreeMap<StateValue, Guard>;
 
+/// Each non-branch node under a decision with the condition selecting it.
+type Leaves = BTreeMap<DecisionId, Guard>;
+
 #[derive(Debug, Default)]
 struct Decisions {
   nodes: Vec<Decision>,
@@ -102,6 +105,7 @@ struct Decisions {
   next: usize,
   expressions: Values,
   scalars: HashMap<(DecisionId, Option<usize>), ValueId>,
+  leaves: HashMap<DecisionId, Rc<Leaves>>,
   outcomes: HashMap<DecisionId, Outcomes>,
 }
 
@@ -236,70 +240,104 @@ impl Decisions {
     }
   }
 
+  fn leaves(
+    &mut self,
+    root: DecisionId,
+    cancelled: &AtomicBool,
+  ) -> Result<Rc<Leaves>, Error> {
+    let mut pending = vec![(root, false)];
+    while let Some((id, visited)) = pending.pop() {
+      self.expressions.budget().work(1);
+      self.expressions.budget().check(cancelled)?;
+      if self.leaves.contains_key(&id) {
+        continue;
+      }
+      let Decision::Branch { guard, left, right } = self.nodes[id] else {
+        self
+          .leaves
+          .insert(id, Rc::new(Leaves::from([(id, ALWAYS)])));
+        continue;
+      };
+      if !visited {
+        pending.extend([(id, true), (right, false), (left, false)]);
+        continue;
+      }
+      let opposite = self.expressions.conditions.not(guard);
+      let mut result = Leaves::new();
+      for (child, side) in [(left, opposite), (right, guard)] {
+        for (&leaf, &condition) in self.leaves[&child].clone().iter() {
+          self.expressions.budget().work(1);
+          self.expressions.budget().check(cancelled)?;
+          let condition = self.expressions.conditions.and(side, condition);
+          if condition != NEVER {
+            let reached = result.entry(leaf).or_insert(NEVER);
+            *reached = self.expressions.conditions.or(*reached, condition);
+          }
+        }
+      }
+      self
+        .expressions
+        .budget()
+        .retain(result.len() * std::mem::size_of::<(DecisionId, Guard)>() + 64);
+      self.leaves.insert(id, Rc::new(result));
+    }
+    Ok(self.leaves[&root].clone())
+  }
+
   fn possible(
     &mut self,
     root: DecisionId,
     cancelled: &AtomicBool,
   ) -> Result<Outcomes, Error> {
-    let mut pending = vec![(root, false)];
-    while let Some((id, visited)) = pending.pop() {
-      self.expressions.budget().work(1);
-      self.expressions.budget().check(cancelled)?;
-      if self.outcomes.contains_key(&id) {
-        continue;
-      }
-      let mut result = Outcomes::new();
-      match self.nodes[id].clone() {
-        Decision::Value(value) => self.merge(&mut result, value, ALWAYS),
-        Decision::Computed { value, resolution } => {
-          for (value, guard) in self.expressions.candidates(value, cancelled)? {
-            let value = self.expressions.projected(value, cancelled)?;
-            self.merge(
-              &mut result,
-              StateValue::Binding(Binding {
-                value,
-                resolution: resolution.clone(),
-              }),
-              guard,
-            );
-          }
-        }
-        Decision::Positionals(fields) => {
-          let ids = fields.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-          for (values, guard) in
-            self.expressions.combinations(&ids, ALWAYS, cancelled)?
-          {
-            let fields = values
-              .into_iter()
-              .zip(&fields)
-              .map(|(value, (_, count))| (value.as_ref().clone(), *count))
-              .collect();
-            self.merge(
-              &mut result,
-              StateValue::Positionals(Positionals { fields }),
-              guard,
-            );
-          }
-        }
-        Decision::Branch { guard, left, right } => {
-          if !visited {
-            pending.extend([(id, true), (right, false), (left, false)]);
-            continue;
-          }
-          let opposite = self.expressions.conditions.not(guard);
-          for (child, side) in [(left, opposite), (right, guard)] {
-            for (value, guard) in self.outcomes[&child].clone() {
-              self.expressions.budget().work(1);
-              self.expressions.budget().check(cancelled)?;
-              let guard = self.expressions.conditions.and(side, guard);
-              self.merge(&mut result, value, guard);
-            }
-          }
-        }
-      }
-      self.outcomes.insert(id, result);
+    if let Some(outcomes) = self.outcomes.get(&root) {
+      return Ok(outcomes.clone());
     }
-    Ok(self.outcomes[&root].clone())
+    let mut result = Outcomes::new();
+    match self.nodes[root].clone() {
+      Decision::Value(value) => self.merge(&mut result, value, ALWAYS),
+      Decision::Computed { value, resolution } => {
+        for (value, guard) in self.expressions.candidates(value, cancelled)? {
+          let value = self.expressions.projected(value, cancelled)?;
+          self.merge(
+            &mut result,
+            StateValue::Binding(Binding {
+              value,
+              resolution: resolution.clone(),
+            }),
+            guard,
+          );
+        }
+      }
+      Decision::Positionals(fields) => {
+        let ids = fields.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        for (values, guard) in
+          self.expressions.combinations(&ids, ALWAYS, cancelled)?
+        {
+          let fields = values
+            .into_iter()
+            .zip(&fields)
+            .map(|(value, (_, count))| (value.as_ref().clone(), *count))
+            .collect();
+          self.merge(
+            &mut result,
+            StateValue::Positionals(Positionals { fields }),
+            guard,
+          );
+        }
+      }
+      Decision::Branch { .. } => {
+        for (&leaf, &condition) in self.leaves(root, cancelled)?.iter() {
+          for (value, guard) in self.possible(leaf, cancelled)? {
+            self.expressions.budget().work(1);
+            self.expressions.budget().check(cancelled)?;
+            let guard = self.expressions.conditions.and(condition, guard);
+            self.merge(&mut result, value, guard);
+          }
+        }
+      }
+    }
+    self.outcomes.insert(root, result.clone());
+    Ok(result)
   }
 
   fn summary(
@@ -317,14 +355,13 @@ impl Decisions {
         _ => unreachable!(),
       });
     }
-    let mut pending = vec![(root, active)];
-    let mut seen = BTreeSet::new();
     let mut resolution = Resolution::default();
     let mut positional: Option<Positionals> = None;
-    while let Some((id, guard)) = pending.pop() {
+    for (&id, &condition) in self.leaves(root, cancelled)?.iter().rev() {
       self.expressions.budget().work(1);
       self.expressions.budget().check(cancelled)?;
-      if guard == NEVER || !seen.insert((id, guard)) {
+      let guard = self.expressions.conditions.and(active, condition);
+      if guard == NEVER {
         continue;
       }
       match &self.nodes[id] {
@@ -358,17 +395,7 @@ impl Decisions {
             positional = Some(value.clone());
           }
         }
-        Decision::Branch {
-          guard: condition,
-          left,
-          right,
-        } => {
-          let (condition, left, right) = (*condition, *left, *right);
-          let opposite = self.expressions.conditions.not(condition);
-          let low = self.expressions.conditions.and(guard, opposite);
-          let high = self.expressions.conditions.and(guard, condition);
-          pending.extend([(left, low), (right, high)]);
-        }
+        Decision::Branch { .. } => unreachable!("decision leaf"),
       }
     }
     if let Some(value) = positional {
@@ -714,10 +741,7 @@ impl Alternatives {
       {
         let id = nodes.expressions.mask(id, active);
         let value = nodes.expressions.projected(id, cancelled)?;
-        let trace = captured.trace();
-        *captured = super::environment::Output::default();
-        captured.append(value.as_ref().clone(), trace, usize::MAX);
-        captured.expression = Some(id);
+        captured.set_expression(id, value.as_ref().clone(), usize::MAX);
       }
       result.push(output);
     }

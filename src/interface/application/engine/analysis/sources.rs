@@ -3,8 +3,8 @@ use super::execution::Environment;
 use super::expansion::Argument;
 use super::{Frame, Resolver, Task};
 use crate::interface::application::engine::{
-  self, DependencyState, EffectTarget, Error, ExecutionContextId,
-  ExecutionKind, ReferenceId, ResolutionIssue, Snapshot, Value, ValueIssue,
+  self, DependencyState, Error, ExecutionContextId, ExecutionKind, ReferenceId,
+  ResolutionIssue, Snapshot, Value, ValueIssue,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -211,14 +211,13 @@ impl<'a> Resolver<'a> {
         issue,
       ));
     };
-    self.source_document(node, args, env, frame, reference, target)
+    self.source_document(node, env, frame, reference, target)
   }
 
   fn source_document(
     &mut self,
     node: Node<'a>,
-    args: &[Argument<'a>],
-    mut env: Environment,
+    env: Environment,
     frame: Frame,
     reference: ReferenceId,
     target: Snapshot,
@@ -248,18 +247,6 @@ impl<'a> Resolver<'a> {
     let root = document.tree.root_node();
     let empty =
       root.child_by_field_name("commands").is_none() && !root.has_error();
-    // Extra dot operands may replace positionals; restoration varies by shell.
-    let arguments = args.len() > operand_index(args) + 1;
-    if arguments {
-      self.invalidate(
-        node,
-        &mut env,
-        frame,
-        ResolutionIssue::UnknownEffect,
-        ValueIssue::Unspecified,
-        [EffectTarget::Positionals],
-      );
-    }
     let inner =
       self.execution(node, frame, ExecutionKind::Source(reference), target);
     self.sources.active.push(target);
@@ -269,16 +256,6 @@ impl<'a> Resolver<'a> {
       for env in flow.environments_mut() {
         if empty {
           env.set_status(Value::Literal(b"0".to_vec()));
-        }
-        if arguments {
-          resolver.invalidate(
-            node,
-            env,
-            frame,
-            ResolutionIssue::UnknownEffect,
-            ValueIssue::Unspecified,
-            [EffectTarget::Positionals],
-          );
         }
       }
       Task::Done(flow)
@@ -386,17 +363,7 @@ impl<'a> Resolver<'a> {
 }
 
 fn source_input(args: &[Argument<'_>], env: &Environment) -> SourceInput {
-  let (path, absent) = env.parameter(b"PATH");
-  // XBD 8.3 leaves the search implementation-defined when PATH is unset or
-  // null or a prefix contains `%`.
-  let search_path = match path {
-    Value::Literal(path)
-      if absent != Some(false) || path.is_empty() || path.contains(&b'%') =>
-    {
-      Value::Unknown(ValueIssue::Unspecified)
-    }
-    path => path,
-  };
+  let search_path = env.parameter(b"PATH").0;
   SourceInput {
     operand: source_value(args),
     annotation: None,

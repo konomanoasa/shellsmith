@@ -170,7 +170,10 @@ fn shared_string_queries_and_pattern_transfers_match_enumerated_values() {
           });
           let left = values.select(first, a_id, b_id);
           let right = values.select(second, c_id, d_id);
-          let root = values.concat(left, right, &flag).unwrap().unwrap();
+          let root = values
+            .concat(left, right, usize::MAX, &flag)
+            .unwrap()
+            .unwrap();
           let concrete = [(a, c), (a, d), (b, c), (b, d)]
             .map(|(left, right)| Value::Literal([left, right].concat()));
           assert_eq!(

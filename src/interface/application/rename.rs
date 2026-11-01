@@ -51,9 +51,11 @@ impl Application {
   ) -> Result<Option<RenameTarget>, Error> {
     let names = self.prepare_names(path, cancelled)?;
     self.check_rename_inputs(&names, cancelled)?;
-    self
-      .rename_selection(&names, path, offset, cancelled)
-      .map(|selection| selection.map(|selection| selection.target))
+    let selection = self.rename_selection(&names, path, offset, cancelled)?;
+    if let Some(selection) = &selection {
+      selection.validate(&names, cancelled)?;
+    }
+    Ok(selection.map(|selection| selection.target))
   }
 
   pub fn rename(
@@ -81,6 +83,7 @@ impl Application {
     if selection.target.placeholder == new_name {
       return Ok(Vec::new());
     }
+    selection.validate(&names, cancelled)?;
     if selection.kind == SymbolKind::Variable
       && self
         .settings()
@@ -113,7 +116,10 @@ impl Application {
     for (range, edit) in edits.iter().rev() {
       check_cancelled(cancelled)?;
       let text = changed.entry(range.path.clone()).or_insert_with(|| {
-        names.documents[&edit.location.snapshot].1.to_string()
+        names.documents[&edit.location.snapshot]
+          .1
+          .source()
+          .to_string()
       });
       text.replace_range(range.start..range.end, new_name);
     }
@@ -186,7 +192,6 @@ impl Application {
       sites: related.sites,
       members: related.members,
     };
-    selection.validate(names, cancelled)?;
     Ok(Some(selection))
   }
 }
@@ -213,6 +218,13 @@ impl Selection {
       if site.spelling.editable().is_none() {
         return Err(refused(
           "A related name is generated or has no safe source replacement",
+        ));
+      }
+      if self.kind == SymbolKind::Variable
+        && site.exported != engine::AttributeState::Known(false)
+      {
+        return Err(refused(
+          "An exported variable may be used by an external program",
         ));
       }
       let resolution = site
@@ -314,11 +326,12 @@ fn source_range(
   collection: &NameCollection,
   location: &Location,
 ) -> Result<SourceRange, Error> {
-  let (path, source) = collection
+  let (path, document) = collection
     .documents
     .get(&location.snapshot)
     .ok_or_else(|| refused("A name has no current source document"))?;
-  source
+  document
+    .source()
     .get(location.bytes.clone())
     .ok_or_else(|| refused("Invalid source spelling"))?;
   Ok(SourceRange {
@@ -354,6 +367,7 @@ struct Relationship {
   compatible: bool,
   access: Access,
   readonly: engine::AttributeState,
+  exported: engine::AttributeState,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -542,6 +556,7 @@ fn relationships<'a>(
       compatible: site.compatible,
       access: site.access,
       readonly: site.readonly,
+      exported: site.exported,
     };
     *result.sites.entry(relationship).or_default() += 1;
   }

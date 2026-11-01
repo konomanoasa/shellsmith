@@ -37,14 +37,22 @@ mod bindings {
   }
 
   #[test]
-  fn named_arguments_share_reverse_references_without_turning_queries_into_calls()
-   {
+  fn named_arguments_refer_to_definitions_without_turning_queries_into_calls() {
     let (workspace, analysis) = analyze(
       "x=1; export x; readonly x; unset -v x; f() { x=2; }; command -v f; command -V f; unset -f f; : \"$x\"",
     );
-    let x = workspace.symbols_named(b"x").next().unwrap().id;
-    let f = workspace.symbols_named(b"f").next().unwrap().id;
-    let variable_references: Vec<_> = analysis.references(x).collect();
+    let x = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
+    let f = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"f")
+      .unwrap()
+      .id;
+    let variable_references: Vec<_> =
+      crate::support::references(&analysis, x).collect();
     assert_eq!(variable_references.len(), 4);
     assert_eq!(
       variable_references
@@ -53,7 +61,7 @@ mod bindings {
         .count(),
       3
     );
-    assert_eq!(analysis.references(f).count(), 3);
+    assert_eq!(crate::support::references(&analysis, f).count(), 3);
     assert_eq!(analysis.contexts().len(), 1);
     let read = reads(&workspace, &analysis, b"x")[0];
     assert_eq!(
@@ -61,8 +69,7 @@ mod bindings {
       Some(&Value::Literal(b"1".to_vec()))
     );
     assert!(
-      analysis
-        .references(f)
+      crate::support::references(&analysis, f)
         .all(|site| site.site.syntax().is_none())
     );
   }
@@ -71,7 +78,8 @@ mod bindings {
   fn sequential_reads_and_assignment_rhs_use_the_preceding_definition() {
     let (workspace, analysis) = analyze("x=1; : \"$x\"; x=$x; : \"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let statuses: Vec<_> = reads(&workspace, &analysis, b"x")
@@ -86,8 +94,8 @@ mod bindings {
         ResolutionStatus::Resolved(ids[1])
       ]
     );
-    assert_eq!(analysis.references(ids[0]).count(), 2);
-    assert_eq!(analysis.references(ids[1]).count(), 1);
+    assert_eq!(crate::support::references(&analysis, ids[0]).count(), 2);
+    assert_eq!(crate::support::references(&analysis, ids[1]).count(), 1);
     assert_eq!(analysis.gaps(), []);
   }
 
@@ -96,7 +104,11 @@ mod bindings {
     let source =
       "x=1; register() { trap 'register; : \"$x\"' EXIT; }; register";
     let (workspace, analysis) = analyze(source);
-    let function = workspace.symbols_named(b"register").next().unwrap().id;
+    let function = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"register")
+      .unwrap()
+      .id;
     assert_eq!(
       analysis
         .contexts()
@@ -143,8 +155,16 @@ mod bindings {
       "f() { :; }; next=f; action='trap \"$next\" EXIT'; trap \"$action\" TERM",
     ] {
       let (workspace, analysis) = analyze(source);
-      let function = workspace.symbols_named(b"f").next().unwrap().id;
-      assert_eq!(analysis.references(function).count(), 1, "{source}");
+      let function = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"f")
+        .unwrap()
+        .id;
+      assert_eq!(
+        crate::support::references(&analysis, function).count(),
+        1,
+        "{source}"
+      );
       assert_eq!(
         analysis
           .contexts()
@@ -261,7 +281,8 @@ mod bindings {
     assert_eq!(
       x.resolution.candidates,
       workspace
-        .symbols_named(b"x")
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
         .map(|symbol| symbol.id)
         .collect()
     );
@@ -276,7 +297,8 @@ mod bindings {
   fn function_reads_are_resolved_in_each_calling_environment() {
     let (workspace, analysis) = analyze("f() { : \"$x\"; }; x=1; f; x=2; f");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -290,8 +312,13 @@ mod bindings {
       uses[1].resolution.status(),
       ResolutionStatus::Resolved(ids[1])
     );
-    let function = workspace.symbols_named(b"f").next().unwrap().id;
-    let calls: Vec<_> = analysis.references(function).collect();
+    let function = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"f")
+      .unwrap()
+      .id;
+    let calls: Vec<_> =
+      crate::support::references(&analysis, function).collect();
     assert_eq!(calls.len(), 2);
     assert!(calls.iter().all(
       |site| site.resolution.status() == ResolutionStatus::Resolved(function)
@@ -304,7 +331,8 @@ mod bindings {
       "x=1; : ${x=2}; : \"$x\"; : ${y=1}; : \"$y\"; read x; : \"$x\"; x=3; : \"$x\"",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -317,7 +345,8 @@ mod bindings {
       ResolutionStatus::Resolved(ids[0])
     );
     let read_write = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .find(|symbol| {
         symbol.id.snapshot.document
           != shellsmith::interface::application::engine::DocumentId(1)
@@ -336,7 +365,11 @@ mod bindings {
       uses[3].resolution.status(),
       ResolutionStatus::Resolved(ids[2])
     );
-    let y = workspace.symbols_named(b"y").next().unwrap().id;
+    let y = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"y")
+      .unwrap()
+      .id;
     assert_eq!(
       reads(&workspace, &analysis, b"y")[1].resolution.status(),
       ResolutionStatus::Resolved(y)
@@ -350,7 +383,8 @@ mod bindings {
       "x=1; x=2 printf '%s' \"$x\"; : \"$x\"; x=3 :; : \"$x\"; f() { x=4; }; command f; : \"$x\"; unset -v x; : \"$x\"; unset -f f; f",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let statuses: Vec<_> = reads(&workspace, &analysis, b"x")
@@ -367,8 +401,12 @@ mod bindings {
         ResolutionStatus::Unresolved
       ]
     );
-    let f = workspace.symbols_named(b"f").next().unwrap().id;
-    assert_eq!(analysis.references(f).count(), 1);
+    let f = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"f")
+      .unwrap()
+      .id;
+    assert_eq!(crate::support::references(&analysis, f).count(), 1);
   }
 
   #[test]
@@ -377,21 +415,34 @@ mod bindings {
     let (workspace, analysis) = analyze(
       "f; f() { x=1; }; command -pv f; command -V f; command command f; : \"$x\"; f; : \"$x\"",
     );
-    let f = workspace.symbols_named(b"f").next().unwrap().id;
-    assert_eq!(analysis.references(f).count(), 3);
+    let f = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"f")
+      .unwrap()
+      .id;
+    assert_eq!(crate::support::references(&analysis, f).count(), 3);
     let uses = reads(&workspace, &analysis, b"x");
     assert_eq!(uses[0].resolution.alternatives, [Alternative::Unset].into());
-    let x = workspace.symbols_named(b"x").next().unwrap().id;
+    let x = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     assert_eq!(uses[1].resolution.status(), ResolutionStatus::Resolved(x));
   }
 
   #[test]
-  fn special_builtin_function_names_are_rejected_and_function_prefixes_have_uncertain_lifetime()
+  fn special_builtin_function_names_are_rejected_and_function_prefixes_are_restored()
    {
     let (workspace, analysis) = support::analyze_damaged(
       "readonly() { x=9; }; readonly x=1; f() { : \"$x\"; }; x=2 f; : \"$x\"",
     );
-    assert!(workspace.symbols_named(b"readonly").next().is_none());
+    assert!(
+      workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"readonly")
+        .is_none()
+    );
     assert!(
       analysis
         .gaps()
@@ -400,7 +451,11 @@ mod bindings {
     );
     let (workspace, analysis) =
       analyze("readonly x=1; f() { : \"$x\"; }; x=2 f; : \"$x\"");
-    let x = workspace.symbols_named(b"x").next().unwrap().id;
+    let x = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     assert_eq!(
       reads(&workspace, &analysis, b"x")
         .iter()
@@ -411,7 +466,8 @@ mod bindings {
     let (workspace, analysis) =
       analyze("x=0; f() { : \"$x\"; }; x=1 f; : \"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -419,12 +475,21 @@ mod bindings {
       uses[0].resolution.status(),
       ResolutionStatus::Resolved(ids[1])
     );
-    assert_eq!(uses[1].resolution.candidates, ids.into_iter().collect());
-    assert!(
-      uses[1]
-        .resolution
-        .issues
-        .contains(&ResolutionIssue::EvaluationOrder)
+    assert_eq!(
+      uses[1].resolution.status(),
+      ResolutionStatus::Resolved(ids[0])
+    );
+    let (workspace, analysis) =
+      analyze("x=0; f() { :; }; x=$((x=2))a f; : \"$x\"");
+    assert_eq!(
+      reads(&workspace, &analysis, b"x")[0].resolution.candidates,
+      [workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
+        .last()
+        .unwrap()
+        .id]
+      .into()
     );
   }
 
@@ -435,7 +500,6 @@ mod bindings {
       "x=0; local x=1; : \"$x\"",
       "x=0; [[ -n x ]]; : \"$x\"",
       "x=0; if select; then :; fi; : \"$x\"",
-      "x=0; label: operand; : \"$x\"",
       "x=0; time() { :; }; time; : \"$x\"",
       "x=0; command \"$(unknown)\"; x=1; : \"$x\"",
       "x=0; fc -s; x=1; : \"$x\"",
@@ -468,8 +532,11 @@ mod bindings {
     ] {
       let source = format!("x=before; {call}; : \"$x\"; x=after; : \"$x\"");
       let (workspace, analysis) = analyze(&source);
-      let definitions: Vec<_> =
-        workspace.symbols_named(b"x").map(|s| s.id).collect();
+      let definitions: Vec<_> = workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
+        .map(|s| s.id)
+        .collect();
       let resolved: Vec<_> = reads(&workspace, &analysis, b"x")
         .iter()
         .map(|site| site.resolution.status())
@@ -502,15 +569,13 @@ mod bindings {
   }
 
   #[test]
-  fn unordered_variable_writes_leave_special_and_positional_parameters_ordered()
-  {
+  fn redirections_read_variables_before_prefix_writes() {
     let parameter = Resolution {
       alternatives: [Alternative::SpecialParameter].into(),
       ..Resolution::default()
     };
     let variable = Resolution {
       alternatives: [Alternative::Unset].into(),
-      issues: [ResolutionIssue::EvaluationOrder].into(),
       ..Resolution::default()
     };
     for (name, expected) in [
@@ -537,29 +602,28 @@ mod bindings {
   }
 
   #[test]
-  fn redirections_without_commands_are_isolated_and_special_order_is_uncertain()
-  {
+  fn redirection_expansions_update_the_environment_before_prefix_assignments() {
     let (workspace, analysis) =
       analyze("x=0; >$((x=1)); : \"$x\"; x=2 : >\"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
     assert_eq!(
       uses[0].resolution.status(),
-      ResolutionStatus::Resolved(ids[0])
+      ResolutionStatus::Resolved(ids[1])
     );
-    assert!(
-      uses[1]
-        .resolution
-        .issues
-        .contains(&ResolutionIssue::EvaluationOrder)
+    assert_eq!(
+      uses[1].resolution.status(),
+      ResolutionStatus::Resolved(ids[1])
     );
     let (workspace, analysis) =
       analyze("x=0; x=3 external >$((x=2)); : \"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     assert_eq!(
@@ -574,7 +638,8 @@ mod bindings {
       "x=0; (: \"$x\") >$((x=1)); : \"$x\"; f() (: \"$x\") >$((x=2)); f; : \"$x\"",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     assert_eq!(
@@ -595,7 +660,11 @@ mod bindings {
   #[test]
   fn readonly_bindings_are_not_removed_by_unset() {
     let (workspace, analysis) = analyze("readonly x=1; unset -v x; : \"$x\"");
-    let x = workspace.symbols_named(b"x").next().unwrap().id;
+    let x = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     assert_eq!(
       reads(&workspace, &analysis, b"x")[0].resolution.status(),
       ResolutionStatus::Resolved(x)
@@ -603,8 +672,391 @@ mod bindings {
   }
 
   #[test]
-  fn conditional_readonly_preserves_both_possible_assignment_and_unset_results()
-  {
+  fn getopts_failures_preserve_readonly_and_unreached_definitions() {
+    for (body, name) in [
+      ("readonly OPTARG; getopts a: target -a value", "OPTIND"),
+      ("readonly OPTARG; getopts a: target -a value", "target"),
+      ("readonly OPTIND; getopts a: target -a value", "target"),
+      ("readonly target; getopts a: target -a value", "target"),
+    ] {
+      let source =
+        format!("OPTIND=1; OPTARG=old; target=keep; {body}; : \"${name}\"");
+      let (workspace, analysis) = analyze(&source);
+      let original = workspace
+        .symbols()
+        .find(|symbol| symbol.name == name.as_bytes())
+        .unwrap()
+        .id;
+      assert_eq!(
+        reads(&workspace, &analysis, name.as_bytes())
+          .last()
+          .unwrap()
+          .resolution
+          .status(),
+        ResolutionStatus::Resolved(original),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn export_attributes_follow_declarations_assignments_and_unset() {
+    use shellsmith::interface::application::engine::AttributeState::{
+      Conditional, Known, Unknown,
+    };
+    for (source, expected) in [
+      ("x=1; : \"$x\"", Known(false)),
+      ("export x=1; : \"$x\"", Known(true)),
+      ("export 'x=1'; : \"$x\"", Known(true)),
+      ("x=1; export x; : \"$x\"", Known(true)),
+      ("export x; : \"$x\"", Known(true)),
+      ("export x; x=2; : \"$x\"", Known(true)),
+      ("export x=1; unset x; x=2; : \"$x\"", Known(false)),
+      ("export x=1; readonly x; unset x; : \"$x\"", Known(true)),
+      ("readonly x=1; export x=2; : \"$x\"", Known(false)),
+      ("readonly x=1; export 'x=2'; : \"$x\"", Known(false)),
+      (
+        "x=1; if condition; then export x; fi; : \"$x\"",
+        Conditional,
+      ),
+      (
+        "x=1; if condition; then export x; else export x; fi; : \"$x\"",
+        Known(true),
+      ),
+      (
+        "x=1; if condition; then export x; fi; unset x; x=2; : \"$x\"",
+        Known(false),
+      ),
+      ("x=1; read name; export \"$name\"; : \"$x\"", Unknown),
+      (
+        "x=1; read name; export \"$name\"; export x; : \"$x\"",
+        Known(true),
+      ),
+      (
+        "x=1; read name; export \"other_$name\"; : \"$x\"",
+        Known(false),
+      ),
+      ("x=1; (export x); : \"$x\"", Known(false)),
+      ("x=1; f() { export x; }; f; : \"$x\"", Known(true)),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      let sites = reads(&workspace, &analysis, b"x");
+      let site = sites.last().unwrap();
+      let attributes = analysis
+        .variable_attributes(site.site)
+        .find(|(context, _)| *context == site.context)
+        .unwrap()
+        .1;
+      assert_eq!(attributes.exported, expected, "{source}");
+    }
+  }
+
+  #[test]
+  fn allexport_applies_to_all_assignments_but_not_attribute_changes_or_unset() {
+    use shellsmith::interface::application::engine::AttributeState::{
+      Conditional, Known,
+    };
+    for (source, expected) in [
+      ("set -a; x=1; : \"$x\"", Known(true)),
+      ("set -o allexport; x=1; : \"$x\"", Known(true)),
+      ("set -oallexport; x=1; : \"$x\"", Known(true)),
+      ("set -a; set +a; x=1; : \"$x\"", Known(false)),
+      ("set -a; set +o allexport; x=1; : \"$x\"", Known(false)),
+      ("set -a; set +oallexport; x=1; : \"$x\"", Known(false)),
+      ("x=1; set -a; : \"$x\"", Known(false)),
+      ("x=1; set -a; readonly x; : \"$x\"", Known(false)),
+      ("set -a; readonly x=1; : \"$x\"", Known(true)),
+      ("set -a; read x; : \"$x\"", Known(true)),
+      ("set -a; getopts a x; : \"$x\"", Known(true)),
+      ("set -a; : $((x=1)); : \"$x\"", Known(true)),
+      ("set -a; : ${x:=1}; : \"$x\"", Known(true)),
+      ("set -a; for x in one; do :; done; : \"$x\"", Conditional),
+      ("set -a; x=1; set +a; x=2; : \"$x\"", Known(true)),
+      ("set -a; x=1; unset x; set +a; x=2; : \"$x\"", Known(false)),
+      (
+        "x=1; if condition; then set -a; fi; x=2; : \"$x\"",
+        Conditional,
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      let sites = reads(&workspace, &analysis, b"x");
+      let site = sites.last().unwrap();
+      let attributes = analysis
+        .variable_attributes(site.site)
+        .find(|(context, _)| *context == site.context)
+        .unwrap()
+        .1;
+      assert_eq!(attributes.exported, expected, "{source}");
+    }
+  }
+
+  #[test]
+  fn implicit_builtin_assignments_and_unset_update_export_attributes() {
+    use shellsmith::interface::application::engine::AttributeState::{
+      Conditional, Known,
+    };
+    for (source, name, expected) in [
+      (
+        "set -a; set -- -a value; getopts a: option; : \"$OPTARG\"",
+        "OPTARG",
+        Known(true),
+      ),
+      (
+        "set -a; set -- -a; getopts a option; : \"$OPTIND\"",
+        "OPTIND",
+        Known(true),
+      ),
+      (
+        "export OPTARG=old; set -- -a; getopts a option; : \"$OPTARG\"",
+        "OPTARG",
+        Known(false),
+      ),
+      (
+        "set -- -a; trap ': \"$OPTARG\"' EXIT; getopts a option",
+        "OPTARG",
+        Known(false),
+      ),
+      (
+        "set -a; export OPTARG=old; OPTIND=1; getopts a option; : \"$OPTARG\"",
+        "OPTARG",
+        Known(false),
+      ),
+      (
+        "export OPTARG=old; set -- -z; getopts a option; : \"$OPTARG\"",
+        "OPTARG",
+        Known(false),
+      ),
+      (
+        "set -a; export OPTARG=old; set -- -z; getopts a option; : \"$OPTARG\"",
+        "OPTARG",
+        Known(false),
+      ),
+      (
+        "OPTIND=1; export OPTARG=old; getopts a '' -a; : \"$OPTARG\"",
+        "OPTARG",
+        Known(false),
+      ),
+      (
+        "OPTIND=1; export OPTARG=old; if condition; then readonly OPTARG; fi; getopts a option -a; : \"$OPTARG\"",
+        "OPTARG",
+        Conditional,
+      ),
+      (
+        "OPTIND=1; option=old; readonly OPTIND; set -a; getopts a option -a; : \"$option\"",
+        "option",
+        Known(false),
+      ),
+      ("cd /unknown; : \"$PWD\"", "PWD", Known(false)),
+      ("set -a; cd /unknown; : \"$PWD\"", "PWD", Conditional),
+      (
+        "export PWD=/; set -a; cd /unknown; : \"$PWD\"",
+        "PWD",
+        Known(true),
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      let site = reads(&workspace, &analysis, name.as_bytes())[0];
+      assert_eq!(
+        analysis
+          .variable_attributes(site.site)
+          .find(|(context, _)| *context == site.context)
+          .unwrap()
+          .1
+          .exported,
+        expected,
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn temporary_assignments_restore_export_and_readonly_attributes() {
+    use shellsmith::interface::application::engine::AttributeState::Known;
+    for (source, expected) in [
+      (
+        "x=old; x=1 command export x=2; : \"$x\"",
+        vec![("old", false, false)],
+      ),
+      (
+        "x=old; x=1 command readonly x=2; : \"$x\"",
+        vec![("old", false, false)],
+      ),
+      (
+        "export x=old; x=1 command readonly x=2; : \"$x\"",
+        vec![("old", true, false)],
+      ),
+      ("x=old; x=1 :; : \"$x\"", vec![("1", false, false)]),
+      ("x=old; set -a; x=1 :; : \"$x\"", vec![("1", true, false)]),
+      (
+        "x=old; f() { : \"$x\"; readonly x; }; x=1 f; : \"$x\"",
+        vec![("1", true, false), ("old", false, false)],
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      let actual: Vec<_> = reads(&workspace, &analysis, b"x")
+        .into_iter()
+        .map(|site| {
+          let attributes = analysis
+            .variable_attributes(site.site)
+            .find(|(context, _)| *context == site.context)
+            .unwrap()
+            .1;
+          (
+            analysis
+              .value(site.site.syntax().unwrap(), site.context)
+              .cloned()
+              .unwrap(),
+            attributes.exported,
+            attributes.readonly,
+          )
+        })
+        .collect();
+      let expected: Vec<_> = expected
+        .into_iter()
+        .map(|(value, exported, readonly)| {
+          (
+            Value::Literal(value.as_bytes().to_vec()),
+            Known(exported),
+            Known(readonly),
+          )
+        })
+        .collect();
+      assert_eq!(actual, expected, "{source}");
+    }
+  }
+
+  #[test]
+  fn initial_environment_exports_survive_reassignment_and_explicit_absence_overrides_them()
+   {
+    use shellsmith::interface::application::engine::AttributeState::{
+      Known, Unknown,
+    };
+    use std::collections::BTreeMap;
+    for (initial, expected) in [
+      (
+        InitialEnvironment {
+          environment: BTreeMap::from([(b"x".to_vec(), b"old".to_vec())]),
+          ..InitialEnvironment::empty()
+        },
+        Known(true),
+      ),
+      (
+        InitialEnvironment {
+          values: BTreeMap::from([(b"x".to_vec(), b"old".to_vec())]),
+          ..InitialEnvironment::empty()
+        },
+        Unknown,
+      ),
+      (
+        InitialEnvironment {
+          environment: BTreeMap::from([(b"x".to_vec(), b"old".to_vec())]),
+          variables: BTreeMap::from([(b"x".to_vec(), InitialBinding::Absent)]),
+          ..InitialEnvironment::empty()
+        },
+        Known(false),
+      ),
+      (
+        InitialEnvironment {
+          allexport: None,
+          ..InitialEnvironment::empty()
+        },
+        shellsmith::interface::application::engine::AttributeState::Conditional,
+      ),
+    ] {
+      let (workspace, analysis) =
+        support::analyze_with("x=new; : \"$x\"", initial);
+      let site = reads(&workspace, &analysis, b"x")[0];
+      assert_eq!(
+        analysis
+          .variable_attributes(site.site)
+          .next()
+          .unwrap()
+          .1
+          .exported,
+        expected
+      );
+    }
+  }
+
+  #[test]
+  fn trap_attributes_require_invariance_after_registration() {
+    use shellsmith::interface::application::engine::AttributeState::{
+      Conditional, Known, Unknown,
+    };
+    for (source, exported, readonly) in [
+      ("x=1; trap ': \"$x\"' EXIT", Known(false), Known(false)),
+      (
+        "export x=1; trap ': \"$x\"' EXIT",
+        Known(true),
+        Known(false),
+      ),
+      ("x=1; trap ': \"$x\"' EXIT; export x", Unknown, Known(false)),
+      (
+        "x=1; trap ': \"$x\"' EXIT; export other",
+        Known(false),
+        Known(false),
+      ),
+      (
+        "x=1; trap 'x=2; : \"$x\"' EXIT; set -a",
+        Conditional,
+        Known(false),
+      ),
+      (
+        "readonly x=1; trap ': \"$x\"' EXIT; export x=2",
+        Known(false),
+        Known(true),
+      ),
+      ("trap ': \"$x\"' EXIT; unset x", Known(false), Known(false)),
+      (
+        "x=1; trap ': \"$x\"' EXIT; x=2 true",
+        Known(false),
+        Known(false),
+      ),
+      (
+        "export x=1; trap ': \"$x\"' EXIT; unset x",
+        Unknown,
+        Unknown,
+      ),
+      (
+        "read name; export \"$name\"; unset x; trap ': \"$x\"' EXIT; export \"other_$name\"",
+        Known(false),
+        Known(false),
+      ),
+      (
+        "x=1; trap ': \"$x\"' EXIT; readonly x",
+        Known(false),
+        Conditional,
+      ),
+      (
+        "x=1; read name; trap ': \"$x\"' EXIT; readonly \"other_$name\"",
+        Known(false),
+        Known(false),
+      ),
+      (
+        "x=1; read name; trap ': \"$x\"' EXIT; readonly \"x$name\"",
+        Unknown,
+        Unknown,
+      ),
+    ] {
+      let (workspace, analysis) = analyze(source);
+      let sites = reads(&workspace, &analysis, b"x");
+      let site = sites.last().unwrap();
+      let attributes = analysis
+        .variable_attributes(site.site)
+        .find(|(context, _)| *context == site.context)
+        .unwrap()
+        .1;
+      assert_eq!(
+        (attributes.exported, attributes.readonly),
+        (exported, readonly),
+        "{source}"
+      );
+    }
+  }
+
+  #[test]
+  fn conditional_readonly_preserves_both_results_and_temporary_readonly_ends_with_its_assignment()
+   {
     for (source, unset) in [
       (
         "x=1; if condition; then readonly x; fi; x=2; : \"$x\"",
@@ -620,7 +1072,8 @@ mod bindings {
       assert_eq!(
         result.candidates,
         workspace
-          .symbols_named(b"x")
+          .symbols()
+          .filter(|symbol| symbol.name == b"x")
           .map(|symbol| symbol.id)
           .collect()
       );
@@ -632,19 +1085,35 @@ mod bindings {
       );
     }
     let (workspace, analysis) = analyze("x=1; readonly x; x=2; : \"$x\"");
-    let first = workspace.symbols_named(b"x").next().unwrap().id;
+    let first = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     let result = &reads(&workspace, &analysis, b"x")[0].resolution;
     assert_eq!(result.candidates, [first].into());
+    assert!(result.is_complete());
+    let (workspace, analysis) =
+      analyze("x=1; f() { readonly x; }; x=2 f; x=3; : \"$x\"");
+    let last = workspace
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
+      .last()
+      .unwrap()
+      .id;
+    let result = &reads(&workspace, &analysis, b"x")[0].resolution;
+    assert_eq!(result.candidates, [last].into());
     assert!(result.is_complete());
   }
 
   #[test]
   fn case_short_circuit_and_braces_merge_paths_without_creating_environments() {
     let (workspace, analysis) = analyze(
-      "x=0; case word in a) x=1 ;& b) : \"$x\" ;; esac; condition && { x=2; }; : \"$x\"",
+      "read word; x=0; case \"$word\" in a) x=1 ;& b) : \"$x\" ;; esac; condition && { x=2; }; : \"$x\"",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -659,7 +1128,11 @@ mod bindings {
    {
     let (workspace, analysis) =
       analyze("case a in ${x=1}) ;; *|b) : \"$x\";; esac");
-    let x = workspace.symbols_named(b"x").next().unwrap().id;
+    let x = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     assert_eq!(
       reads(&workspace, &analysis, b"x")[1].resolution.status(),
       ResolutionStatus::Resolved(x)
@@ -668,11 +1141,27 @@ mod bindings {
   }
 
   #[test]
-  fn substitutions_are_isolated_and_pipelines_keep_environment_uncertainty() {
+  fn case_alternatives_preserve_each_possible_match_in_source_order() {
+    let (workspace, analysis) = analyze(
+      "read v; x=0; case \"$v\" in a|$((x=1))|$((x=2))) : \"$x\";; esac",
+    );
+    let ids: Vec<_> = workspace
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
+      .map(|symbol| symbol.id)
+      .collect();
+    let resolution = &reads(&workspace, &analysis, b"x")[0].resolution;
+    assert_eq!(resolution.candidates, ids.into_iter().collect());
+    assert!(resolution.alternatives.is_empty());
+  }
+
+  #[test]
+  fn substitutions_and_pipeline_commands_preserve_the_parent_environment() {
     let (workspace, analysis) =
       analyze("x=1; : $(x=2; : \"$x\"); : \"$x\"; { x=3; } | cat; : \"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -684,14 +1173,9 @@ mod bindings {
       uses[1].resolution.status(),
       ResolutionStatus::Resolved(ids[0])
     );
-    assert_eq!(uses[2].resolution.candidates, [ids[0], ids[2]].into());
+    assert_eq!(uses[2].resolution.candidates, [ids[0]].into());
     assert!(uses[2].resolution.is_complete());
-    assert!(
-      analysis
-        .gaps()
-        .iter()
-        .any(|gap| gap.issue == ResolutionIssue::PipelineEnvironment)
-    );
+    assert_eq!(analysis.gaps(), []);
     let substitution = analysis.context(uses[0].context).unwrap();
     assert_eq!(substitution.kind, ExecutionKind::Substitution);
     assert_ne!(substitution.environment, uses[1].context);
@@ -703,7 +1187,8 @@ mod bindings {
       "x=0; while condition; do while condition; do x=1; break 2; x=2; done; x=3; done; : \"$x\"",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     assert_eq!(
@@ -713,7 +1198,8 @@ mod bindings {
     let (workspace, analysis) =
       analyze("x=0; while x=1; break; do x=2; done; : \"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     assert_eq!(
@@ -721,11 +1207,15 @@ mod bindings {
       ResolutionStatus::Resolved(ids[1])
     );
     let (workspace, analysis) = analyze("x=0; return; : \"$x\"");
-    assert!(
-      reads(&workspace, &analysis, b"x")[0]
-        .resolution
-        .issues
-        .contains(&ResolutionIssue::UnsupportedControl)
+    assert_eq!(
+      reads(&workspace, &analysis, b"x")[0].resolution.status(),
+      ResolutionStatus::Resolved(
+        workspace
+          .symbols()
+          .find(|symbol| symbol.name == b"x")
+          .unwrap()
+          .id
+      )
     );
   }
 
@@ -744,7 +1234,8 @@ mod bindings {
           format!("if condition; then x=1; else {other}; fi; {body}; : \"$x\"");
         let (workspace, analysis) = analyze(&source);
         let ids: Vec<_> = workspace
-          .symbols_named(b"x")
+          .symbols()
+          .filter(|symbol| symbol.name == b"x")
           .map(|symbol| symbol.id)
           .collect();
         let uses = reads(&workspace, &analysis, b"x");
@@ -771,7 +1262,8 @@ mod bindings {
       "x=1\nf() { x=2; }\nf <<EOF\n$x\nEOF\n: \"$x\"\ncat <<'EOF'\n$x\nEOF\n",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -793,7 +1285,8 @@ mod bindings {
       "x=0\nf() { x=1; }\nf <<A <<B\n$x\nA\n$x\nB\n: \"$(cat <<C\n$x\nC\n)\"\n: \"$x\"\n",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -822,7 +1315,8 @@ mod bindings {
       "x=0\nf() { x=1; }\nf <<A <<B\nA\n$x\nB\n: \"$(cat <<C\nC\n)\"\n: \"$x\"\ncat <<'D'\nD\n",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -885,7 +1379,11 @@ mod bindings {
         "{source}"
       );
       for path in paths {
-        assert_eq!(analysis.values(path.id).count(), 0, "{source}");
+        assert_eq!(
+          crate::support::values(&analysis, path.id).count(),
+          0,
+          "{source}"
+        );
         assert!(
           !analysis
             .uses()
@@ -926,7 +1424,11 @@ mod bindings {
     ] {
       let source = format!("x=1; : \"$x\"; {broken}\n: \"$x\"");
       let (workspace, analysis) = support::analyze_damaged(&source);
-      let definition = workspace.symbols_named(b"x").next().unwrap().id;
+      let definition = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"x")
+        .unwrap()
+        .id;
       let uses = reads(&workspace, &analysis, b"x");
       assert!(uses.len() >= 2, "{source}");
       let first = uses.first().unwrap();
@@ -953,7 +1455,11 @@ mod bindings {
     let source =
       "x=1; f() { : \"${}\"; }; : \"$x\"; f; : \"$x\"; f() { :; }; f";
     let (workspace, analysis) = support::analyze_damaged(source);
-    let definition = workspace.symbols_named(b"x").next().unwrap().id;
+    let definition = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     let variables = reads(&workspace, &analysis, b"x");
     assert_eq!(variables.len(), 2);
     assert_eq!(
@@ -967,7 +1473,8 @@ mod bindings {
         .contains(&ResolutionIssue::Recovery)
     );
     let functions: Vec<_> = workspace
-      .symbols_named(b"f")
+      .symbols()
+      .filter(|symbol| symbol.name == b"f")
       .map(|symbol| symbol.id)
       .collect();
     assert_eq!(functions.len(), 2);
@@ -1003,7 +1510,11 @@ mod bindings {
       ("x=1; : \"$x\" \"$(: ${x^^})\"; : \"$x\"", 2),
     ] {
       let (workspace, analysis) = support::analyze_damaged(source);
-      let definition = workspace.symbols_named(b"x").next().unwrap().id;
+      let definition = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"x")
+        .unwrap()
+        .id;
       assert_eq!(
         reads(&workspace, &analysis, b"x")
           .iter()
@@ -1016,28 +1527,48 @@ mod bindings {
   }
 
   #[test]
-  fn unspecified_evaluation_order_never_claims_a_single_reaching_write() {
+  fn dash_evaluation_order_selects_reaching_writes_without_order_gaps() {
     for source in [
       "x=0; x=1 y=$x external",
       "x=0; : $(( (x=1) + x ))",
+      "x=0; n=$(( (x=1) + (x=2) )); : \"$x\"",
       "case a in a|${x=1}) : \"$x\";; esac",
     ] {
       let (workspace, analysis) = analyze(source);
       let uses = reads(&workspace, &analysis, b"x");
       assert_ne!(uses, [] as [&ResolvedUse; 0]);
-      assert!(uses.iter().all(|site| {
-        site
-          .resolution
-          .issues
-          .contains(&ResolutionIssue::EvaluationOrder)
-      }));
+      assert!(
+        uses.iter().all(|site| site.resolution.is_complete()),
+        "{source}"
+      );
+      let expected = if source.starts_with("case") {
+        None
+      } else {
+        Some(
+          workspace
+            .symbols()
+            .filter(|symbol| symbol.name == b"x")
+            .last()
+            .unwrap()
+            .id,
+        )
+      };
+      assert_eq!(
+        uses.last().unwrap().resolution.candidates,
+        expected.into_iter().collect(),
+        "{source}"
+      );
     }
   }
 
   #[test]
   fn redirection_expansions_follow_all_command_argument_expansions() {
     let (workspace, analysis) = analyze("x=1; : >${x:=2} \"$x\"");
-    let x = workspace.symbols_named(b"x").next().unwrap().id;
+    let x = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     let uses = reads(&workspace, &analysis, b"x");
     assert_eq!(uses[1].resolution.status(), ResolutionStatus::Resolved(x));
   }
@@ -1046,7 +1577,8 @@ mod bindings {
   fn subshell_changes_do_not_replace_outer_bindings() {
     let (workspace, analysis) = analyze("x=1; (x=2; : \"$x\"); : \"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -1108,7 +1640,8 @@ mod bindings {
       .analyze(request, &mut inputs, &AtomicBool::new(false))
       .unwrap();
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -1132,7 +1665,7 @@ mod bindings {
         ExecutionKind::Function(_)
       ));
     }
-    assert_eq!(analysis.references(ids[3]).count(), 0);
+    assert_eq!(crate::support::references(&analysis, ids[3]).count(), 0);
     assert_eq!(analysis.gaps(), []);
   }
 
@@ -1164,9 +1697,8 @@ mod bindings {
   }
 
   #[test]
-  fn sourced_files_keep_positional_parameters_only_without_extra_operands() {
+  fn sourced_files_keep_positional_parameters_even_with_extra_operands() {
     let literal = |text: &str| Value::Literal(text.as_bytes().to_vec());
-    let unspecified = Value::Unknown(ValueIssue::Unspecified);
     for (entry, body, one, count) in [
       (
         "set -- x; . /lib; : \"$one$count\"",
@@ -1189,20 +1721,20 @@ mod bindings {
       (
         "set -- x; . /lib arg; : \"$one$count\"",
         "one=$1; count=$#",
-        unspecified.clone(),
-        unspecified.clone(),
+        literal("x"),
+        literal("1"),
       ),
       (
         "set -- x; . /lib ''; : \"$one$count\"",
         "one=$1; count=$#",
-        unspecified.clone(),
-        unspecified.clone(),
+        literal("x"),
+        literal("1"),
       ),
       (
         "set -- x; . /lib arg; one=$1; count=$#; : \"$one$count\"",
         "set -- changed",
-        unspecified.clone(),
-        unspecified.clone(),
+        literal("changed"),
+        literal("1"),
       ),
     ] {
       let root = support::parse(1, 1, entry);
@@ -1277,7 +1809,8 @@ mod bindings {
   }
 
   #[test]
-  fn source_and_function_calls_do_not_make_caller_loops_lexical() {
+  fn source_can_break_caller_loops_but_functions_have_their_own_loop_boundary()
+  {
     let root = support::parse(
       1,
       1,
@@ -1292,21 +1825,28 @@ mod bindings {
     let analysis = workspace
       .analyze(request, &mut inputs, &AtomicBool::new(false))
       .unwrap();
-    assert!(
-      reads(&workspace, &analysis, b"x")[0]
-        .resolution
-        .issues
-        .contains(&ResolutionIssue::UnsupportedControl)
+    assert_eq!(
+      reads(&workspace, &analysis, b"x")[0].resolution.status(),
+      ResolutionStatus::Resolved(
+        workspace
+          .symbols()
+          .find(|symbol| symbol.name == b"x")
+          .unwrap()
+          .id
+      )
     );
     let (workspace, analysis) = analyze(
       "x=0; f() { while condition; do break 2; done; }; while condition; do f; x=1; done; : \"$x\"",
     );
-    assert!(
-      reads(&workspace, &analysis, b"x")[0]
-        .resolution
-        .issues
-        .contains(&ResolutionIssue::UnsupportedControl)
+    assert_eq!(
+      reads(&workspace, &analysis, b"x")[0].resolution.candidates,
+      workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
+        .map(|symbol| symbol.id)
+        .collect()
     );
+    assert_eq!(analysis.gaps(), []);
   }
 
   #[test]
@@ -1315,7 +1855,8 @@ mod bindings {
       "x=0; for i in a b; do : \"$x\"; x=1; continue; x=2; done; : \"$x\"",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     for site in reads(&workspace, &analysis, b"x") {
@@ -1325,7 +1866,8 @@ mod bindings {
     let (workspace, analysis) =
       analyze("x=0; while condition; do x=1; break; x=2; done; : \"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     assert_eq!(
@@ -1339,7 +1881,8 @@ mod bindings {
     let (workspace, analysis) =
       analyze("x=1; x=2 & : \"$x\"; f() { x=3; return; x=4; }; f; : \"$x\"");
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -1469,7 +2012,11 @@ mod bindings {
       [Alternative::External].into()
     );
     assert!(uses[0].resolution.is_complete());
-    let x = workspace.symbols_named(b"x").next().unwrap().id;
+    let x = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     assert_eq!(uses[1].resolution.status(), ResolutionStatus::Resolved(x));
     for name in [b"1".as_slice(), b"?".as_slice()] {
       assert_eq!(
@@ -1508,7 +2055,8 @@ mod bindings {
       let source = format!("y=1; {body}; : \"$y\"");
       let (workspace, analysis) = analyze(&source);
       let definitions: Vec<_> = workspace
-        .symbols_named(b"y")
+        .symbols()
+        .filter(|symbol| symbol.name == b"y")
         .map(|symbol| symbol.id)
         .collect();
       assert_eq!(definitions.len(), 1, "{source}");
@@ -1519,14 +2067,19 @@ mod bindings {
         ResolutionStatus::Resolved(definitions[0]),
         "{source}"
       );
-      assert_eq!(analysis.references(definitions[0]).count(), 1, "{source}");
+      assert_eq!(
+        crate::support::references(&analysis, definitions[0]).count(),
+        1,
+        "{source}"
+      );
       assert_eq!(analysis.contexts().len(), 1, "{source}");
       assert!(analysis.unknown_effects().next().is_none(), "{source}");
       assert_eq!(analysis.gaps(), [], "{source}");
     }
     let (workspace, analysis) = analyze("y=1; x='y=5'; n=$(($x)); : \"$y\"");
     let original = workspace
-      .symbols_named(b"y")
+      .symbols()
+      .filter(|symbol| symbol.name == b"y")
       .find(|symbol| symbol.id.snapshot.document == DocumentId(1))
       .unwrap()
       .id;
@@ -1554,7 +2107,8 @@ mod bindings {
       "read condition; x=1; : $((x+=2)); : \"$x\"; : $((condition ? (x=3) : (x=4))); : \"$x\"",
     );
     let ids: Vec<_> = workspace
-      .symbols_named(b"x")
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
       .map(|symbol| symbol.id)
       .collect();
     let uses = reads(&workspace, &analysis, b"x");
@@ -1585,7 +2139,8 @@ mod bindings {
       );
       let (workspace, analysis) = analyze(&source);
       let ids: Vec<_> = workspace
-        .symbols_named(b"x")
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
         .map(|symbol| symbol.id)
         .collect();
       let statuses: Vec<_> = reads(&workspace, &analysis, b"x")
@@ -1606,7 +2161,8 @@ mod bindings {
   }
 
   #[test]
-  fn function_returns_stop_subshell_bodies_and_keep_pipeline_return_paths() {
+  fn function_returns_stop_subshell_bodies_without_returning_from_the_parent_pipeline()
+   {
     let (workspace, analysis) =
       analyze("x=0; f() { (return; : \"$x\"); : \"$x\"; }; f");
     let uses = reads(&workspace, &analysis, b"x");
@@ -1618,19 +2174,18 @@ mod bindings {
     let result = &reads(&workspace, &analysis, b"x")[0].resolution;
     assert_eq!(
       result.candidates,
-      workspace
-        .symbols_named(b"x")
-        .map(|symbol| symbol.id)
-        .collect()
+      [workspace
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
+        .last()
+        .unwrap()
+        .id]
+      .into()
     );
     assert!(result.is_complete());
-    assert!(
-      analysis
-        .gaps()
-        .iter()
-        .any(|gap| gap.issue == ResolutionIssue::PipelineEnvironment)
-    );
+    assert_eq!(analysis.gaps(), []);
   }
+
   #[test]
   fn source_inputs_use_the_provider_conditions_instead_of_registered_dependencies()
    {
@@ -1662,14 +2217,10 @@ mod bindings {
         let mut request = AnalysisRequest::new(root.snapshot());
         request.initial = InitialEnvironment::empty();
         request.initial.cwd = Some(b"/actual".to_vec());
-        request
-          .initial
-          .values
-          .insert(b"PATH".to_vec(), b"/actual".to_vec());
-        request
-          .initial
-          .values
-          .insert(b"HOME".to_vec(), b"/actual".to_vec());
+        request.initial.values.extend([
+          (b"PATH".to_vec(), b"/actual".to_vec()),
+          (b"HOME".to_vec(), b"/actual".to_vec()),
+        ]);
         let mut workspace = Workspace::default();
         workspace.insert(root).unwrap();
         workspace.insert(library).unwrap();
@@ -1701,20 +2252,20 @@ mod bindings {
           "{operand}: {supplied}"
         );
         assert_eq!(
-          result.references(registered).count(),
+          crate::support::references(&result, registered).count(),
           0,
           "{operand}: {supplied}"
         );
         assert_eq!(
-          result.references(definition).count(),
+          crate::support::references(&result, definition).count(),
           usize::from(supplied == "matching"),
           "{operand}: {supplied}"
         );
         workspace.publish_analysis(result).unwrap();
-        let targets: Vec<_> = workspace
-          .source_links(DocumentId(1))
+        let targets: Vec<_> = support::sources(&workspace, DocumentId(1))
           .into_iter()
-          .map(|(_, target)| target)
+          .filter(|source| source.complete && source.targets.len() == 1)
+          .flat_map(|source| source.targets)
           .collect();
         assert_eq!(
           targets,
@@ -1728,9 +2279,13 @@ mod bindings {
         let again = workspace
           .analyze(request, &mut inputs, &AtomicBool::new(false))
           .unwrap();
-        assert_eq!(again.references(definition).count(), 0);
+        assert_eq!(crate::support::references(&again, definition).count(), 0);
         workspace.publish_analysis(again).unwrap();
-        assert_eq!(workspace.source_links(DocumentId(1)), []);
+        assert!(
+          support::sources(&workspace, DocumentId(1))
+            .iter()
+            .all(|source| !source.complete || source.targets.len() != 1)
+        );
       }
     }
   }
@@ -1827,10 +2382,14 @@ mod updates {
       .analyze(fresh_request, &mut fresh_inputs, &AtomicBool::new(false))
       .unwrap();
     equivalent(&new, &fresh_analysis);
-    let previous = updated.symbols_named(b"x").next().unwrap().id;
+    let previous = updated
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     let current = updated.document(DocumentId(3)).unwrap().symbols()[0].id;
-    assert_eq!(new.references(previous).count(), 0);
-    assert_eq!(new.references(current).count(), 1);
+    assert_eq!(crate::support::references(&new, previous).count(), 0);
+    assert_eq!(crate::support::references(&new, current).count(), 1);
     assert_eq!(
       updated.publish_analysis(fresh_analysis),
       Err(Error::StaleAnalysis)
@@ -1884,8 +2443,7 @@ mod updates {
     );
     let definition = workspace.document(DocumentId(2)).unwrap().symbols()[0].id;
     assert_eq!(
-      analysis
-        .references(definition)
+      crate::support::references(&analysis, definition)
         .next()
         .unwrap()
         .resolution
@@ -1951,14 +2509,16 @@ mod updates {
         .status(),
       ResolutionStatus::NotAttempted
     );
-    assert!(analysis.document_resolutions(snapshot).any(|site| site.site
-      == shellsmith::interface::application::engine::UseSite::Syntax(y)
-      && site.status() == ResolutionStatus::NotAttempted));
     assert_eq!(
-      analysis.status(
-        shellsmith::interface::application::engine::UseSite::Syntax(x),
-        analysis.contexts()[0].id
-      ),
+      analysis
+        .resolution(
+          shellsmith::interface::application::engine::UseSite::Syntax(x),
+          analysis.contexts()[0].id
+        )
+        .map_or(
+          ResolutionStatus::NotAttempted,
+          shellsmith::interface::application::engine::Resolution::status
+        ),
       ResolutionStatus::NotAttempted
     );
     assert_eq!(workspace.search_symbols(b"unused").count(), 1);
@@ -1988,6 +2548,35 @@ mod updates {
       let recovered = workspace.analyze(request, &mut inputs, &flag).unwrap();
       workspace.publish_analysis(recovered).unwrap();
       assert!(workspace.analysis().is_some());
+    }
+  }
+
+  #[test]
+  fn trap_bodies_share_the_work_limit_of_the_request() {
+    let body = format!(
+      "f() {{ for b in x y; do :; done; }}; {}",
+      "if c; then p=\"$b\"; fi; f \"$p\"; ".repeat(6)
+    );
+    for source in [body.clone(), format!("trap '{body}' EXIT")] {
+      let mut workspace = Workspace::default();
+      let document = support::parse(1, 1, &source);
+      let mut request = AnalysisRequest::new(document.snapshot());
+      request.initial = InitialEnvironment::empty();
+      workspace.insert(document).unwrap();
+      let flag = AtomicBool::new(false);
+      let mut inputs = support::Inputs::default();
+      assert!(
+        workspace
+          .analyze(request.clone(), &mut inputs, &flag)
+          .is_ok(),
+        "{source}"
+      );
+      request.limits.work = 20_000;
+      assert_eq!(
+        workspace.analyze(request, &mut inputs, &flag).unwrap_err(),
+        Error::AnalysisLimit,
+        "{source}"
+      );
     }
   }
 
@@ -2074,10 +2663,13 @@ mod updates {
         )
         .unwrap();
       assert_eq!(repaired.gaps(), []);
-      let definition = workspace.symbols_named(b"x").next().unwrap().id;
+      let definition = workspace
+        .symbols()
+        .find(|symbol| symbol.name == b"x")
+        .unwrap()
+        .id;
       assert_eq!(
-        repaired
-          .references(definition)
+        crate::support::references(&repaired, definition)
           .next()
           .unwrap()
           .resolution
@@ -2185,7 +2777,8 @@ mod stack {
         support::Inputs::default(),
       );
       let definitions: Vec<_> = workspace
-        .symbols_named(b"x")
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
         .map(|symbol| symbol.id)
         .collect();
       assert_eq!(
@@ -2211,7 +2804,8 @@ mod stack {
         support::Inputs::default(),
       );
       let definitions: Vec<_> = workspace
-        .symbols_named(b"x")
+        .symbols()
+        .filter(|symbol| symbol.name == b"x")
         .map(|symbol| symbol.id)
         .collect();
       assert_eq!(
@@ -2239,7 +2833,12 @@ mod stack {
       AnalysisLimits::default(),
       support::Inputs::default(),
     );
-    let assignment = workspace.symbols_named(b"x").nth(1).unwrap().id;
+    let assignment = workspace
+      .symbols()
+      .filter(|symbol| symbol.name == b"x")
+      .nth(1)
+      .unwrap()
+      .id;
     assert_eq!(
       resolved_reads(&workspace, &analysis, b"x"),
       [ResolutionStatus::Resolved(assignment)]
@@ -2290,7 +2889,11 @@ mod stack {
       AnalysisLimits::default(),
       support::Inputs::default(),
     );
-    let assignment = workspace.symbols_named(b"x").next().unwrap().id;
+    let assignment = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
     assert_eq!(
       resolved_reads(&workspace, &analysis, b"x"),
       [ResolutionStatus::Resolved(assignment)]
@@ -2339,19 +2942,26 @@ mod convergence {
   use crate::support;
 
   use shellsmith::interface::application::engine::{
-    DocumentId, OccurrenceKind, Value, ValueIssue,
+    DocumentId, InitialEnvironment, OccurrenceKind, Value, ValueIssue,
   };
   use std::fmt::Write;
 
-  use support::analyze;
+  use support::{analyze, analyze_with};
 
   #[test]
   fn thirty_thousand_commands_are_all_resolved_within_the_default_budget() {
     let source = String::from("x=1\n") + &": \"$x\"\n".repeat(30_000);
     let (workspace, analysis) = analyze(&source);
-    let definition = workspace.symbols_named(b"x").next().unwrap().id;
-    assert_eq!(analysis.references(definition).count(), 30_000);
-    for site in analysis.references(definition) {
+    let definition = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
+    assert_eq!(
+      crate::support::references(&analysis, definition).count(),
+      30_000
+    );
+    for site in crate::support::references(&analysis, definition) {
       assert_eq!(site.resolution.candidates, [definition].into());
       assert_eq!(
         analysis.value(site.site.syntax().unwrap(), site.context),
@@ -2359,6 +2969,54 @@ mod convergence {
       );
     }
     assert_eq!(analysis.gaps(), []);
+  }
+
+  #[test]
+  fn wrapper_calls_after_an_unresolved_source_stay_within_default_budget() {
+    let mut source = String::from(
+      ". ./lib.sh\ncd \"$1\" || exit 1\nlog() { echo \"$@\" >&2; }\nrun() { log \"$@\"; \"$@\"; }\n",
+    );
+    for index in 0..128 {
+      writeln!(source, "run step{index}").unwrap();
+    }
+    let (workspace, analysis) = analyze(&source);
+    let definition = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"run")
+      .unwrap()
+      .id;
+    assert_eq!(
+      crate::support::references(&analysis, definition).count(),
+      128
+    );
+  }
+
+  #[test]
+  fn directory_probes_in_unknown_startup_state_stay_within_default_budget() {
+    let mut source = String::from(
+      "root=$(pwd)\nif [ -n \"$1\" ]; then mode=fast; else mode=slow; fi\n",
+    );
+    for index in 0..80 {
+      writeln!(
+        source,
+        "[ -d \"$root/d{index}\" ] && dir{index}=$(cd \"$root/d{index}\" && pwd)\necho \"$mode\" \"$dir{index}\""
+      )
+      .unwrap();
+    }
+    let (workspace, analysis) =
+      analyze_with(&source, InitialEnvironment::default());
+    let definitions: Vec<_> = workspace
+      .symbols()
+      .filter(|symbol| symbol.name == b"mode")
+      .map(|symbol| symbol.id)
+      .collect();
+    assert_eq!(definitions.len(), 2);
+    for definition in definitions {
+      assert_eq!(
+        crate::support::references(&analysis, definition).count(),
+        80
+      );
+    }
   }
 
   #[test]
@@ -2422,9 +3080,16 @@ mod convergence {
         .count(),
       4_097
     );
-    let definition = workspace.symbols_named(b"x").next().unwrap().id;
-    assert_eq!(analysis.references(definition).count(), 4_097);
-    for site in analysis.references(definition) {
+    let definition = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"x")
+      .unwrap()
+      .id;
+    assert_eq!(
+      crate::support::references(&analysis, definition).count(),
+      4_097
+    );
+    for site in crate::support::references(&analysis, definition) {
       assert_eq!(
         analysis.value(site.site.syntax().unwrap(), site.context),
         Some(&Value::Literal(b"1".to_vec()))
@@ -2472,8 +3137,7 @@ mod convergence {
       })
       .unwrap();
     assert_eq!(
-      analysis
-        .values(last.id)
+      crate::support::values(&analysis, last.id)
         .map(|(_, value)| value.clone())
         .collect::<Vec<_>>(),
       [Value::Literal(b"0".to_vec())]
@@ -2481,7 +3145,8 @@ mod convergence {
     for index in 0..32 {
       let name = format!("v{index}");
       let definitions: std::collections::BTreeSet<_> = workspace
-        .symbols_named(name.as_bytes())
+        .symbols()
+        .filter(|symbol| symbol.name == name.as_bytes())
         .map(|symbol| symbol.id)
         .collect();
       assert_eq!(definitions.len(), 3);
@@ -2542,11 +3207,11 @@ mod inputs {
       .analyze(request, &mut inputs, &AtomicBool::new(false))
       .unwrap();
     assert_eq!(
-      old.values(read).next().unwrap().1,
+      crate::support::values(&old, read).next().unwrap().1,
       &Value::Literal(b"/first".to_vec())
     );
     assert_eq!(
-      current.values(read).next().unwrap().1,
+      crate::support::values(&current, read).next().unwrap().1,
       &Value::Literal(b"/second".to_vec())
     );
     assert_eq!(old.snapshots(), current.snapshots());
@@ -2612,30 +3277,45 @@ mod inputs {
         .unwrap();
       assert_eq!(inputs.source_queries, expected);
       for document in [&first, &second] {
-        assert_eq!(analysis.references(document.symbols()[0].id).count(), 1);
+        assert_eq!(
+          crate::support::references(&analysis, document.symbols()[0].id)
+            .count(),
+          1
+        );
       }
       assert!(matches!(
         analysis.source_bindings()[&reference],
         DependencyState::Unresolved(_)
       ));
       workspace.publish_analysis(analysis).unwrap();
-      assert_eq!(workspace.source_links(DocumentId(1)), []);
+      assert!(
+        support::sources(&workspace, DocumentId(1))
+          .iter()
+          .all(|source| !source.complete || source.targets.len() != 1)
+      );
       inputs
         .sources
         .insert(expected[1].clone(), SourceDocument::Resolved(first.clone()));
       let analysis = workspace
         .analyze(request, &mut inputs, &AtomicBool::new(false))
         .unwrap();
-      assert_eq!(analysis.references(first.symbols()[0].id).count(), 2);
-      assert_eq!(analysis.references(second.symbols()[0].id).count(), 0);
+      assert_eq!(
+        crate::support::references(&analysis, first.symbols()[0].id).count(),
+        2
+      );
+      assert_eq!(
+        crate::support::references(&analysis, second.symbols()[0].id).count(),
+        0
+      );
       assert_eq!(
         analysis.source_bindings()[&reference],
         DependencyState::Resolved(first.snapshot())
       );
       workspace.publish_analysis(analysis).unwrap();
-      let links = workspace.source_links(DocumentId(1));
+      let links = support::sources(&workspace, DocumentId(1));
       assert_eq!(links.len(), 1);
-      assert_eq!(links[0].1, first.snapshot());
+      assert!(links[0].complete);
+      assert_eq!(links[0].targets, [first.snapshot()].into());
     }
   }
 
@@ -2730,8 +3410,7 @@ mod inputs {
     assert_eq!(inputs.queries.len(), 1);
     assert_eq!(workspace.documents().count(), 81);
     assert_eq!(
-      result
-        .values(read)
+      crate::support::values(&result, read)
         .map(|(_, value)| value.clone())
         .collect::<Vec<_>>(),
       [Value::Literal(b"finished".to_vec())]
@@ -3145,11 +3824,11 @@ mod names {
         "{body}"
       );
       let names = workspace.name_relations(&AtomicBool::new(false)).unwrap();
-      let sites = names.at(snapshot, offset);
+      let sites = support::name_sites_at(&names, snapshot, offset);
       assert_eq!(sites.len(), 1, "{body}");
-      assert_eq!(sites[0].1.context, None, "{body}");
-      assert_eq!(sites[0].1.resolution, None, "{body}");
-      assert_eq!(sites[0].1.identity, None, "{body}");
+      assert_eq!(sites[0].context, None, "{body}");
+      assert_eq!(sites[0].resolution, None, "{body}");
+      assert_eq!(sites[0].identity, None, "{body}");
       assert_eq!(workspace.analysis().unwrap().contexts().len(), 1, "{body}");
     }
   }
@@ -3161,7 +3840,11 @@ mod names {
     let (mut workspace, analysis) = support::analyze(source);
     let snapshot = workspace.document(DocumentId(1)).unwrap().snapshot();
     let contexts = analysis.contexts().to_vec();
-    let definition = workspace.symbols_named(b"a").next().unwrap().id;
+    let definition = workspace
+      .symbols()
+      .find(|symbol| symbol.name == b"a")
+      .unwrap()
+      .id;
     workspace.publish_analysis(analysis).unwrap();
     let inside = workspace
       .resolution_at(snapshot, source.find("{ a;").unwrap() + 2)
@@ -3182,10 +3865,7 @@ mod names {
       .unwrap()
       .id;
     assert!(
-      workspace
-        .analysis()
-        .unwrap()
-        .values(read)
+      crate::support::values(workspace.analysis().unwrap(), read)
         .all(|(_, value)| value == &Value::Literal(b"entry".to_vec()))
     );
     workspace.name_relations(&AtomicBool::new(false)).unwrap();
@@ -3282,6 +3962,37 @@ mod names {
           |site| site.context.is_some() && site.spelling.editable().is_some()
         )
     );
+  }
+
+  #[test]
+  fn declarations_through_command_keep_temporary_names_separate() {
+    let source = "x=old; x=1 command export x=2; : $x";
+    let (mut workspace, analysis) = support::analyze(source);
+    workspace.publish_analysis(analysis).unwrap();
+    let names = workspace.name_relations(&AtomicBool::new(false)).unwrap();
+    let outer = names
+      .names
+      .iter()
+      .find(|name| name.text == b"x" && name.temporary.is_none())
+      .unwrap();
+    assert!(
+      names.effects.is_empty() && names.dependencies.is_empty(),
+      "{names:#?}"
+    );
+    assert_eq!(outer.definitions.len(), 1, "{names:#?}");
+    for site in names
+      .occurrences
+      .iter()
+      .filter(|site| site.names.contains(&outer.id))
+    {
+      assert_eq!(
+        site.exported,
+        shellsmith::interface::application::engine::AttributeState::Known(
+          false
+        ),
+        "{names:#?}"
+      );
+    }
   }
 
   #[test]

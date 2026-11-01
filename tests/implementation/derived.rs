@@ -27,8 +27,8 @@ fn projected_symbol_details_require_agreement_on_ranges_and_containers() {
     revision: Revision(1),
   };
   let mut workspace = Workspace::default();
-  workspace
-    .update(snapshot, b"trap 'f() { x=1; }' EXIT", &cancel)
+  Document::parse(snapshot, b"trap 'f() { x=1; }' EXIT", &cancel)
+    .and_then(|document| workspace.insert(document))
     .unwrap();
   let registration = workspace
     .document(snapshot.document)
@@ -75,7 +75,6 @@ fn projected_symbol_details_require_agreement_on_ranges_and_containers() {
   workspace
     .indexed
     .insert(snapshot.document, (4096, Arc::new(derived)));
-  assert_eq!(workspace.projected_symbols(snapshot.document).count(), 2);
   let details: Vec<_> = workspace
     .document_symbol_details(snapshot.document)
     .into_iter()
@@ -111,7 +110,9 @@ fn symbol_hierarchy_preserves_known_names_without_inventing_generated_ranges() {
     env!("CARGO_MANIFEST_DIR"),
   )))
   .unwrap();
-  app.workspace.update(snapshot, source, &cancel).unwrap();
+  Document::parse(snapshot, source, &cancel)
+    .and_then(|document| app.workspace.insert(document))
+    .unwrap();
   let registration = app
     .workspace
     .document(snapshot.document)
@@ -187,8 +188,8 @@ fn syntax_index_and_analysis_reuse_body_snapshots_and_invalidate_them_together()
     revision: Revision(1),
   };
   let mut workspace = Workspace::default();
-  workspace
-    .update(snapshot, b"trap 'inner() { :; }' EXIT", &cancel)
+  Document::parse(snapshot, b"trap 'inner() { :; }' EXIT", &cancel)
+    .and_then(|document| workspace.insert(document))
     .unwrap();
   workspace
     .index_document(
@@ -225,9 +226,15 @@ fn syntax_index_and_analysis_reuse_body_snapshots_and_invalidate_them_together()
     &workspace.documents[&body.snapshot().document]
   ));
   workspace.publish_analysis(result).unwrap();
-  assert_eq!(workspace.projected_symbols(snapshot.document).count(), 1);
+  assert_eq!(
+    workspace.document_symbol_details(snapshot.document).len(),
+    1
+  );
   workspace.clear_analysis();
-  assert_eq!(workspace.projected_symbols(snapshot.document).count(), 1);
+  assert_eq!(
+    workspace.document_symbol_details(snapshot.document).len(),
+    1
+  );
   assert_eq!(
     workspace.index_document(
       snapshot.document,
@@ -240,8 +247,8 @@ fn syntax_index_and_analysis_reuse_body_snapshots_and_invalidate_them_together()
     revision: Revision(2),
     ..snapshot
   };
-  workspace
-    .update(next, b"trap 'exit 1' EXIT", &cancel)
+  Document::parse(next, b"trap 'exit 1' EXIT", &cancel)
+    .and_then(|document| workspace.insert(document))
     .unwrap();
   assert_eq!(
     workspace
@@ -251,16 +258,16 @@ fn syntax_index_and_analysis_reuse_body_snapshots_and_invalidate_them_together()
       .len(),
     1
   );
-  workspace
-    .update(
-      Snapshot {
-        revision: Revision(3),
-        ..snapshot
-      },
-      b"trap - EXIT",
-      &cancel,
-    )
-    .unwrap();
+  Document::parse(
+    Snapshot {
+      revision: Revision(3),
+      ..snapshot
+    },
+    b"trap - EXIT",
+    &cancel,
+  )
+  .and_then(|document| workspace.insert(document))
+  .unwrap();
   workspace
     .index_document(
       snapshot.document,
@@ -269,7 +276,11 @@ fn syntax_index_and_analysis_reuse_body_snapshots_and_invalidate_them_together()
     )
     .unwrap();
   assert!(workspace.document(body.snapshot().document).is_none());
-  assert_eq!(workspace.projected_symbols(snapshot.document).count(), 0);
+  assert!(
+    workspace
+      .document_symbol_details(snapshot.document)
+      .is_empty()
+  );
   assert!(workspace.programs.is_empty());
 }
 
